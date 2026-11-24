@@ -1,0 +1,31 @@
+[package]
+name = "tracksplus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.105"
+chrono = "0.4.45"
+cpal = "0.18.2"
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+eframe = "0.37.0"
+fs4 = "1.1.0"
+hound = "3.5.1"
+parking_lot = "0.13.0"
+rfd = "0.18.0"
+rtrb = "0.4.1"
+rubato = "0.16"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[features]
+default = []
+# Pilotes ASIO sous Windows (Dante Virtual Soundcard, RME, Focusrite…).
+asio = ["cpal/asio"]
+# Serveur JACK (Linux/macOS).
+jack = ["cpal/jack"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

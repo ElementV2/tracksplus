@@ -1,0 +1,59 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dépendances système
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # La feature `asio` télécharge le SDK ASIO de Steinberg et utilise le LLVM du runner.
+      - name: Build (ASIO + WASAPI)
+        run: cargo build --release --features asio
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TracksPlus-windows
+          path: target/release/tracksplus.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build universel
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output tracksplus \
+            target/aarch64-apple-darwin/release/tracksplus \
+            target/x86_64-apple-darwin/release/tracksplus
+      - name: Bundle .app
+        run: |
+          APP=TracksPlus.app
+          mkdir -p $APP/Contents/MacOS
+          cp tracksplus $APP/Contents/MacOS/TracksPlus
+          cp packaging/macos/Info.plist $APP/Contents/Info.plist
+          codesign --force --deep -s - $APP
+          ditto -c -k --keepParent $APP TracksPlus-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TracksPlus-macos
+          path: TracksPlus-macos.zip
