@@ -35,6 +35,15 @@ fn parse_secs(t: &str) -> Option<f64> {
     (total.is_finite() && total >= 0.0).then_some(total)
 }
 
+/// Au-delà de cette taille, un son est copié dans la session en arrière-plan.
+const BIG_SOUND: u64 = 32 * 1024 * 1024;
+
+/// Copie d'un gros son vers le dossier « Sons » de la session, en cours.
+pub struct PendingCopy {
+    src: PathBuf,
+    rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+}
+
 /// Durée « mm:ss.cc » (deux chiffres partout), « h:mm:ss.cc » au-delà d'une heure.
 fn fmt_secs(s: f64) -> String {
     // En centièmes entiers : pas de « 0:60.00 » par arrondi.
@@ -142,12 +151,34 @@ impl App {
                 break;
             }
             // Le son est copié dans le dossier « Sons » de la session : la session garde
-            // tout ce qu'il lui faut, même si l'original est déplacé ou supprimé.
-            let f = match crate::soundboard::copy_into_session(&f, &self.project.dir) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.notify(format!("{e:#}"), true);
-                    continue;
+            // tout ce qu'il lui faut, même si l'original est déplacé ou supprimé. Un gros
+            // fichier est copié en arrière-plan : le pad joue l'original en attendant.
+            let sounds = self.project.dir.join(crate::soundboard::SOUNDS_DIR);
+            let big = f.parent() != Some(sounds.as_path())
+                && std::fs::metadata(&f).is_ok_and(|m| m.len() > BIG_SOUND);
+            let f = if big {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (src, dir) = (f.clone(), self.project.dir.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(
+                        crate::soundboard::copy_into_session(&src, &dir)
+                            .map_err(|e| format!("{e:#}")),
+                    );
+                });
+                self.sb.copies.push(PendingCopy { src: f.clone(), rx });
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.notify(format!("Copie de « {name} » dans la session…"), false);
+                f
+            } else {
+                match crate::soundboard::copy_into_session(&f, &self.project.dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.notify(format!("{e:#}"), true);
+                        continue;
+                    }
                 }
             };
             let color = (slot % t::PALETTE.len()) as u8;
@@ -208,8 +239,52 @@ impl App {
         }
     }
 
+    /// Gros sons copiés en arrière-plan : les pads passent à la copie de la session (sans
+    /// recharger le son s'il est déjà en mémoire).
+    fn poll_copies(&mut self, ctx: &egui::Context) {
+        let mut done = Vec::new();
+        self.sb.copies.retain(|c| match c.rx.try_recv() {
+            Ok(res) => {
+                done.push((c.src.clone(), res));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (src, res) in done {
+            match res {
+                Ok(dst) => {
+                    let mut used = false;
+                    for page in &mut self.board.pages {
+                        for pad in page.pads.iter_mut().flatten() {
+                            if pad.path == src {
+                                pad.path = dst.clone();
+                                used = true;
+                            }
+                        }
+                    }
+                    if !used {
+                        continue;
+                    }
+                    match self.cache.map.remove(&src) {
+                        Some(LoadState::Ready(s)) => {
+                            self.cache.map.insert(dst.clone(), LoadState::Ready(s));
+                        }
+                        _ => self.cache.request(&dst, Some(ctx)),
+                    }
+                    self.sb.midi_dirty = true;
+                    self.board_modified();
+                }
+                Err(e) => self.notify(format!("Copie dans la session impossible : {e}"), true),
+            }
+        }
+    }
+
     /// Traitement indépendant de l'onglet affiché : MIDI, table de déclenchement.
     pub fn soundboard_background(&mut self, ctx: &egui::Context) {
+        if !self.sb.copies.is_empty() {
+            self.poll_copies(ctx);
+        }
         let grid = self.grid_map();
         // Contrôleur à passer dans sa disposition (une fois par branchement).
         if grid.is_some() {
@@ -376,6 +451,14 @@ impl App {
                 continue;
             }
             if let Some(slot) = self.sb.learn_key {
+                if pressed && key == Key::Delete {
+                    // Suppr est réservé à la suppression du pad sélectionné.
+                    self.notify(
+                        "Suppr sert à supprimer un pad : choisissez une autre touche",
+                        true,
+                    );
+                    continue;
+                }
                 if pressed {
                     self.sb.learn_key = None;
                     if key != Key::Escape {
@@ -468,6 +551,7 @@ impl App {
             self.sb.page = 0;
         }
         egui::Panel::top("sb_head")
+            .resizable(false)
             .exact_size(36.0)
             .frame(
                 egui::Frame::new()
@@ -476,7 +560,8 @@ impl App {
             )
             .show(ui, |ui| self.sb_header(ui));
         egui::Panel::right("sb_master")
-            .exact_size(86.0)
+            .resizable(false)
+            .exact_size(crate::ui::multitrack::MASTER_W)
             .frame(egui::Frame::new().fill(t::SURFACE))
             .show(ui, |ui| {
                 let mut m = self.master_pad;
@@ -497,10 +582,8 @@ impl App {
         // taille quand on clique sur un pad.
         let has_pad = self.sb.selected.and_then(|s| self.board.pad(s)).is_some();
         egui::Panel::bottom("sb_editor")
-            .resizable(true)
-            .default_size(256.0)
-            .min_size(240.0)
-            .max_size(520.0)
+            .resizable(false)
+            .exact_size(256.0)
             .frame(
                 egui::Frame::new()
                     .fill(t::SURFACE)
@@ -1502,7 +1585,7 @@ impl App {
                 }
             }
         }
-        if !dropped.is_empty() {
+        if !dropped.is_empty() && !blocked {
             let target = drop_slot.or_else(|| {
                 (0..cols * rows)
                     .map(|i| Board::slot(page, i))

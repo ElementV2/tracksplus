@@ -27,7 +27,7 @@ keepawake = "0.6.1"
 
 # Une seule instance : ramener au premier plan la fenêtre déjà ouverte.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem"] }
 
 [build-dependencies]
 # Icône et informations de version intégrées à l'exécutable Windows.

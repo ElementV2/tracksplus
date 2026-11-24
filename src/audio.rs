@@ -203,6 +203,9 @@ pub struct Shared {
     pub rec_frames: AtomicU64,
     /// Trames jouées depuis le début de la lecture.
     pub out_frames: AtomicU64,
+    /// Position de lecture (trames depuis son début) au moment où la prise a vraiment
+    /// commencé dans le callback d'entrée : sert à poser une prise faite en écoutant.
+    pub rec_play_offset: AtomicU64,
     /// Données perdues car le disque n'a pas suivi.
     pub overruns: AtomicU32,
     /// Trous de lecture.
@@ -242,6 +245,7 @@ impl Shared {
             meters: (0..MAX_INPUTS).map(|_| AtomicU32::new(0)).collect(),
             rec_frames: AtomicU64::new(0),
             out_frames: AtomicU64::new(0),
+            rec_play_offset: AtomicU64::new(0),
             overruns: AtomicU32::new(0),
             underruns: AtomicU32::new(0),
             xruns: AtomicU32::new(0),
@@ -830,6 +834,10 @@ where
                 // qui relâche les producteurs (le thread disque voit alors la fin de prise).
                 match cmd {
                     InCmd::Record(t) => {
+                        st.shared.rec_play_offset.store(
+                            st.shared.out_frames.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
                         let old = std::mem::replace(&mut st.targets, t);
                         st.dispose(old);
                     }
@@ -1182,7 +1190,8 @@ impl OutState {
                 chunk.commit_all();
             }
             // Trou de lecture (ou imminent : le prochain bloc ne tiendra pas) : fondus
-            // courts de part et d'autre, pas de marche brutale donc pas de clic.
+            // courts de part et d'autre, pas de marche brutale donc pas de clic. Avec 3 s de
+            // tampon, « imminent » ne se produit qu'au bord d'un vrai trou.
             if n > 0 && self.play_fade_in {
                 self.play_fade_in = false;
                 fade_head(play, n, MON_FADE);

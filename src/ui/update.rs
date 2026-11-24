@@ -20,11 +20,11 @@ impl App {
         if self.update_install
             && let State::Ready { file, .. } = self.updater.state()
         {
-            self.update_install = false;
-            if self.is_recording() {
-                self.notify("Mise à jour reportée : une prise est en cours", true);
+            if !self.is_stopped() || self.save_as_job.is_some() || self.import_job.is_some() {
+                // Prise, finalisation ou copie en cours : on réessaie dès que c'est fini.
                 return;
             }
+            self.update_install = false;
             // Tout est sauvegardé avant que l'installeur ne ferme l'application.
             self.autosave();
             self.board_changed = Some(self.now);

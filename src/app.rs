@@ -166,12 +166,17 @@ pub struct NewSessionDialog {
 /// Fin de prise en cours en arrière-plan.
 pub struct Finishing {
     rx: std::sync::mpsc::Receiver<Result<Vec<RecResult>, FinishError>>,
-    start: u64,
+    /// Position de la prise sur la timeline (déjà recalée).
+    pub start: u64,
     released: bool,
 }
 
-/// Résultat d'un « Enregistrer sous » : session copiée, soundboard adopté, sons introuvables.
-pub type SaveAsDone = (Project, Board, Vec<PathBuf>);
+/// Résultat d'un import de soundboard : soundboard adopté, sons introuvables.
+pub type ImportDone = (Board, Vec<PathBuf>);
+
+/// Résultat d'un « Enregistrer sous » : session copiée, soundboard adopté, sons introuvables,
+/// prises introuvables.
+pub type SaveAsDone = (Project, Board, Vec<PathBuf>, Vec<String>);
 
 /// Raccourci de choix des pistes à exporter (`Custom` = cochées à la main).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -234,6 +239,8 @@ pub struct SbState {
     pub settings_open: bool,
     /// Dernier envoi des LED du contrôleur.
     pub led_at: f64,
+    /// Gros sons en cours de copie dans la session (le pad joue l'original en attendant).
+    pub copies: Vec<crate::ui::soundboard::PendingCopy>,
     /// Pad renommé directement dans la grille (double-clic) : emplacement, nom en cours.
     pub renaming: Option<(u16, String)>,
 }
@@ -274,6 +281,13 @@ pub struct App {
     pub save_error_at: f64,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
+    /// La prise en cours est faite en écoutant les pistes existantes.
+    pub rec_overdub: bool,
+    /// Journal de la prise en cours, à compléter du décalage mesuré dès que la prise a
+    /// réellement commencé (prise faite en écoutant).
+    pub journal_pending: Option<recovery::Journal>,
+    /// Import d'un soundboard en cours (copie des sons dans la session).
+    pub import_job: Option<std::sync::mpsc::Receiver<Result<ImportDone, String>>>,
     /// Explorateur intégré (sons d'un pad, session à ouvrir).
     pub browser: Option<crate::ui::browser::FileBrowser>,
     /// Écran d'accueil (au lancement, ou depuis le menu).
@@ -299,7 +313,9 @@ pub struct App {
     pub selection: Option<(u64, u64)>,
     pub selected_tracks: HashSet<u64>,
     pub show_bridge: bool,
-    pub ruler_anchor: Option<u64>,
+    /// Point d'entrée (`true`) ou de sortie (`false`) posé seul, en attente de l'autre
+    /// pour former la plage.
+    pub ruler_anchor: Option<(u64, bool)>,
     /// La tête de lecture est tenue à la souris (sur la règle).
     pub playhead_drag: bool,
     /// Pendant une lecture : dernier repositionnement du son pendant le glissé (s).
@@ -437,6 +453,9 @@ impl App {
             disk_stalled: false,
             save_error_at: f64::NEG_INFINITY,
             rec_latency: 0,
+            rec_overdub: false,
+            journal_pending: None,
+            import_job: None,
             browser: None,
             start_screen: false,
             updater: Default::default(),
@@ -460,7 +479,7 @@ impl App {
             undo: Vec::new(),
             redo: Vec::new(),
             sel_clips: HashSet::new(),
-            snap: true,
+            snap: false,
             clip_drag: None,
         };
         app.midi.shared.lock().ctx = Some(cc.egui_ctx.clone());
@@ -549,6 +568,13 @@ impl App {
 
     pub fn is_recording(&self) -> bool {
         matches!(self.transport, Transport::Recording { .. })
+    }
+
+    /// Montage interdit : prise en cours, en finalisation (ses prises ne sont pas encore dans
+    /// la session : une modification et son annulation les perdraient), ou « Enregistrer
+    /// sous » en cours.
+    pub fn editing_locked(&self) -> bool {
+        self.is_recording() || self.finishing.is_some() || self.save_as_job.is_some()
     }
 
     pub fn play(&mut self) {
@@ -705,6 +731,8 @@ impl App {
         // l'enregistrement, pour pouvoir tout retrouver après un crash.
         let journal = recovery::Journal {
             start: self.playhead,
+            play_offset: 0,
+            latency: 0,
             sample_rate: sr,
             takes: specs
                 .iter()
@@ -721,6 +749,7 @@ impl App {
             );
         }
         recovery::remember_session(&self.project);
+        let journal_copy = journal.clone();
         if let Err(e) = recovery::write_journal(&self.project.dir, &journal) {
             self.notify(
                 format!("Attention : journal de secours non écrit ({e:#})"),
@@ -739,24 +768,30 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = self.engine.start_record(targets) {
-            recovery::remove_journal(&self.project.dir);
-            let _ = recorder.finish();
-            self.live.clear();
-            self.notify(format!("{e:#}"), true);
-            return;
-        }
+        // La lecture des pistes existantes démarre AVANT la prise (son pré-remplissage peut
+        // prendre du temps) ; le décalage réel entre les deux est mesuré par le callback
+        // d'entrée et compensé à la fin, avec la latence entrée + sortie de la carte.
         self.rec_latency = 0;
+        self.rec_overdub = false;
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
                 Player::start(&self.project, self.playhead, self.project.audible());
             self.engine.start_playback(cons);
             self.player = Some(player);
-            // Enregistrement sur des pistes existantes : la prise arrive en retard de la
-            // latence entrée + sortie de la carte. On la recale à la fin de la prise.
+            self.rec_overdub = true;
             self.rec_latency = self.engine.round_trip_latency() as u64;
         }
+        if let Err(e) = self.engine.start_record(targets) {
+            recovery::remove_journal(&self.project.dir);
+            let _ = recorder.finish();
+            self.engine.stop_playback();
+            self.player = None;
+            self.live.clear();
+            self.notify(format!("{e:#}"), true);
+            return;
+        }
         self.recorder = Some(recorder);
+        self.journal_pending = self.rec_overdub.then_some(journal_copy);
         // Pas de mise en veille pendant la prise (sans effet si le système refuse).
         self.awake = keepawake::Builder::default()
             .idle(true)
@@ -810,9 +845,15 @@ impl App {
                         std::thread::spawn(move || {
                             let _ = tx.send(rec.finish());
                         });
+                        // Prise faite en écoutant : elle a commencé à cette position de lecture.
+                        let offset = if std::mem::take(&mut self.rec_overdub) {
+                            self.engine.shared.rec_play_offset.load(Ordering::Relaxed)
+                        } else {
+                            0
+                        };
                         self.finishing = Some(Finishing {
                             rx,
-                            start,
+                            start: start + offset,
                             released,
                         });
                     }
@@ -824,19 +865,40 @@ impl App {
         self.engine.shared.counting.store(false, Ordering::Relaxed);
     }
 
+    /// Prise faite en écoutant : dès qu'elle a commencé, le journal de secours reçoit le
+    /// décalage mesuré et la latence, pour qu'une prise récupérée après un crash tombe en
+    /// place elle aussi.
+    fn complete_journal(&mut self) {
+        if !self.is_recording() || self.engine.shared.rec_frames.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Some(mut j) = self.journal_pending.take() else {
+            return;
+        };
+        j.play_offset = self.engine.shared.rec_play_offset.load(Ordering::Relaxed);
+        j.latency = self.rec_latency;
+        let _ = recovery::write_journal(&self.project.dir, &j);
+    }
+
     /// Fin de prise terminée en arrière-plan : on intègre les prises. `wait` : attendre
     /// (fermeture de l'application).
     fn poll_finishing(&mut self, wait: bool) {
         let Some(f) = &self.finishing else {
             return;
         };
+        use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
         let res = if wait {
-            f.rx.recv_timeout(std::time::Duration::from_secs(15)).ok()
+            match f.rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok(r) => r,
+                Err(RecvTimeoutError::Timeout) => Err(FinishError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => Err(FinishError::Panicked),
+            }
         } else {
-            f.rx.try_recv().ok()
-        };
-        let Some(res) = res else {
-            return;
+            match f.rx.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => Err(FinishError::Panicked),
+            }
         };
         let f = self.finishing.take().expect("prise en finalisation");
         self.live_takes_to_clips(f.start, Some(res), f.released);
@@ -908,6 +970,7 @@ impl App {
                     if r.segments.len() == 1 {
                         // Fichier fermé : sa forme d'onde est mise en cache pour les
                         // prochaines ouvertures de la session.
+                        p.write().shrink();
                         render::store_peaks(&path, &p.read());
                         self.peaks.insert(id, p.clone());
                     } else {
@@ -939,6 +1002,8 @@ impl App {
             max_len = max_len.max(r.frames());
         }
         self.live.clear();
+        self.undo.clear();
+        self.redo.clear();
         self.playhead = start + max_len;
         self.project.dirty = true;
         let save = self.project.save();
@@ -1152,7 +1217,7 @@ impl App {
     }
 
     pub fn undo(&mut self) {
-        if !self.is_recording()
+        if !self.editing_locked()
             && self.clip_drag.is_none()
             && let Some(s) = self.undo.pop()
         {
@@ -1162,7 +1227,7 @@ impl App {
     }
 
     pub fn redo(&mut self) {
-        if !self.is_recording()
+        if !self.editing_locked()
             && self.clip_drag.is_none()
             && let Some(s) = self.redo.pop()
         {
@@ -1183,7 +1248,7 @@ impl App {
     /// Coupe à la tête de lecture : les prises sélectionnées, sinon celles des pistes
     /// sélectionnées, sinon toutes celles sous la tête.
     pub fn split_at_playhead(&mut self) {
-        if self.is_recording() {
+        if self.editing_locked() {
             return;
         }
         let pos = self.playhead;
@@ -1212,7 +1277,7 @@ impl App {
 
     /// Fondus d'entrée et de sortie identiques sur les prises sélectionnées (`None` = retirer).
     pub fn set_clip_fades(&mut self, ms: Option<u64>) {
-        if self.sel_clips.is_empty() || self.is_recording() {
+        if self.sel_clips.is_empty() || self.editing_locked() {
             return;
         }
         self.checkpoint();
@@ -1232,7 +1297,7 @@ impl App {
 
     /// Supprime les prises sélectionnées, ou le contenu de la plage de temps sélectionnée.
     pub fn delete_selection(&mut self) {
-        if self.is_recording() {
+        if self.editing_locked() {
             return;
         }
         if !self.sel_clips.is_empty() {
@@ -1402,7 +1467,36 @@ impl App {
                 }
             }
         }
-        let missing = b.adopt_sounds(&self.project.dir);
+        // Copie des sons dans la session en arrière-plan (fenêtre d'attente).
+        let dir = self.project.dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let missing = b.adopt_sounds(&dir);
+            let _ = tx.send(Ok((b, missing)));
+        });
+        self.import_job = Some(rx);
+    }
+
+    /// Import de soundboard terminé : il remplace le soundboard de la session.
+    fn poll_import(&mut self) {
+        let Some(rx) = &self.import_job else {
+            return;
+        };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Import du soundboard interrompu (erreur interne)".to_string())
+            }
+        };
+        self.import_job = None;
+        let (mut b, missing) = match res {
+            Ok(r) => r,
+            Err(e) => {
+                self.notify(e, true);
+                return;
+            }
+        };
         b.take_devices(&self.board);
         self.set_board(b);
         self.board_changed = Some(self.now);
@@ -1512,9 +1606,9 @@ impl App {
         std::thread::spawn(move || {
             let res = p
                 .save_as(dir, name)
-                .map(|()| {
+                .map(|lost| {
                     let missing = b.adopt_sounds(&p.dir);
-                    (p, b, missing)
+                    (p, b, missing, lost)
                 })
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(res);
@@ -1527,13 +1621,31 @@ impl App {
         let Some(rx) = &self.save_as_job else {
             return;
         };
-        let Ok(res) = rx.try_recv() else {
-            return;
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Enregistrement de la session interrompu (erreur interne)".to_string())
+            }
         };
         self.save_as_job = None;
         match res {
-            Ok((p, b, missing)) => {
+            Ok((p, b, missing, lost)) => {
+                if !lost.is_empty() {
+                    self.notify(
+                        format!(
+                            "{} prise(s) introuvable(s) non copiée(s) : {}",
+                            lost.len(),
+                            lost.join(", ")
+                        ),
+                        true,
+                    );
+                }
                 self.project = p;
+                // Des fichiers ont pu être renommés dans la copie : l'historique d'avant
+                // pointerait sur de mauvais fichiers.
+                self.undo.clear();
+                self.redo.clear();
                 if !missing.is_empty() {
                     self.notify(
                         format!("{} son(s) du soundboard introuvable(s)", missing.len()),
@@ -1554,25 +1666,29 @@ impl App {
     }
 
     fn save_as_dialog(&mut self, ctx: &egui::Context) {
-        if self.save_as_job.is_none() {
+        let (title, detail) = if self.save_as_job.is_some() {
+            (
+                "Enregistrement de la session…",
+                "Copie des prises et des sons dans le nouveau dossier.",
+            )
+        } else if self.import_job.is_some() {
+            (
+                "Import du soundboard…",
+                "Copie des sons dans le dossier de la session.",
+            )
+        } else {
             return;
-        }
+        };
         egui::Modal::new(egui::Id::unique("save_as_job"))
             .frame(t::window_frame())
             .show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(16.0).color(t::ACCENT));
-                    ui.label(
-                        egui::RichText::new("Enregistrement de la session…")
-                            .font(t::semibold(14.0)),
-                    );
+                    ui.label(egui::RichText::new(title).font(t::semibold(14.0)));
                 });
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Copie des prises et des sons dans le nouveau dossier.")
-                        .color(t::TEXT_3),
-                );
+                ui.label(egui::RichText::new(detail).color(t::TEXT_3));
             });
         ctx.request_repaint();
     }
@@ -1655,7 +1771,7 @@ impl App {
     }
 
     pub fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
-        if self.is_recording() {
+        if self.editing_locked() {
             return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
         }
         self.stop();
@@ -1724,7 +1840,7 @@ impl App {
     }
 
     pub fn open_export(&mut self) {
-        if self.is_recording() {
+        if self.editing_locked() {
             self.notify("Export indisponible pendant l'enregistrement", true);
             return;
         }
@@ -1810,6 +1926,7 @@ impl App {
             || self.welcome.is_some()
             || self.browser.is_some()
             || self.save_as_job.is_some()
+            || self.import_job.is_some()
     }
 
     pub fn zoom_to_fit(&mut self) {
@@ -1902,7 +2019,8 @@ impl App {
 
     /// Quelque chose bouge à l'écran : transport, prise, vumètres, pads, messages…
     fn needs_animation(&self) -> bool {
-        const QUIET: f32 = 1e-4; // ≈ -80 dB
+        // ≈ -60 dB : le bruit de fond d'une entrée ne maintient pas 60 images/s.
+        const QUIET: f32 = 1e-3;
         let meters = self
             .in_meters
             .iter()
@@ -1922,6 +2040,7 @@ impl App {
             || self.updater.busy()
             || self.export_job.is_some()
             || self.save_as_job.is_some()
+            || self.import_job.is_some()
             || self.sb.drag_pad.is_some()
     }
 
@@ -3260,8 +3379,10 @@ impl eframe::App for App {
                 self.sb.midi_dirty = true;
             }
             self.update_playhead();
+            self.complete_journal();
             self.poll_finishing(false);
             self.poll_save_as();
+            self.poll_import();
             self.soundboard_background(ctx);
             self.update_background(ctx);
         }));
@@ -3302,6 +3423,22 @@ impl eframe::App for App {
         self.midi.leds_off(self.board.led_mode);
         self.stop();
         self.poll_finishing(true);
+        // Copie en cours (« Enregistrer sous », import) : on la laisse se terminer.
+        for rx in [
+            self.save_as_job.take().map(|r| {
+                Box::new(move || r.recv_timeout(std::time::Duration::from_secs(120)).is_ok())
+                    as Box<dyn FnOnce() -> bool>
+            }),
+            self.import_job.take().map(|r| {
+                Box::new(move || r.recv_timeout(std::time::Duration::from_secs(120)).is_ok())
+                    as Box<dyn FnOnce() -> bool>
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = rx();
+        }
         self.autosave();
         self.board_changed = Some(0.0);
         self.save_board_now();
@@ -3356,6 +3493,7 @@ impl App {
         }
 
         egui::Panel::top("top")
+            .resizable(false)
             .exact_size(44.0)
             .frame(egui::Frame::new().fill(t::SURFACE))
             .show(ui, |ui| self.top_bar(ui));
@@ -3363,6 +3501,7 @@ impl App {
         if !alerts.is_empty() {
             let blink = (self.now * 2.0).fract() < 0.6;
             egui::Panel::top("alerts")
+                .resizable(false)
                 .exact_size(26.0)
                 .frame(
                     egui::Frame::new()
@@ -3384,6 +3523,7 @@ impl App {
                 });
         }
         egui::Panel::bottom("status")
+            .resizable(false)
             .exact_size(22.0)
             .frame(
                 egui::Frame::new()

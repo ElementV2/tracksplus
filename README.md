@@ -75,15 +75,25 @@ Tout ce qui appartient à une session est rangé dans son dossier (par défaut
 - **Navigation** : la timeline **suit** la tête de lecture en continu ; si vous faites défiler
   pendant la lecture ou l'enregistrement, le suivi se met en pause 3 s puis recadre
   automatiquement (y compris verticalement sur les pistes en cours d'enregistrement).
-  Clic sur la règle / une piste = se déplacer (même en lecture). **Glisser sur les pistes =
-  rectangle de sélection des prises** (Ctrl / Maj pour ajouter) ; **glisser sur la règle =
-  sélection de temps** (export ou suppression d'une plage). Touches **1 à 9** = aller au
+  Clic sur la règle / une piste = se déplacer (même en lecture). **Glisser sur la règle =
+  faire défiler la timeline** (attraper la tête de lecture la déplace). **Plage de temps**
+  (export ou suppression d'une plage) : **Ctrl + clic sur la règle = point d'entrée, Alt +
+  clic = point de sortie**, ou à la tête de lecture avec les boutons **Entrée / Sortie** de
+  la barre d'outils (touches **I** / **O**) ; un point seul attend l'autre ; Échap efface. **Glisser sur les
+  pistes = rectangle de sélection des prises** (Ctrl / Maj pour ajouter). Touches **1 à 9** = aller au
   repère 1 à 9. Double-clic sur une prise = sélectionner sa durée, barre de défilement.
+- **Barre d'outils en pictogrammes** (bulle d'aide au survol, avec le raccourci) : suivre la
+  lecture, magnétisme · repère, point d'entrée `[`, point de sortie `]`, effacer la plage ·
+  couper (ciseaux), supprimer (corbeille) · annuler, rétablir · vumètres ; à droite, ajouter
+  des pistes et exporter.
+- **Formes d'onde** détaillées (un point toutes les 256 échantillons, trois niveaux de zoom,
+  courbe lissée au zoom fin), claires sur fond teinté, échelle d'affichage relevée pour les
+  passages faibles (le son n'est jamais modifié).
 - **Montage** : cliquer une prise pour la sélectionner (Ctrl pour en ajouter), la **glisser**
   pour la déplacer (y compris vers une autre piste), **rogner** en tirant ses bords,
   **couper** à la tête de lecture (S), **supprimer** (Suppr) les prises sélectionnées ou tout le
   contenu d'une plage de temps. **Magnétisme** sur la tête de lecture, les repères, la sélection
-  et les bords des autres prises (Maj pour le désactiver). **Annuler / Rétablir** (Ctrl+Z,
+  et les bords des autres prises (désactivé au lancement : bouton aimant ; Maj pour l'ignorer). **Annuler / Rétablir** (Ctrl+Z,
   Ctrl+Maj+Z). Le montage est non destructif : les fichiers enregistrés ne sont jamais modifiés.
 - **Fondus sur les prises** : poignées blanches aux coins supérieurs de chaque prise à tirer
   pour régler le fondu d'entrée et de sortie (courbe en S, sans clic), ou clic droit →
@@ -234,6 +244,7 @@ Conçu pour ne jamais perdre une prise :
 | Espace | Lecture / Stop (pendant une prise : deux appuis) | |
 | R | Enregistrer (pendant une prise : deux appuis pour arrêter) | |
 | M | Ajouter un repère | |
+| I / O | Point d'entrée / de sortie de la plage à la tête de lecture | |
 | ← / → | Repère précédent / suivant | |
 | 1 … 9 | Aller au repère 1 … 9 | |
 | Origine / Entrée | Début (ou début de la sélection) | |
@@ -242,7 +253,9 @@ Conçu pour ne jamais perdre une prise :
 | Suppr | Supprimer la sélection | Supprimer le pad sélectionné |
 | Ctrl + Z / Ctrl + Maj + Z | Annuler / Rétablir | |
 | Échap | Effacer les sélections | Tout arrêter (pendant un renommage : l'annuler) |
-| Ctrl + clic | Ajouter une prise à la sélection | Jouer le pad |
+| Ctrl + clic | Ajouter une prise à la sélection ; sur la règle : point d'entrée de la plage | Jouer le pad |
+| Alt + clic (règle) | Point de sortie de la plage | |
+| Glisser sur la règle | Faire défiler la timeline (sur la tête de lecture : la déplacer) | |
 | Double-clic | Renommer une piste / un repère | Renommer le pad |
 | Ctrl + molette | Zoom | Zoom de l'éditeur |
 | Maj + molette | Défiler dans le temps | |

@@ -23,6 +23,12 @@ pub struct JournalTake {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Journal {
     pub start: u64,
+    /// Prise faite en écoutant : position de lecture au début réel de la prise (trames).
+    #[serde(default)]
+    pub play_offset: u64,
+    /// Latence entrée + sortie à retirer au début de la prise (trames).
+    #[serde(default)]
+    pub latency: u64,
     pub sample_rate: u32,
     pub takes: Vec<JournalTake>,
 }
@@ -105,7 +111,7 @@ pub fn recover(project: &mut Project) -> Result<usize> {
     let mut n = 0;
     for take in &j.takes {
         // Une prise longue peut s'étendre sur plusieurs fichiers (nom, nom_p2, nom_p3…).
-        let mut pos = j.start;
+        let mut pos = j.start + j.play_offset;
         for k in 1.. {
             let file = crate::recorder::segment_name(&take.file, k);
             let path = project.audio_dir().join(&file);
@@ -147,20 +153,30 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                         hound::WavReader::open(&path).is_ok_and(|r| r.spec().channels >= 2);
                     project.add_track_ch(Some(format!("{name} (récupérée)")), None, stereo)
                 };
+                // Même recalage qu'à la fin normale d'une prise : début du premier fichier
+                // sauté de la latence.
+                let skip = if k == 1 {
+                    j.latency
+                        .min(frames.saturating_sub(crate::project::MIN_CLIP))
+                } else {
+                    0
+                };
                 let id = project.alloc_id();
                 if let Some(t) = project.track_mut(track_id) {
                     t.clips.push(Clip {
                         id,
                         file: file.clone(),
                         start: pos,
-                        offset: 0,
-                        len: frames,
+                        offset: skip,
+                        len: frames - skip,
                         src_len: frames,
                         fade_in: 0,
                         fade_out: 0,
                     });
                     n += 1;
                 }
+                pos += frames - skip;
+                continue;
             }
             pos += frames;
         }
@@ -246,6 +262,8 @@ mod tests {
             &dir,
             &Journal {
                 start: 960,
+                play_offset: 240,
+                latency: 100,
                 sample_rate: 48000,
                 takes: vec![
                     JournalTake {
@@ -263,7 +281,8 @@ mod tests {
         let mut q = Project::load(&p.file_path()).unwrap();
         assert_eq!(recover(&mut q).unwrap(), 1);
         let c = &q.tracks[0].clips[0];
-        assert_eq!((c.start, c.len), (960, 4800));
+        // Recalée comme une fin de prise normale : décalage de lecture et latence.
+        assert_eq!((c.start, c.offset, c.len), (960 + 240, 100, 4700));
         assert!(!journal_path(&dir).exists());
         // Rejouer la récupération ne duplique rien.
         assert_eq!(recover(&mut q).unwrap(), 0);

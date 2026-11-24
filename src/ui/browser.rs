@@ -78,6 +78,9 @@ pub struct FileBrowser {
     kind: Kind,
     /// Remonter la liste en haut (changement de dossier).
     scroll_top: bool,
+    /// Dernier changement de dossier : les clics qui suivent de près (fin d'un double-clic)
+    /// ne doivent pas agir sur ce qui se trouve sous la souris dans le nouveau dossier.
+    nav_at: std::time::Instant,
     /// Raccourcis de gauche, calculés à l'ouverture (test des lecteurs A: à Z:).
     places: Vec<Place>,
 }
@@ -115,6 +118,7 @@ impl FileBrowser {
             multiple,
             kind,
             scroll_top: true,
+            nav_at: std::time::Instant::now(),
             places: places(session_dir, kind),
         };
         b.open_dir(start);
@@ -126,6 +130,7 @@ impl FileBrowser {
         self.anchor = None;
         self.filter.clear();
         self.scroll_top = true;
+        self.nav_at = std::time::Instant::now();
         match read_entries(&dir, self.kind) {
             Ok(e) => {
                 self.entries = e;
@@ -278,15 +283,19 @@ fn places(session_dir: &Path, kind: Kind) -> Vec<Place> {
             });
         }
     }
+    // Disques présents, demandés au système d'un coup (un lecteur réseau déconnecté n'est
+    // pas interrogé : pas de blocage à l'ouverture).
     #[cfg(target_os = "windows")]
-    for l in b'A'..=b'Z' {
-        let root = PathBuf::from(format!("{}:\\", l as char));
-        if root.exists() {
-            v.push(Place {
-                label: format!("Disque {}:", l as char),
-                path: root,
-                icon: Icon::Folder,
-            });
+    {
+        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        for (k, l) in (b'A'..=b'Z').enumerate() {
+            if mask & (1 << k) != 0 {
+                v.push(Place {
+                    label: format!("Disque {}:", l as char),
+                    path: PathBuf::from(format!("{}:\\", l as char)),
+                    icon: Icon::Folder,
+                });
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -529,7 +538,10 @@ impl App {
                                 t::TEXT_3,
                             );
                         }
-                        if resp.double_clicked() {
+                        let settled = b.nav_at.elapsed().as_millis() > 450;
+                        if !settled {
+                            // Second clic d'un double-clic sur un dossier : ignoré.
+                        } else if resp.double_clicked() {
                             if e.is_dir {
                                 go = Some(e.path.clone());
                             } else {
@@ -705,6 +717,7 @@ mod tests {
             },
             scroll_top: false,
             places: Vec::new(),
+            nav_at: std::time::Instant::now(),
         };
         let vis = [0, 1, 2, 3];
         b.click(1, false, false, &vis);

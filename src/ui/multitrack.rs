@@ -1,7 +1,7 @@
 //! Onglet Multipiste : barre d'outils, pistes, timeline, montage, vumètres.
 
 use super::theme as t;
-use super::widgets::{self as w, BtnStyle, Icon, MeterState};
+use super::widgets::{self as w, Icon, MeterState};
 use crate::app::{App, Transport, short};
 use crate::audio;
 use crate::project::{Clip, MIN_CLIP};
@@ -16,8 +16,116 @@ const HEADER_W: f32 = 284.0;
 /// Hauteur du panneau de réglages d'une piste dépliée.
 const INSPECTOR_H: f32 = 132.0;
 
-/// Piste du bandeau de vumètres : id, nom, canaux, armée, position, étiquette, couleur.
-type MeterTrack = (u64, String, Vec<u16>, bool, usize, String, Color32);
+/// Colonnes de forme d'onde déjà calculées, par paquets de `WAVE_CHUNK` pixels : (fichier,
+/// zoom, décalage, niveau, paquet) → (min, max) par colonne. Le dessin d'une image ne
+/// recalcule que ce qui a changé (zoom, prise en cours qui s'allonge).
+#[derive(Default)]
+pub struct WaveCache {
+    map: std::collections::HashMap<(usize, u64, u64, u8, i64), WaveChunk>,
+}
+
+struct WaveChunk {
+    cols: Vec<Option<(i8, i8)>>,
+    /// Toutes les données nécessaires existaient : le paquet ne changera plus.
+    complete: bool,
+    /// Nombre de points disponibles au calcul (prise en cours : recalcul s'il a grandi).
+    len: usize,
+}
+
+const WAVE_CHUNK: i64 = 256;
+
+impl WaveCache {
+    /// Min / max de la colonne `k` (en pixels depuis le début de la prise).
+    #[allow(clippy::too_many_arguments)]
+    fn column(
+        &mut self,
+        id: usize,
+        lvl: &[crate::render::Peak],
+        level: u8,
+        per: f64,
+        offset: u64,
+        spp: f64,
+        k: i64,
+    ) -> Option<(i8, i8)> {
+        let chunk = k.div_euclid(WAVE_CHUNK);
+        let key = (id, spp.to_bits(), offset, level, chunk);
+        let fresh = self
+            .map
+            .get(&key)
+            .is_some_and(|c| c.complete || c.len == lvl.len());
+        if !fresh {
+            if self.map.len() > 4096 {
+                self.map.clear();
+            }
+            let mut complete = true;
+            let cols = (0..WAVE_CHUNK)
+                .map(|j| {
+                    let kk = chunk * WAVE_CHUNK + j;
+                    if kk < 0 {
+                        return None;
+                    }
+                    let s0 = offset as f64 + kk as f64 * spp;
+                    if spp < per {
+                        // Zoom plus fin que les points : courbe lissée entre deux points
+                        // voisins (au lieu de marches d'escalier).
+                        let f = ((s0 + spp * 0.5) / per - 0.5).max(0.0);
+                        let i = f as usize;
+                        if i + 1 >= lvl.len() {
+                            complete = false;
+                        }
+                        let a = *lvl.get(i)?;
+                        let b = *lvl.get(i + 1).unwrap_or(&a);
+                        let u = (f - i as f64) as f32;
+                        let mix =
+                            |x: i8, y: i8| (x as f32 + (y as f32 - x as f32) * u).round() as i8;
+                        return Some((mix(a[0], b[0]), mix(a[1], b[1])));
+                    }
+                    let i0 = (s0 / per) as usize;
+                    let want = (((s0 + spp) / per) as usize).max(i0 + 1);
+                    if want > lvl.len() {
+                        complete = false;
+                    }
+                    let i1 = want.min(lvl.len());
+                    // Niveaux grossiers : le dernier point se complète encore (prise en cours,
+                    // calcul en cours) tant que la forme d'onde grandit.
+                    if level > 0 && i1 == lvl.len() {
+                        complete = false;
+                    }
+                    if i0 >= i1 {
+                        return None;
+                    }
+                    let (mut mn, mut mx) = (i8::MAX, i8::MIN);
+                    for pk in &lvl[i0..i1] {
+                        mn = mn.min(pk[0]);
+                        mx = mx.max(pk[1]);
+                    }
+                    Some((mn, mx))
+                })
+                .collect();
+            self.map.insert(
+                key,
+                WaveChunk {
+                    cols,
+                    complete,
+                    len: lvl.len(),
+                },
+            );
+        }
+        self.map[&key].cols[k.rem_euclid(WAVE_CHUNK) as usize]
+    }
+}
+
+thread_local! {
+    static WAVES: std::cell::RefCell<WaveCache> = std::cell::RefCell::new(WaveCache::default());
+}
+
+/// Échelle d'affichage de la forme d'onde : relevée pour les passages faibles (une voix à
+/// -20 dB occupe un tiers de la hauteur au lieu d'un dixième) ; 0 dB reste en haut.
+/// N'affecte que le dessin, jamais le son.
+fn wave_scale(v: i8) -> f32 {
+    // Les points sont déjà à l'échelle d'affichage (voir `render::to_peak`).
+    v as f32 / 127.0
+}
 
 /// Couleur d'une piste : celle choisie, sinon selon sa position.
 pub fn track_color(track: &crate::project::Track, idx: usize) -> Color32 {
@@ -54,7 +162,11 @@ pub struct ClipDrag {
     pub changed: bool,
 }
 
-/// Panneau de vumètre master stéréo (partagé avec le soundboard).
+/// Largeur du panneau de vumètre master (multipiste et soundboard).
+pub const MASTER_W: f32 = 100.0;
+
+/// Panneau de vumètre master stéréo (partagé avec le soundboard) : graduations à gauche,
+/// deux larges barres L / R séparées par un trait fin, crêtes max au-dessus.
 pub fn master_panel(ui: &mut egui::Ui, title: &str, meters: &mut [MeterState; 2]) {
     let full = ui.max_rect();
     let p = ui.painter().clone();
@@ -66,12 +178,20 @@ pub fn master_panel(ui: &mut egui::Ui, title: &str, meters: &mut [MeterState; 2]
         t::caps(10.0),
         t::TEXT_3,
     );
-    let rw = 32.0;
+    // Colonnes : graduations | barre L | séparation | barre R.
+    let bw = 26.0;
+    let sep = 5.0;
+    let rx_end = full.right() - 9.0;
+    let rx = rx_end - bw;
+    let lx = rx - sep - bw;
+    let scale_right = lx - 7.0;
+
+    // Crêtes max au-dessus de chaque barre (clic : remise à zéro).
     let top = full.top() + 26.0;
     let mut reset = false;
     for (k, m) in meters.iter().enumerate() {
-        let x = full.center().x + if k == 0 { -rw - 1.0 } else { 1.0 };
-        let r = Rect::from_min_size(pos2(x, top), vec2(rw, 16.0));
+        let cx = if k == 0 { lx } else { rx } + bw / 2.0;
+        let r = Rect::from_center_size(pos2(cx, top + 8.0), vec2(bw + 4.0, 16.0));
         w::peak_readout(&p, r, m);
         if ui
             .interact(r, ui.make_persistent_id((title, "pk", k)), Sense::click())
@@ -86,12 +206,9 @@ pub fn master_panel(ui: &mut egui::Ui, title: &str, meters: &mut [MeterState; 2]
             m.reset();
         }
     }
+
     let mtop = top + 26.0;
     let mbot = full.bottom() - 22.0;
-    let bw = 10.0;
-    let gap = 22.0;
-    let lx = full.center().x - gap / 2.0 - bw;
-    let rx = full.center().x + gap / 2.0;
     w::meter_v(
         &p,
         Rect::from_min_max(pos2(lx, mtop), pos2(lx + bw, mbot)),
@@ -102,25 +219,21 @@ pub fn master_panel(ui: &mut egui::Ui, title: &str, meters: &mut [MeterState; 2]
         Rect::from_min_max(pos2(rx, mtop), pos2(rx + bw, mbot)),
         &meters[1],
     );
-    let sc = Rect::from_min_max(
-        pos2(full.center().x - 8.0, mtop),
-        pos2(full.center().x + 8.0, mbot),
-    );
-    for db in w::SCALE {
-        let y = sc.bottom() - w::deflection(db) * sc.height();
-        w::hline(&p, lx + bw, lx + bw + 3.0, y, t::TEXT_3);
-        w::hline(&p, rx - 3.0, rx, y, t::TEXT_3);
-    }
+    // Trait fin entre les deux barres.
+    w::vline(&p, (lx + bw + sep / 2.0).round(), mtop, mbot, t::SURFACE_4);
+    // Graduations à gauche : chiffres alignés à droite, petits traits jusqu'à la barre L.
+    let h = mbot - mtop;
     let mut last = f32::MAX;
     for db in w::SCALE.iter().rev() {
-        let y = sc.bottom() - w::deflection(*db) * sc.height();
+        let y = mbot - w::deflection(*db) * h;
+        w::hline(&p, lx - 4.0, lx - 1.0, y, t::TEXT_3);
         if last - y < 11.0 && *db != 0.0 {
             continue;
         }
         last = y;
         p.text(
-            pos2(sc.center().x, y),
-            Align2::CENTER_CENTER,
+            pos2(scale_right, y),
+            Align2::RIGHT_CENTER,
             format!("{}", db.abs() as i32),
             t::regular(8.5),
             t::TEXT_3,
@@ -146,6 +259,7 @@ impl App {
     pub fn multitrack_ui(&mut self, ui: &mut egui::Ui) {
         self.multitrack_keys(ui.ctx());
         egui::Panel::top("mt_tools")
+            .resizable(false)
             .exact_size(36.0)
             .frame(
                 egui::Frame::new()
@@ -154,7 +268,8 @@ impl App {
             )
             .show(ui, |ui| self.toolbar(ui));
         egui::Panel::right("master")
-            .exact_size(86.0)
+            .resizable(false)
+            .exact_size(MASTER_W)
             .frame(egui::Frame::new().fill(t::SURFACE))
             .show(ui, |ui| {
                 let mut m = self.master_play;
@@ -163,10 +278,8 @@ impl App {
             });
         if self.show_bridge {
             egui::Panel::bottom("bridge")
-                .resizable(true)
-                .default_size(210.0)
-                .min_size(140.0)
-                .max_size(420.0)
+                .resizable(false)
+                .exact_size(210.0)
                 .frame(egui::Frame::new().fill(t::SURFACE))
                 .show(ui, |ui| self.meter_bridge(ui));
         }
@@ -180,6 +293,14 @@ impl App {
             return;
         }
         let none = egui::Modifiers::NONE;
+        let (mark_in, mark_out) =
+            ctx.input_mut(|i| (i.consume_key(none, Key::I), i.consume_key(none, Key::O)));
+        if mark_in {
+            self.set_range_point(self.playhead, true);
+        }
+        if mark_out {
+            self.set_range_point(self.playhead, false);
+        }
         let (space, rec, home, end, marker, fit, esc, all, left, right, split, del) = ctx
             .input_mut(|i| {
                 (
@@ -227,6 +348,7 @@ impl App {
         }
         if esc {
             self.selection = None;
+            self.ruler_anchor = None;
             self.selected_tracks.clear();
             self.sel_clips.clear();
         }
@@ -303,84 +425,84 @@ impl App {
             t::LINE,
         );
         let stopped = self.is_stopped();
-        let recording = self.is_recording();
+        // Boutons de montage grisés pendant une prise et sa finalisation.
+        let recording = self.editing_locked();
         ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if w::tool_button(ui, Some(Icon::Follow), "Suivre", self.view.follow, true)
-                .on_hover_text("La timeline suit la tête de lecture")
+            ui.spacing_mut().item_spacing.x = 3.0;
+            // Pictogrammes : la bulle d'aide nomme l'action et son raccourci.
+            if w::tool_icon(ui, Icon::Follow, self.view.follow, true)
+                .on_hover_text("Suivre la lecture : la timeline suit la tête de lecture")
                 .clicked()
             {
                 self.view.follow = !self.view.follow;
                 self.view.nav_until = 0.0;
             }
-            if w::tool_button(ui, Some(Icon::Snap), "Magnétisme", self.snap, true)
-                .on_hover_text("Les prises s'aimantent à la tête, aux repères et aux autres prises (Maj pour désactiver)")
+            if w::tool_icon(ui, Icon::Snap, self.snap, true)
+                .on_hover_text("Magnétisme : les prises s'aimantent à la tête, aux repères et aux autres prises (Maj pour désactiver)")
                 .clicked()
             {
                 self.snap = !self.snap;
             }
-            ui.add_space(8.0);
-            if w::tool_button(ui, Some(Icon::Marker), "Repère", false, true)
-                .on_hover_text("Ajouter un repère à la tête de lecture (M), même en enregistrement")
+            ui.add_space(10.0);
+            if w::tool_icon(ui, Icon::Marker, false, true)
+                .on_hover_text("Repère : en poser un à la tête de lecture (M), même en enregistrement")
                 .clicked()
             {
                 self.add_marker();
             }
-            if w::tool_button(ui, Some(Icon::Split), "Couper", false, !recording)
+            if w::tool_icon(ui, Icon::MarkIn, false, true)
+                .on_hover_text("Point d'entrée de la plage à la tête de lecture (I) — aussi : Ctrl + clic sur la règle")
+                .clicked()
+            {
+                self.set_range_point(self.playhead, true);
+            }
+            if w::tool_icon(ui, Icon::MarkOut, false, true)
+                .on_hover_text("Point de sortie de la plage à la tête de lecture (O) — aussi : Alt + clic sur la règle")
+                .clicked()
+            {
+                self.set_range_point(self.playhead, false);
+            }
+            let has_range = self.selection.is_some() || self.ruler_anchor.is_some();
+            if w::tool_icon(ui, Icon::ClearRange, false, has_range)
+                .on_hover_text("Effacer la plage de temps (Échap)")
+                .clicked()
+            {
+                self.selection = None;
+                self.ruler_anchor = None;
+            }
+            ui.add_space(10.0);
+            if w::tool_icon(ui, Icon::Scissors, false, !recording)
                 .on_hover_text("Couper à la tête de lecture (S) : prises sélectionnées, ou toutes celles sous la tête")
                 .clicked()
             {
                 self.split_at_playhead();
             }
             let can_del = !recording && (!self.sel_clips.is_empty() || self.selection.is_some());
-            if w::tool_button(ui, Some(Icon::Close), "Supprimer", false, can_del)
-                .on_hover_text("Supprimer les prises sélectionnées, ou le contenu de la plage sélectionnée (Suppr)")
+            if w::tool_icon(ui, Icon::Trash, false, can_del)
+                .on_hover_text("Supprimer les prises sélectionnées, ou le contenu de la plage (Suppr)")
                 .clicked()
             {
                 self.delete_selection();
             }
-            ui.add_space(8.0);
-            if w::icon_button(ui, Icon::Undo, 24.0, BtnStyle::Ghost, !self.undo.is_empty() && !recording, "Annuler (Ctrl+Z)").clicked() {
+            ui.add_space(10.0);
+            if w::tool_icon(ui, Icon::Undo, false, !self.undo.is_empty() && !recording)
+                .on_hover_text("Annuler (Ctrl+Z)")
+                .clicked()
+            {
                 self.undo();
             }
-            let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-            let en = !self.redo.is_empty() && !recording;
-            if resp.hovered() && en {
-                ui.painter().rect_filled(r, t::R, t::SURFACE_3);
-            }
-            // Icône « rétablir » = annuler en miroir.
-            let col = if en { t::TEXT_2 } else { t::TEXT_3.gamma_multiply(0.5) };
-            let c = r.center();
-            let s = 5.8;
-            let pts: Vec<egui::Pos2> = (0..=10)
-                .map(|k| {
-                    let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * k as f32 / 10.0;
-                    c + vec2(0.55 * s * a.cos() - 0.1 * s, 0.55 * s * a.sin() + 0.1 * s)
-                })
-                .collect();
-            ui.painter().add(egui::Shape::line(pts, Stroke::new(1.0, col)));
-            let tip = c + vec2(-0.1 * s, -0.45 * s);
-            ui.painter().add(egui::Shape::convex_polygon(
-                vec![tip + vec2(0.45, 0.0) * s, tip + vec2(0.0, -0.3) * s, tip + vec2(0.0, 0.3) * s],
-                col,
-                Stroke::NONE,
-            ));
-            if resp.on_hover_text("Rétablir (Ctrl+Maj+Z)").clicked() && en {
+            if w::tool_icon(ui, Icon::Redo, false, !self.redo.is_empty() && !recording)
+                .on_hover_text("Rétablir (Ctrl+Maj+Z)")
+                .clicked()
+            {
                 self.redo();
             }
-            ui.add_space(8.0);
-            if w::tool_button(ui, Some(Icon::Meters), "Vumètres", self.show_bridge, true)
-                .on_hover_text("Afficher tous les vumètres d'entrée")
+            ui.add_space(10.0);
+            if w::tool_icon(ui, Icon::Meters, self.show_bridge, true)
+                .on_hover_text("Vumètres : afficher tous les vumètres d'entrée")
                 .clicked()
             {
                 self.show_bridge = !self.show_bridge;
-            }
-            if self.selection.is_some()
-                && w::tool_button(ui, Some(Icon::Close), "Effacer la plage", false, true)
-                    .on_hover_text("Désélectionner la plage de temps (Échap)")
-                    .clicked()
-            {
-                self.selection = None;
             }
         });
 
@@ -390,34 +512,26 @@ impl App {
                 .max_rect(right)
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
-        child.spacing_mut().item_spacing.x = 4.0;
-        if w::tool_button(
+        child.spacing_mut().item_spacing.x = 3.0;
+        if w::tool_icon(
             &mut child,
-            Some(Icon::Export),
-            "Exporter",
+            Icon::Export,
             false,
             self.project.has_audio() && stopped,
         )
+        .on_hover_text("Exporter les pistes ou un mix (Ctrl+E)")
         .clicked()
         {
             self.open_export();
         }
         // Ajouter des pistes : dialogue « Nouvelles pistes » (nombre, type, entrées).
-        if w::tool_button(
-            &mut child,
-            Some(Icon::Plus),
-            "Ajouter des pistes",
-            false,
-            stopped,
-        )
-        .on_hover_text("Une ou plusieurs pistes, mono ou stéréo, sur des entrées qui se suivent")
-        .clicked()
+        if w::tool_icon(&mut child, Icon::AddTrack, false, stopped)
+            .on_hover_text("Ajouter des pistes : une ou plusieurs, mono ou stéréo, sur des entrées qui se suivent")
+            .clicked()
         {
             self.open_new_tracks();
         }
     }
-
-    // ---------------------------------------------------------------- repères temporels
 
     fn x_of(&self, left: f32, sample: u64) -> f32 {
         left + ((sample as f64 - self.view.scroll) / self.view.spp) as f32
@@ -527,6 +641,29 @@ impl App {
                     0.0,
                     t::ACCENT.gamma_multiply(0.28),
                 );
+            }
+        }
+        // Point d'entrée ou de sortie posé seul (Ctrl / Alt + clic), en attente de l'autre.
+        if self.selection.is_none()
+            && let Some((x, is_in)) = self.ruler_anchor
+        {
+            let x = self.x_of(rect.left(), x);
+            if x >= rect.left() && x <= rect.right() {
+                w::vline(&p, x, rect.top(), rect.bottom(), t::ACCENT);
+                let tri = if is_in {
+                    vec![
+                        pos2(x, rect.top()),
+                        pos2(x + 7.0, rect.top()),
+                        pos2(x, rect.top() + 7.0),
+                    ]
+                } else {
+                    vec![
+                        pos2(x, rect.top()),
+                        pos2(x - 7.0, rect.top()),
+                        pos2(x, rect.top() + 7.0),
+                    ]
+                };
+                p.add(egui::Shape::convex_polygon(tri, t::ACCENT, Stroke::NONE));
             }
         }
 
@@ -668,11 +805,13 @@ impl App {
         }
     }
 
-    /// Clic = déplacer la tête ; glisser = sélection de temps.
-    /// Règle : attraper la tête de lecture et la tirer ; ailleurs, glisser = sélection de
-    /// temps, clic = aller à cet endroit. Tout est aimanté à la grille (Maj : libre).
+    /// Règle : clic = aller à cet endroit ; glisser = faire défiler la timeline (attraper la
+    /// tête de lecture elle-même la déplace). Plage de temps : **Ctrl + clic = point
+    /// d'entrée, Alt + clic = point de sortie**. Tout est aimanté à la grille (Maj : libre).
     fn time_select(&mut self, resp: &egui::Response, left: f32) {
-        let free = resp.ctx.input(|i| i.modifiers.shift);
+        let (free, ctrl, alt) = resp
+            .ctx
+            .input(|i| (i.modifiers.shift, i.modifiers.command, i.modifiers.alt));
         let ph_x = self.x_of(left, self.playhead);
         let near_head = |x: f32| (x - ph_x).abs() <= 7.0;
         if (self.playhead_drag || resp.hover_pos().is_some_and(|h| near_head(h.x)))
@@ -680,53 +819,77 @@ impl App {
         {
             resp.ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
-        if resp.drag_started() {
+        if resp.drag_started() && !ctrl && !alt {
             let origin = resp.ctx.input(|i| i.pointer.press_origin());
-            if let Some(p) = origin.or(resp.interact_pointer_pos()) {
-                if near_head(p.x) && !self.is_recording() {
-                    self.playhead_drag = true;
-                } else {
-                    let a = self.snap_pos(self.sample_at(left, p.x), free, false);
-                    self.ruler_anchor = Some(a);
-                }
+            if let Some(p) = origin.or(resp.interact_pointer_pos())
+                && near_head(p.x)
+                && !self.is_recording()
+            {
+                self.playhead_drag = true;
             }
+        }
+        // Glisser ailleurs sur la règle : défilement horizontal de la timeline.
+        if resp.dragged() && !self.playhead_drag && !ctrl && !alt {
+            let dx = resp.drag_delta().x as f64;
+            if dx != 0.0 {
+                self.view.scroll = (self.view.scroll - dx * self.view.spp).max(0.0);
+                self.user_navigated();
+            }
+            resp.ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         }
         if resp.dragged()
-            && let Some(p) = resp.interact_pointer_pos()
-        {
-            if self.playhead_drag {
-                let s = self.snap_pos(self.sample_at(left, p.x), free, true);
-                self.scrub_to(s);
-            } else if let Some(a) = self.ruler_anchor {
-                let b = self.snap_pos(self.sample_at(left, p.x), free, false);
-                if (b as f64 - a as f64).abs() / self.view.spp > 3.0 {
-                    self.selection = Some((a.min(b), a.max(b)));
-                }
-            }
-        }
-        if resp.drag_stopped() {
-            if self.playhead_drag {
-                self.playhead_drag = false;
-                // Position finale exacte, aussi en lecture.
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let s = self.snap_pos(self.sample_at(left, p.x), free, true);
-                    self.seek(s);
-                }
-            } else {
-                self.ruler_anchor = None;
-                if let Some((a, _)) = self.selection
-                    && self.is_stopped()
-                {
-                    self.playhead = a;
-                }
-            }
-        }
-        if resp.clicked()
-            && !self.is_recording()
+            && self.playhead_drag
             && let Some(p) = resp.interact_pointer_pos()
         {
             let s = self.snap_pos(self.sample_at(left, p.x), free, true);
+            self.scrub_to(s);
+        }
+        if resp.drag_stopped() && self.playhead_drag {
+            self.playhead_drag = false;
+            // Position finale exacte, aussi en lecture.
+            if let Some(p) = resp.interact_pointer_pos() {
+                let s = self.snap_pos(self.sample_at(left, p.x), free, true);
+                self.seek(s);
+            }
+        }
+        if !resp.clicked() {
+            return;
+        }
+        let Some(p) = resp.interact_pointer_pos() else {
+            return;
+        };
+        let s = self.snap_pos(self.sample_at(left, p.x), free, !(ctrl || alt));
+        if ctrl || alt {
+            self.set_range_point(s, ctrl);
+        } else if !self.is_recording() {
             self.seek(s);
+        }
+    }
+
+    /// Pose le point d'entrée (`is_in`) ou de sortie de la plage de temps. La plage est
+    /// formée dès que l'autre point existe du bon côté ; sinon le point attend l'autre.
+    fn set_range_point(&mut self, s: u64, is_in: bool) {
+        let other = match (self.selection, self.ruler_anchor) {
+            (Some((a, b)), _) => Some(if is_in { b } else { a }),
+            (None, Some((x, anchor_in))) if anchor_in != is_in => Some(x),
+            _ => None,
+        };
+        let range = other.and_then(|o| {
+            let (a, b) = if is_in { (s, o) } else { (o, s) };
+            (b > a).then_some((a, b))
+        });
+        match range {
+            Some(r) => {
+                self.selection = Some(r);
+                self.ruler_anchor = None;
+                if self.is_stopped() {
+                    self.playhead = r.0;
+                }
+            }
+            None => {
+                self.selection = None;
+                self.ruler_anchor = Some((s, is_in));
+            }
         }
     }
 
@@ -1121,7 +1284,7 @@ impl App {
         let mut clip_to_delete = None;
         let mut audible_changed = false;
         let stopped = self.is_stopped();
-        let editable = !self.is_recording();
+        let editable = !self.editing_locked();
         let in_ch = self.engine.status.in_channels;
         let blink = (self.now * 1.6).fract() < 0.55;
         let (pointer, press_origin, shift, command) = ui.input(|i| {
@@ -1170,22 +1333,6 @@ impl App {
             ui.spacing_mut().item_spacing.y = 0.0;
             lanes_top = ui.cursor().top();
             let ntracks = self.project.tracks.len();
-            if ntracks == 0 {
-                ui.add_space(40.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("Aucune piste")
-                            .font(t::semibold(13.0))
-                            .color(t::TEXT_2),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "« Ajouter des pistes » : une ou plusieurs d'un coup, sur les entrées de votre choix.",
-                        )
-                        .color(t::TEXT_3),
-                    );
-                });
-            }
             let mut spans = Vec::with_capacity(ntracks);
             for idx in 0..ntracks {
                 let tid = self.project.tracks[idx].id;
@@ -1698,11 +1845,22 @@ impl App {
                         pressed_clip = Some(h);
                     }
                 }
-                if let Transport::Recording { start } = self.transport
+                // Prise en cours, ou en finalisation (fichiers en train d'être fermés) : elle
+                // reste affichée jusqu'à son intégration à la session.
+                let live_span = match self.transport {
+                    Transport::Recording { start } => Some((start, None)),
+                    _ => self.finishing.as_ref().map(|f| (f.start, Some(()))),
+                };
+                if let Some((start, finishing)) = live_span
                     && let Some(l) = self.live.iter().find(|l| l.track_id == track.id)
                 {
+                    let end = if finishing.is_some() {
+                        start + (l.peaks.read().l0.len() * crate::render::PEAK_BLOCK) as u64
+                    } else {
+                        self.playhead
+                    };
                     let x0 = self.x_of(lane.left(), start);
-                    let x1 = self.x_of(lane.left(), self.playhead);
+                    let x1 = self.x_of(lane.left(), end);
                     let crect = Rect::from_min_max(
                         pos2(x0, inner.top()),
                         pos2(x1.max(x0 + 2.0), inner.bottom()),
@@ -1885,6 +2043,87 @@ impl App {
                     }
                 });
             }
+            // Sous la dernière piste, la timeline et la colonne des pistes continuent jusqu'en
+            // bas : on clique (aller à cet endroit) et on trace un rectangle de sélection depuis
+            // n'importe où.
+            let rest_top = ui.cursor().top();
+            let rest_h = (ui.clip_rect().bottom() - rest_top).max(60.0);
+            let (rest, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), rest_h), Sense::hover());
+            let rest_head = Rect::from_min_size(rest.min, vec2(HEADER_W, rest_h));
+            let rest_lane = Rect::from_min_max(pos2(rest.left() + HEADER_W, rest.top()), rest.max);
+            {
+                let p = ui.painter();
+                p.rect_filled(rest_head, 0.0, t::SURFACE);
+                p.rect_filled(rest_lane, 0.0, t::LANE_A);
+                let lp = ui.painter_at(rest_lane);
+                for &(gx, major) in &grid_x {
+                    let col = if major { t::GRID } else { t::GRID.gamma_multiply(0.45) };
+                    w::vline(&lp, gx, rest_lane.top(), rest_lane.bottom(), col);
+                }
+                w::vline(p, rest_head.right() - 1.0, rest.top(), rest.bottom(), t::LINE);
+                if ntracks == 0 {
+                    p.text(
+                        pos2(rest_lane.center().x, rest.top() + 50.0),
+                        Align2::CENTER_CENTER,
+                        "Aucune piste",
+                        t::semibold(13.0),
+                        t::TEXT_2,
+                    );
+                    p.text(
+                        pos2(rest_lane.center().x, rest.top() + 72.0),
+                        Align2::CENTER_CENTER,
+                        "Bouton « Ajouter des pistes » en haut à droite : une ou plusieurs d'un coup, sur les entrées de votre choix.",
+                        t::regular(12.0),
+                        t::TEXT_3,
+                    );
+                }
+            }
+            let rresp = ui.interact(
+                rest_lane,
+                ui.make_persistent_id("lanes_rest"),
+                Sense::click_and_drag(),
+            );
+            let (command, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+            if rresp.drag_started() {
+                let pp = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or(rresp.interact_pointer_pos())
+                    .unwrap_or_default();
+                let s = self.sample_at(rest_lane.left(), pp.x);
+                let y = pp.y - lanes_top;
+                let base = if command || shift {
+                    self.sel_clips.clone()
+                } else {
+                    HashSet::new()
+                };
+                self.marquee = Some(Marquee {
+                    sample: s,
+                    y,
+                    base,
+                    cur: (s, y),
+                });
+            }
+            if rresp.dragged()
+                && self.marquee.is_some()
+                && let Some(pp) = rresp.interact_pointer_pos()
+            {
+                let cur = (self.sample_at(rest_lane.left(), pp.x), pp.y - lanes_top);
+                self.update_marquee(cur);
+            }
+            if rresp.drag_stopped() {
+                self.marquee = None;
+            }
+            if rresp.clicked() {
+                self.sel_clips.clear();
+                if !self.is_recording()
+                    && let Some(pp) = rresp.interact_pointer_pos()
+                {
+                    let s = self.sample_at(rest_lane.left(), pp.x);
+                    let s = self.snap_pos(s, shift, true);
+                    self.seek(s);
+                }
+            }
             self.view.row_spans = spans;
             if let Some(m) = &self.marquee {
                 let x0 = self.x_of(tl_left, m.sample);
@@ -1897,7 +2136,6 @@ impl App {
                 p.rect_filled(r, 0.0, t::ACCENT.gamma_multiply(0.10));
                 p.rect_stroke(r, 0.0, Stroke::new(1.0, t::ACCENT.gamma_multiply(0.8)), StrokeKind::Inside);
             }
-            ui.add_space(50.0);
         });
         self.view.scroll_y = out.state.clamped_offset().y;
         self.view.viewport_h = out.inner_rect.height();
@@ -2013,59 +2251,45 @@ impl App {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 1.0;
                     let col_w = 44.0;
-                    let tracks: Vec<MeterTrack> = self
-                        .project
-                        .tracks
-                        .iter()
-                        .enumerate()
-                        .map(|(i, tr)| {
-                            let label = match tr.input {
-                                Some(i) if tr.stereo => format!("entrées {}-{}", i + 1, i + 2),
-                                Some(i) => format!("entrée {}", i + 1),
-                                None => "pas d'entrée".into(),
-                            };
-                            (
-                                tr.id,
-                                tr.name.clone(),
-                                tr.inputs().collect(),
-                                tr.armed,
-                                i,
-                                label,
-                                track_color(tr, i),
-                            )
-                        })
-                        .collect();
-                    for (id, name, chans, armed, idx, label, color) in tracks {
+                    // Aucune allocation par image : on lit les pistes en place, et les
+                    // colonnes hors de la zone visible ne sont pas dessinées.
+                    let mut reset: Option<[Option<u16>; 2]> = None;
+                    let mut select = None;
+                    for idx in 0..self.project.tracks.len() {
                         let (r, resp) =
                             ui.allocate_exact_size(vec2(col_w, area.height()), Sense::click());
+                        if !ui.is_rect_visible(r) {
+                            continue;
+                        }
+                        let tr = &self.project.tracks[idx];
+                        let (id, armed, color) = (tr.id, tr.armed, track_color(tr, idx));
+                        let chans: [Option<u16>; 2] = match tr.input {
+                            Some(i) if tr.stereo => [Some(i), Some(i + 1)],
+                            Some(i) => [Some(i), None],
+                            None => [None, None],
+                        };
+                        let meter = |c: Option<u16>| match c {
+                            Some(i) if (i as usize) < audio::MAX_INPUTS && i < in_ch => {
+                                self.in_meters[i as usize]
+                            }
+                            _ => MeterState::default(),
+                        };
+                        let stereo = chans[1].is_some();
+                        let (m0, m1) = (meter(chans[0]), meter(chans[1]));
+                        let merged = if stereo { m0.merge(m1) } else { m0 };
                         let p = ui.painter();
                         let sel = self.selected_tracks.contains(&id);
                         if sel || resp.hovered() {
                             p.rect_filled(r, 0.0, if sel { t::SURFACE_3 } else { t::SURFACE_2 });
                         }
-                        let ms: Vec<MeterState> = chans
-                            .iter()
-                            .map(|&i| {
-                                if (i as usize) < audio::MAX_INPUTS && i < in_ch {
-                                    self.in_meters[i as usize]
-                                } else {
-                                    MeterState::default()
-                                }
-                            })
-                            .collect();
-                        let merged = ms
-                            .iter()
-                            .copied()
-                            .reduce(MeterState::merge)
-                            .unwrap_or_default();
                         let pr = Rect::from_center_size(
                             pos2(r.center().x, r.top() + 10.0),
                             vec2(38.0, 15.0),
                         );
                         w::peak_readout(p, pr, &merged);
-                        if ms.len() == 2 {
+                        if stereo {
                             // Stéréo : deux barres côte à côte (gauche, droite).
-                            for (k, m) in ms.iter().enumerate() {
+                            for (k, m) in [m0, m1].iter().enumerate() {
                                 let x = r.center().x - 4.0 + k as f32 * 4.5;
                                 let mr = Rect::from_min_max(pos2(x, top), pos2(x + 3.5, bottom));
                                 w::meter_v(p, mr, m);
@@ -2095,25 +2319,40 @@ impl App {
                         p.text(
                             pos2(r.center().x, bottom + 28.0),
                             Align2::CENTER_CENTER,
-                            short(&name, 6),
+                            short(&tr.name, 6),
                             t::regular(9.0),
                             t::TEXT_3,
                         );
-                        let resp = resp.on_hover_text(format!("{name} — {label}"));
+                        // Bulle construite seulement au survol.
+                        let resp = resp.on_hover_ui(|ui| {
+                            let tr = &self.project.tracks[idx];
+                            let label = match tr.input {
+                                Some(i) if tr.stereo => format!("entrées {}-{}", i + 1, i + 2),
+                                Some(i) => format!("entrée {}", i + 1),
+                                None => "pas d'entrée".into(),
+                            };
+                            ui.label(format!("{} — {label}", tr.name));
+                        });
                         if resp.clicked()
                             && let Some(pp) = resp.interact_pointer_pos()
                         {
                             if pr.contains(pp) {
-                                for &i in &chans {
-                                    if let Some(mm) = self.in_meters.get_mut(i as usize) {
-                                        mm.reset();
-                                    }
-                                }
+                                reset = Some(chans);
                             } else {
-                                self.selected_tracks.clear();
-                                self.selected_tracks.insert(id);
+                                select = Some(id);
                             }
                         }
+                    }
+                    if let Some(chans) = reset {
+                        for i in chans.into_iter().flatten() {
+                            if let Some(mm) = self.in_meters.get_mut(i as usize) {
+                                mm.reset();
+                            }
+                        }
+                    }
+                    if let Some(id) = select {
+                        self.selected_tracks.clear();
+                        self.selected_tracks.insert(id);
                     }
                 });
             });
@@ -2308,9 +2547,9 @@ pub fn draw_clip(
 ) {
     let cr = CornerRadius::same(t::R);
     let body = if selected {
-        t::mix(t::LANE_A, color, 0.62)
+        t::mix(t::LANE_A, color, 0.42)
     } else {
-        t::mix(t::LANE_A, color, 0.40)
+        t::mix(t::LANE_A, color, 0.26)
     };
     painter.rect_filled(rect, cr, body);
     let head = Rect::from_min_max(
@@ -2334,31 +2573,37 @@ pub fn draw_clip(
     );
     if let Some(peaks) = peaks {
         let data = peaks.read();
-        let (lvl, per) = if spp >= (PEAK_BLOCK * PEAK_L1 * 2) as f64 {
-            (&data.l1, (PEAK_BLOCK * PEAK_L1) as f64)
+        let l1 = (PEAK_BLOCK * PEAK_L1) as f64;
+        let l2 = l1 * PEAK_L1 as f64;
+        let (lvl, per, level) = if spp >= l2 * 2.0 {
+            (&data.l2, l2, 2u8)
+        } else if spp >= l1 * 2.0 {
+            (&data.l1, l1, 1)
         } else {
-            (&data.l0, PEAK_BLOCK as f64)
+            (&data.l0, PEAK_BLOCK as f64, 0)
         };
         if !lvl.is_empty() {
-            let x0 = rect.left().max(visible.left()).floor();
+            // Colonnes repérées depuis le début de la prise (stables quand on fait défiler),
+            // calculées une fois puis relues dans le cache.
+            let left = rect.left().floor();
+            let x0 = left.max(visible.left().floor());
             let x1 = rect.right().min(visible.right()).ceil();
+            let k0 = (x0 - left) as i64;
             let wave =
                 Rect::from_min_max(pos2(x0, head.bottom() + 2.0), pos2(x1, rect.bottom() - 2.0));
-            let wcol = t::mix(body, Color32::BLACK, 0.62);
-            let mesh = w::wave_mesh(wave, wcol, |i| {
-                let x = x0 + i as f32;
-                let s0 = offset as f64 + (x - rect.left()) as f64 * spp;
-                let i0 = (s0 / per) as usize;
-                let i1 = (((s0 + spp) / per) as usize).max(i0 + 1).min(lvl.len());
-                if i0 >= lvl.len() {
-                    return None;
-                }
-                let (mut mn, mut mx) = (i16::MAX, i16::MIN);
-                for pk in &lvl[i0..i1] {
-                    mn = mn.min(pk[0]);
-                    mx = mx.max(pk[1]);
-                }
-                Some((mn as f32 / 32767.0, mx as f32 / 32767.0))
+            // Forme claire sur fond sombre teinté : lisible et contrastée.
+            let wcol = if selected {
+                t::mix(color, Color32::WHITE, 0.55)
+            } else {
+                t::mix(color, Color32::WHITE, 0.22)
+            };
+            let id = data.id as usize;
+            let mesh = WAVES.with_borrow_mut(|cache| {
+                w::wave_mesh(wave, wcol, |i| {
+                    cache
+                        .column(id, lvl, level, per, offset, spp, k0 + i as i64)
+                        .map(|(mn, mx)| (wave_scale(mn), wave_scale(mx)))
+                })
             });
             painter.add(egui::Shape::mesh(mesh));
         }
@@ -2472,6 +2717,108 @@ fn fmt_ruler(tt: f64, step: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::fmt_ruler;
+
+    /// Cache des formes d'onde : mêmes valeurs qu'un calcul direct, recalcul quand une
+    /// prise en cours s'allonge, et troisième niveau de détail tenu à jour.
+    #[test]
+    fn wave_cache_matches_direct_computation() {
+        use super::WaveCache;
+        use crate::render::{PEAK_BLOCK, PEAK_L1};
+        let mut pd = crate::render::PeakData::default();
+        let pts: Vec<crate::render::Peak> = (0..5000)
+            .map(|i| [-((i % 120) as i8), (i % 127) as i8])
+            .collect();
+        pd.extend(&pts[..3000]);
+        assert_eq!(pd.l2.len(), 3000_usize.div_ceil(PEAK_L1 * PEAK_L1));
+        let (per, spp, offset) = (PEAK_BLOCK as f64, 3.5 * PEAK_BLOCK as f64, 2048);
+        let direct = |lvl: &[crate::render::Peak], k: i64| {
+            let s0 = offset as f64 + k as f64 * spp;
+            let i0 = (s0 / per) as usize;
+            let i1 = (((s0 + spp) / per) as usize).max(i0 + 1).min(lvl.len());
+            (i0 < i1).then(|| {
+                lvl[i0..i1]
+                    .iter()
+                    .fold((i8::MAX, i8::MIN), |(a, b), p| (a.min(p[0]), b.max(p[1])))
+            })
+        };
+        let mut c = WaveCache::default();
+        for k in [0, 1, 255, 256, 700, 857, 900] {
+            assert_eq!(
+                c.column(1, &pd.l0, 0, per, offset, spp, k),
+                direct(&pd.l0, k),
+                "colonne {k}"
+            );
+        }
+        // La prise s'allonge : le paquet incomplet est recalculé.
+        assert_eq!(c.column(1, &pd.l0, 0, per, offset, spp, 900), None);
+        pd.extend(&pts[3000..]);
+        assert_eq!(
+            c.column(1, &pd.l0, 0, per, offset, spp, 900),
+            direct(&pd.l0, 900)
+        );
+        assert!(c.column(1, &pd.l0, 0, per, offset, spp, 900).is_some());
+    }
+
+    /// Charge : forme d'onde d'une prise de 3 h (48 kHz) : mémoire des points, calcul de
+    /// toute la largeur d'écran au zoom arrière, puis défilement (relecture du cache).
+    /// `cargo test --release -- --ignored --nocapture charge_formes_d_onde`
+    #[test]
+    #[ignore]
+    fn charge_formes_d_onde_3h() {
+        use super::WaveCache;
+        use crate::render::{PEAK_BLOCK, PEAK_L1, PeakData};
+        let frames = 3 * 3600 * 48_000usize;
+        let n = frames.div_ceil(PEAK_BLOCK);
+        let pts: Vec<crate::render::Peak> = (0..n)
+            .map(|i| [-((i % 97) as i8), (i % 109) as i8])
+            .collect();
+        let t = std::time::Instant::now();
+        let mut pd = PeakData::default();
+        pd.extend(&pts);
+        let build = t.elapsed();
+        let mem = (pd.l0.len() + pd.l1.len() + pd.l2.len()) * 4;
+        let width = 1600i64;
+        for (label, spp) in [
+            ("zoom arrière (3 h à l'écran)", frames as f64 / width as f64),
+            (
+                "zoom moyen (1 min à l'écran)",
+                48_000.0 * 60.0 / width as f64,
+            ),
+            ("zoom fin (1 s à l'écran)", 48_000.0 / width as f64),
+        ] {
+            let l1 = (PEAK_BLOCK * PEAK_L1) as f64;
+            let l2 = l1 * PEAK_L1 as f64;
+            let (lvl, per, level) = if spp >= l2 * 2.0 {
+                (&pd.l2, l2, 2u8)
+            } else if spp >= l1 * 2.0 {
+                (&pd.l1, l1, 1)
+            } else {
+                (&pd.l0, PEAK_BLOCK as f64, 0)
+            };
+            let mut c = WaveCache::default();
+            let t = std::time::Instant::now();
+            for k in 0..width {
+                std::hint::black_box(c.column(1, lvl, level, per, 0, spp, k));
+            }
+            let cold = t.elapsed();
+            // Défilement de 3 px par image pendant 60 images : relu dans le cache.
+            let t = std::time::Instant::now();
+            for f in 0..60i64 {
+                for k in 0..width {
+                    std::hint::black_box(c.column(1, lvl, level, per, 0, spp, k + f * 3));
+                }
+            }
+            let warm = t.elapsed() / 60;
+            println!(
+                "formes d'onde · {label} : 1re image {cold:?}, image suivante {warm:?} (piste de 3 h, {:.1} Mo de points, construits en {build:?})",
+                mem as f64 / 1e6
+            );
+            assert!(
+                warm < std::time::Duration::from_millis(4),
+                "dessin trop lent"
+            );
+        }
+    }
 
     /// Graduations : décimales selon la finesse (zoom), jusqu'à la milliseconde.
     #[test]

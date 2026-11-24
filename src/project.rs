@@ -434,7 +434,10 @@ impl Project {
 
     /// "Enregistrer sous" : copie les fichiers audio dans le nouveau dossier.
     /// Utilisable sur une copie de la session depuis un autre thread.
-    pub fn save_as(&mut self, new_dir: PathBuf, new_name: String) -> Result<()> {
+    /// Renvoie les fichiers audio introuvables (non copiés) : la session est enregistrée,
+    /// mais ces prises seront muettes.
+    pub fn save_as(&mut self, new_dir: PathBuf, new_name: String) -> Result<Vec<String>> {
+        let mut missing = Vec::new();
         // On prépare tout sur une copie : la session courante n'est modifiée qu'une fois
         // la copie des fichiers et la sauvegarde réussies.
         let mut next = self.clone();
@@ -471,6 +474,7 @@ impl Project {
             for f in files {
                 let src = old_audio.join(&f);
                 if !src.exists() {
+                    missing.push(f.clone());
                     continue;
                 }
                 // Un fichier du même nom existe déjà dans la cible : jamais réutilisé tel
@@ -495,7 +499,7 @@ impl Project {
         }
         next.save()?;
         *self = next;
-        Ok(())
+        Ok(missing)
     }
 
     /// Nom de fichier unique pour une nouvelle prise.

@@ -770,14 +770,15 @@ pub fn copy_into_session(src: &Path, dir: &Path) -> Result<PathBuf> {
     anyhow::bail!("Trop de sons nommés « {stem} » dans la session")
 }
 
-/// Au-delà, seuls le début et la fin des fichiers sont comparés.
-const FULL_COMPARE_MAX: u64 = 64 * 1024 * 1024;
 const EDGE_COMPARE: u64 = 1024 * 1024;
 
 /// Deux fichiers de taille `size` ont le même contenu (en entier jusqu'à 64 Mo, sinon le
 /// premier et le dernier Mo).
 fn same_contents(a: &Path, b: &Path, size: u64) -> std::io::Result<bool> {
-    compare_files(a, b, size, FULL_COMPARE_MAX, EDGE_COMPARE)
+    // Comparaison complète : deux gros sons de même nom et même taille peuvent ne différer
+    // qu'au milieu (début et fin silencieux). Les gros fichiers sont copiés en arrière-plan,
+    // ce n'est donc jamais l'interface qui attend.
+    compare_files(a, b, size, u64::MAX, EDGE_COMPARE)
 }
 
 fn compare_files(a: &Path, b: &Path, size: u64, full_max: u64, edge: u64) -> std::io::Result<bool> {

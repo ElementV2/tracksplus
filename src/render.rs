@@ -12,22 +12,49 @@ use std::sync::{Arc, OnceLock};
 /// morceaux (beaucoup de pistes sur un même disque = moins d'allers-retours).
 const WAV_BUF: usize = 512 * 1024;
 
-/// Nombre d'échantillons résumés par un point de forme d'onde.
-pub const PEAK_BLOCK: usize = 1024;
+/// Nombre d'échantillons résumés par un point de forme d'onde (≈ 5 ms à 48 kHz : détail
+/// fin au zoom ; au-delà, la courbe est lissée entre les points).
+pub const PEAK_BLOCK: usize = 256;
 
 /// Facteur entre les deux niveaux de détail de la forme d'onde.
 pub const PEAK_L1: usize = 16;
 
-/// Forme d'onde : (min, max) quantifiés sur i16, sur deux niveaux de détail
-/// (`PEAK_BLOCK` et `PEAK_BLOCK * PEAK_L1` échantillons par point).
-#[derive(Default)]
+/// Forme d'onde : (min, max) quantifiés sur i16, sur trois niveaux de détail
+/// (`PEAK_BLOCK`, `× PEAK_L1` et `× PEAK_L1²` échantillons par point) : quel que soit le
+/// zoom, un pixel ne lit qu'une poignée de points, même sur une prise de plusieurs heures.
+/// Point de forme d'onde : (min, max) sur 8 bits, déjà à l'échelle d'affichage (racine
+/// carrée de l'amplitude : les passages faibles gardent leur détail). Deux octets par point.
+pub type Peak = [i8; 2];
+
 pub struct PeakData {
-    pub l0: Vec<[i16; 2]>,
-    pub l1: Vec<[i16; 2]>,
+    /// Identifiant unique (jamais réutilisé) : sert de clé au cache du dessin.
+    pub id: u64,
+    pub l0: Vec<Peak>,
+    pub l1: Vec<Peak>,
+    pub l2: Vec<Peak>,
+}
+
+impl Default for PeakData {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            l0: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        }
+    }
 }
 
 impl PeakData {
-    pub fn extend(&mut self, new: &[[i16; 2]]) {
+    /// Rend la mémoire réservée en trop une fois la forme d'onde complète.
+    pub fn shrink(&mut self) {
+        self.l0.shrink_to_fit();
+        self.l1.shrink_to_fit();
+        self.l2.shrink_to_fit();
+    }
+
+    pub fn extend(&mut self, new: &[Peak]) {
         for &p in new {
             self.l0.push(p);
             let i = self.l0.len() - 1;
@@ -37,17 +64,29 @@ impl PeakData {
                 last[0] = last[0].min(p[0]);
                 last[1] = last[1].max(p[1]);
             }
+            if i.is_multiple_of(PEAK_L1 * PEAK_L1) {
+                self.l2.push(p);
+            } else if let Some(last) = self.l2.last_mut() {
+                last[0] = last[0].min(p[0]);
+                last[1] = last[1].max(p[1]);
+            }
         }
     }
 }
 
 pub type Peaks = Arc<RwLock<PeakData>>;
 
-pub fn to_peak(min: f32, max: f32) -> [i16; 2] {
-    [
-        (min.clamp(-1.0, 1.0) * 32767.0) as i16,
-        (max.clamp(-1.0, 1.0) * 32767.0) as i16,
-    ]
+pub fn to_peak(min: f32, max: f32) -> Peak {
+    // Compression racine carrée (comme l'affichage) puis 8 bits.
+    let q = |x: f32| {
+        let x = if x.is_finite() {
+            x.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        (x.signum() * x.abs().sqrt() * 127.0).round() as i8
+    };
+    [q(min), q(max)]
 }
 
 /// Accumulateur de forme d'onde utilisé pendant l'enregistrement.
@@ -75,7 +114,7 @@ impl PeakAccum {
     }
 
     /// Termine la trame en cours.
-    pub fn end_frame(&mut self, out: &mut Vec<[i16; 2]>) {
+    pub fn end_frame(&mut self, out: &mut Vec<Peak>) {
         self.n += 1;
         if self.n == PEAK_BLOCK {
             out.push(to_peak(self.min, self.max));
@@ -84,7 +123,7 @@ impl PeakAccum {
         }
     }
 
-    pub fn flush(&mut self, out: &mut Vec<[i16; 2]>) {
+    pub fn flush(&mut self, out: &mut Vec<Peak>) {
         if self.n > 0 {
             out.push(to_peak(self.min, self.max));
             self.n = 0;
@@ -135,7 +174,9 @@ pub fn compute_peaks(path: &Path, dst: &Peaks) {
         && Stamp::of(path) == Some(st)
     {
         write_cache(path, st, &all);
+        drop(all);
     }
+    dst.write().shrink();
 }
 
 /// Demande le calcul de la forme d'onde de `path` dans `dst`, par un petit groupe de
@@ -150,7 +191,14 @@ pub fn request_peaks(path: PathBuf, dst: Peaks) {
                 .name(format!("tracksplus-peaks-{i}"))
                 .spawn(move || {
                     while let Ok((path, dst)) = rx.recv() {
-                        compute_peaks(&path, &dst);
+                        // Session refermée entre-temps : plus personne n'attend ce calcul.
+                        if Arc::strong_count(&dst) == 1 {
+                            continue;
+                        }
+                        // Un fichier piégé ne doit pas arrêter le calcul des suivants.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            compute_peaks(&path, &dst)
+                        }));
                     }
                 });
         }
@@ -192,7 +240,7 @@ impl Stamp {
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"TPPK";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 /// magic, version, PEAK_BLOCK, taille, secondes, nanosecondes, nombre de points.
 const CACHE_HEADER: usize = 4 + 4 + 4 + 8 + 8 + 4 + 8;
 
@@ -204,7 +252,7 @@ fn cache_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// Points (niveau fin) du cache, s'il correspond exactement au fichier source.
-fn load_cache(path: &Path, st: Stamp) -> Option<Vec<[i16; 2]>> {
+fn load_cache(path: &Path, st: Stamp) -> Option<Vec<Peak>> {
     let b = std::fs::read(cache_path(path)?).ok()?;
     let h = b.get(..CACHE_HEADER)?;
     let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
@@ -220,25 +268,20 @@ fn load_cache(path: &Path, st: Stamp) -> Option<Vec<[i16; 2]>> {
     }
     let n = usize::try_from(u64_at(32)).ok()?;
     let body = &b[CACHE_HEADER..];
-    if body.len() != n.checked_mul(4)? {
+    if body.len() != n.checked_mul(2)? {
         return None;
     }
     Some(
-        body.as_chunks::<4>()
+        body.as_chunks::<2>()
             .0
             .iter()
-            .map(|c| {
-                [
-                    i16::from_le_bytes([c[0], c[1]]),
-                    i16::from_le_bytes([c[2], c[3]]),
-                ]
-            })
+            .map(|c| [c[0] as i8, c[1] as i8])
             .collect(),
     )
 }
 
 /// Écrit le cache (fichier temporaire puis renommage : jamais de cache à moitié écrit).
-fn write_cache(path: &Path, st: Stamp, l0: &[[i16; 2]]) {
+fn write_cache(path: &Path, st: Stamp, l0: &[Peak]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let Some(dst) = cache_path(path) else {
@@ -250,7 +293,7 @@ fn write_cache(path: &Path, st: Stamp, l0: &[[i16; 2]]) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let mut b = Vec::with_capacity(CACHE_HEADER + l0.len() * 4);
+    let mut b = Vec::with_capacity(CACHE_HEADER + l0.len() * 2);
     b.extend_from_slice(CACHE_MAGIC);
     b.extend_from_slice(&CACHE_VERSION.to_le_bytes());
     b.extend_from_slice(&(PEAK_BLOCK as u32).to_le_bytes());
@@ -259,8 +302,8 @@ fn write_cache(path: &Path, st: Stamp, l0: &[[i16; 2]]) {
     b.extend_from_slice(&st.nanos.to_le_bytes());
     b.extend_from_slice(&(l0.len() as u64).to_le_bytes());
     for p in l0 {
-        b.extend_from_slice(&p[0].to_le_bytes());
-        b.extend_from_slice(&p[1].to_le_bytes());
+        b.push(p[0] as u8);
+        b.push(p[1] as u8);
     }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = dst.file_name().unwrap_or_default().to_os_string();
@@ -560,7 +603,7 @@ mod tests {
         let wav = audio.join("x.wav");
         write_wav(&wav, 5000, 0.5);
         let a = peaks_of(&wav);
-        assert_eq!(a.l0.len(), 5);
+        assert_eq!(a.l0.len(), 5000usize.div_ceil(PEAK_BLOCK));
         let cache = audio.join(".peaks").join("x.wav.peaks");
         assert!(cache.exists(), "cache écrit");
         let st = Stamp::of(&wav).unwrap();
@@ -578,7 +621,8 @@ mod tests {
         write_wav(&wav, 9000, 0.25);
         assert!(load_cache(&wav, Stamp::of(&wav).unwrap()).is_none());
         let c = peaks_of(&wav);
-        assert_eq!(c.l0.len(), 9);
+        let n9 = 9000usize.div_ceil(PEAK_BLOCK);
+        assert_eq!(c.l0.len(), n9);
         assert_eq!(c.l0[0], to_peak(-0.25, 0.25));
         assert_eq!(load_cache(&wav, Stamp::of(&wav).unwrap()).unwrap(), c.l0);
 
@@ -590,7 +634,7 @@ mod tests {
         let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
         request_peaks(wav.clone(), p.clone());
         let t = std::time::Instant::now();
-        while p.read().l0.len() < 9 && t.elapsed().as_secs() < 10 {
+        while p.read().l0.len() < n9 && t.elapsed().as_secs() < 10 {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(p.read().l0, c.l0);
