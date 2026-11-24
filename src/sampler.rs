@@ -64,14 +64,10 @@ pub enum PadCmd {
     Stop {
         slot: u16,
     },
-    StopAll {
-        fade: usize,
-    },
+    /// Arrêt immédiat de toutes les voix (micro-fondu anti-clic de 10 ms).
+    StopAll,
     SetOutput {
         left: usize,
-    },
-    SetMaster {
-        gain: f32,
     },
 }
 
@@ -108,10 +104,6 @@ pub struct Sampler {
     rx: Receiver<PadCmd>,
     garbage: Sender<Arc<SampleData>>,
     pub left: usize,
-    /// Gain général appliqué à la fin du dernier bloc…
-    master: f32,
-    /// … et gain demandé : rampe linéaire de l'un à l'autre sur un bloc (pas de « zip »).
-    master_target: f32,
     sample_rate: usize,
 }
 
@@ -127,8 +119,6 @@ impl Sampler {
             rx,
             garbage,
             left,
-            master: 1.0,
-            master_target: 1.0,
             sample_rate: sample_rate as usize,
         }
     }
@@ -208,13 +198,12 @@ impl Sampler {
                     v.release(quick * 2);
                 }
             }
-            PadCmd::StopAll { fade } => {
+            PadCmd::StopAll => {
                 for v in &mut self.voices {
-                    v.release(fade.max(quick));
+                    v.release(quick);
                 }
             }
             PadCmd::SetOutput { left } => self.left = left,
-            PadCmd::SetMaster { gain } => self.master_target = gain,
         }
     }
 
@@ -223,14 +212,6 @@ impl Sampler {
         while let Ok(cmd) = self.rx.try_recv() {
             self.handle(cmd);
         }
-        // Gain général : rampe linéaire sur le bloc vers la nouvelle valeur.
-        let m0 = self.master;
-        let dm = if frames > 0 {
-            (self.master_target - m0) / frames as f32
-        } else {
-            0.0
-        };
-        self.master = if frames > 0 { self.master_target } else { m0 };
         for v in &mut self.voices {
             let data = &v.sample.data;
             let p = v.p;
@@ -245,12 +226,7 @@ impl Sampler {
                         break;
                     }
                 }
-                let master = if dm == 0.0 {
-                    m0
-                } else {
-                    m0 + dm * (f + 1) as f32
-                };
-                let mut g = p.gain * master;
+                let mut g = p.gain;
                 if v.first && p.fade_in > 0 {
                     let k = v.pos.saturating_sub(p.start);
                     if k < p.fade_in {
@@ -398,39 +374,6 @@ mod tests {
             grx.try_recv().is_ok(),
             "le son doit être rendu à l'interface"
         );
-    }
-
-    /// Changement du gain général : rampe sur un bloc, pas de marche.
-    #[test]
-    fn master_gain_ramps() {
-        let (tx, rx) = bounded(16);
-        let (gtx, _grx) = bounded(16);
-        let mut s = Sampler::new(rx, gtx, 0, 48000);
-        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
-        tx.send(PadCmd::Press {
-            slot: 0,
-            sample: sample(48000),
-            params: params(PadMode::Toggle, 48000),
-        })
-        .unwrap();
-        let mut out = vec![0.0; 128];
-        s.render(&mut out, 64, &pos);
-        assert_eq!(out[0], 0.5);
-        tx.send(PadCmd::SetMaster { gain: 0.0 }).unwrap();
-        out.fill(0.0);
-        s.render(&mut out, 64, &pos);
-        // Descente régulière de 0,5 vers 0 sur le bloc.
-        assert!(out[0] > 0.48 && out[0] < 0.5, "{}", out[0]);
-        assert!((out[2 * 31] - 0.25).abs() < 0.01, "{}", out[2 * 31]);
-        assert_eq!(out[2 * 63], 0.0);
-        let steps = out
-            .windows(4)
-            .step_by(2)
-            .all(|w| (w[0] - w[2]).abs() < 0.01);
-        assert!(steps, "pas de marche");
-        out.fill(0.0);
-        s.render(&mut out, 64, &pos);
-        assert!(out.iter().all(|&x| x == 0.0));
     }
 
     #[test]

@@ -15,10 +15,10 @@ Un **écran d'accueil** en pleine page (aucune session n'est ouverte derrière t
 pas choisi) propose de **reprendre la dernière session**, d'en créer une nouvelle,
 d'en ouvrir une, ou de choisir dans la **liste des sessions** (celles du dossier
 `Musique\TracksPlus` et les sessions récentes ouvertes ailleurs), avec leur date, leur nombre
-de pistes et de prises et leur durée, et une recherche par nom. « Continuer avec une session
-vide » (ou Échap) ferme l'écran. « Ouvrir une session… » utilise le même explorateur
-intégré : les dossiers de session y apparaissent directement comme des sessions. Désactivable (« Afficher au lancement ») ; toujours
-accessible par le menu ☰ → « Sessions récentes… ». Après un crash pendant une prise, la
+de pistes et de prises et leur durée, et une recherche par nom. L'application attend ce
+choix : aucune session vide n'est ouverte en douce. « Ouvrir une session… » utilise le même
+explorateur intégré : les dossiers de session y apparaissent directement comme des sessions,
+comme dans le menu ☰ → « Ouvrir une session… ». Après un crash pendant une prise, la
 session interrompue est rouverte directement, sans passer par cet écran.
 
 ## Une session = un dossier
@@ -49,15 +49,17 @@ Tout ce qui appartient à une session est rangé dans son dossier (par défaut
 
 ## Onglet Multipiste
 
+- **Réglages** (menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droite) :
+  une seule fenêtre à onglets, **Carte son** et **Soundboard**.
 - **Carte son** : pilote (ASIO / WASAPI, CoreAudio, ALSA / JACK), entrée, fréquence, buffer, et
   **toutes les sorties au même endroit** : multipiste, soundboard et monitoring, chacune sur
   n'importe quelle paire de n'importe quel périphérique (ou « Comme le multipiste »).
   Configuration mémorisée : on retrouve sa carte Dante au lancement. Après un changement
   de buffer ou de fréquence dans le panneau du pilote (RME, Focusrite…), **« Actualiser »**
-  dans « Carte son » rouvre la carte et reprend ces réglages (en ASIO, buffer et fréquence
+  dans l'onglet « Carte son » rouvre la carte et reprend ces réglages (en ASIO, buffer et fréquence
   repassent en « Auto »). Indisponible pendant une prise.
 - **Fenêtre** : 1280 × 720 minimum (à l'échelle d'affichage 100 % de Windows).
-- **Pistes** : « Ajouter des pistes » → nombre de pistes, **Mono** ou **Stéréo**, première
+- **Pistes** : bouton **+** au-dessus des pistes (à droite du nombre de pistes) → nombre de pistes, **Mono** ou **Stéréo**, première
   entrée et nom. Mono = une entrée ; stéréo = une paire fixe (1-2, 3-4…) enregistrée dans un
   seul WAV stéréo. La flèche à gauche du nom déplie le panneau de la piste : type (mono /
   stéréo), entrée (sélecteur en grille, entrées déjà utilisées signalées), **couleur**,
@@ -84,8 +86,7 @@ Tout ce qui appartient à une session est rangé dans son dossier (par défaut
   repère 1 à 9. Double-clic sur une prise = sélectionner sa durée, barre de défilement.
 - **Barre d'outils en pictogrammes** (bulle d'aide au survol, avec le raccourci) : suivre la
   lecture, magnétisme · repère, point d'entrée `[`, point de sortie `]`, effacer la plage ·
-  couper (ciseaux), supprimer (corbeille) · annuler, rétablir · vumètres ; à droite, ajouter
-  des pistes et exporter.
+  couper (ciseaux), supprimer (corbeille) · annuler, rétablir · vumètres ; à droite, exporter.
 - **Formes d'onde** détaillées (un point toutes les 256 échantillons, trois niveaux de zoom,
   courbe lissée au zoom fin), claires sur fond teinté, échelle d'affichage relevée pour les
   passages faibles (le son n'est jamais modifié).
@@ -102,9 +103,19 @@ Tout ce qui appartient à une session est rangé dans son dossier (par défaut
 - **Repères** (touche M, même pendant l'enregistrement) : clic = y aller ; clic droit ou
   double-clic sur l'étiquette = renommer, supprimer, sélectionner
   jusqu'au repère suivant, flèches ← / → pour sauter de repère en repère.
-- **Export** : pistes **choisies une à une** (ou la sélection de la timeline), toute la
-  session ou **seulement la plage sélectionnée**, pistes séparées (stéréo pour les pistes stéréo) et/ou mix stéréo,
-  44.1 / 48 / 88.2 / 96 kHz, 16 bits (dither TPDF) / 24 bits / 32 bits entier / 32 bits flottant.
+- **Export** : une fenêtre simple, chaque option expliquée par une bulle avec un exemple concret.
+  - **Contenu** : pistes **choisies une à une** (ou les pistes sélectionnées dans la colonne de
+    gauche), toute la session ou **seulement la plage In/Out** ; pistes séparées (stéréo pour les
+    pistes stéréo) et/ou mix **stéréo ou mono**.
+  - **Formats** : **WAV** (RF64 automatique au-delà de 4 Go), **BWF** (horodatage et description :
+    chaque fichier se recale seul en post-production), **AIFF**, **FLAC** (sans perte),
+    **MP3** (128 à 320 kbit/s ou VBR V0, tags ID3) et **Ogg Vorbis** (qualité 5, 7 ou 9).
+  - **Résolution** 16 bits (dither TPDF) / 24 bits / 32 bits entier / 32 bits flottant selon le
+    format ; **fréquence** 44,1 à 192 kHz (48 kHz maximum en MP3 et Ogg), conversion de haute
+    qualité si elle diffère de la session.
+  - **Normalisation** par fichier : crête −0,1 ou −1 dB, ou volume perçu −14 LUFS (streaming),
+    −16 LUFS (podcast), −23 LUFS (EBU R128), crête vraie gardée sous −1 dBTP.
+  - Résumé avant export : nombre de fichiers, format et **taille estimée**.
 
 ## Onglet Soundboard
 
@@ -174,9 +185,13 @@ Tout ce qui appartient à une session est rangé dans son dossier (par défaut
   **Ctrl + clic joue le pad** (pour tester sans contrôleur, selon son mode). Les sons se
   jouent aussi au clavier, au contrôleur MIDI, ou avec « Écouter » dans l'éditeur (repart
   toujours du début).
-- **Sortie dédiée** (ex. sorties 3–4 de la Dante), volume général, vumètre stéréo des pads,
-  **Tout arrêter** avec fondu (Échap). Le soundboard est enregistré automatiquement dans la
-  session (voir « Une session = un dossier »).
+- **Transport des pads** dans la barre du haut (à la place de celui du multipiste) : **stop**
+  = tout arrêter, net, sans fondu (Échap), voyant vert dès qu'un pad joue, compteur du temps
+  restant du dernier pad à finir et du nombre de pads en lecture. Une prise multipiste en
+  cours reste signalée (pastille REC, clic : retour au multipiste).
+- **Sortie dédiée** (ex. sorties 3–4 de la Dante) à 0 dB, vumètre stéréo des pads. Le
+  soundboard est enregistré automatiquement dans la session (voir « Une session = un
+  dossier »).
 
 ## Fiabilité en live
 
@@ -210,7 +225,8 @@ Conçu pour ne jamais perdre une prise :
 - **Fichiers toujours complets** : session, soundboard et réglages sont écrits dans un fichier
   temporaire forcé sur le disque puis renommé ; une coupure ne laisse jamais de fichier
   tronqué. Une sauvegarde impossible (disque plein, clé retirée) est signalée.
-- **Export** : refusé avec un message clair si un fichier dépasserait 4 Go (limite du WAV).
+- **Export** : WAV et BWF passent en RF64 au-delà de 4 Go ; l'AIFF, limité à 4 Go, est refusé
+  avec un message clair avant d'écrire. Un export annulé ne laisse pas de fichier à moitié écrit.
 - **Mises à jour vérifiées** : l'installeur téléchargé est contrôlé (empreinte SHA-256 publiée
   par GitHub) avant d'être lancé, après une sauvegarde complète.
 - **Une seule instance** : relancer TracksPlus déjà ouvert affiche un message et ramène la
@@ -264,10 +280,10 @@ Conçu pour ne jamais perdre une prise :
 
 ## Utilisation avec Dante
 
-1. Réglages carte son (pastille en haut à droite) → pilote **ASIO** (Windows) ou **CoreAudio**
+1. Réglages, onglet Carte son (pastille en haut à droite) → pilote **ASIO** (Windows) ou **CoreAudio**
    (macOS) → **Dante Virtual Soundcard**. Fréquence identique à Dante Controller.
-2. Multipiste : « Ajouter une piste » (mono ou stéréo) pour chaque entrée, renommez, armez, ⏺.
-3. Soundboard : choisissez la paire de sorties Dante dédiée aux pads.
+2. Multipiste : bouton **+** au-dessus des pistes (mono ou stéréo) pour chaque entrée, renommez, armez, ⏺.
+3. Même onglet : sortie Soundboard sur la paire de sorties Dante dédiée aux pads.
 
 ## Compiler
 
@@ -292,7 +308,8 @@ TracksPlus est distribué sous licence **GNU GPL v3** (voir [`LICENSE`](LICENSE)
 
 Composants tiers : police [Inter](https://rsms.me/inter/) (OFL, `assets/fonts`) ; SDK ASIO
 de Steinberg, utilisé sous sa licence GPLv3 ; `vendor/asio-sys` est une copie d'asio-sys
-(Apache-2.0) avec une seule modification pour la compilation MinGW.
+(Apache-2.0) avec une seule modification pour la compilation MinGW. Export : encodeur MP3
+LAME (LGPL), libvorbis et libogg (BSD), flacenc (Apache-2.0), mesure de sonie ebur128 (MIT).
 
 ## Architecture
 
@@ -303,7 +320,8 @@ de Steinberg, utilisé sous sa licence GPLv3 ; `vendor/asio-sys` est une copie d
 | `src/soundboard.rs` | Modèle du soundboard (enregistré dans la session, sons copiés dans `Sons`), décodage (symphonia) et rééchantillonnage des sons |
 | `src/midi.rs` | Contrôleurs MIDI : dispositions des modèles reconnus, LED, déclenchement direct vers le moteur audio |
 | `src/recorder.rs` / `src/player.rs` | Threads disque : enregistrement et lecture multipiste |
-| `src/render.rs` / `src/export.rs` | Lecture des prises, formes d'onde, export |
+| `src/render.rs` / `src/export.rs` | Lecture des prises, formes d'onde, export (rendu, conversion, normalisation) |
+| `src/encode.rs` | Écriture des fichiers exportés : WAV/RF64, BWF, AIFF, FLAC, MP3, Ogg Vorbis |
 | `src/project.rs` | Session, pistes, prises, repères |
 | `src/update.rs` | Mises à jour : dernière release GitHub, téléchargement et lancement de l'installeur |
 | `src/sessions.rs` | Sessions connues (dossier des sessions + récentes), pour l'écran d'accueil |

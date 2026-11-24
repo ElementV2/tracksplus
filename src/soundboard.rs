@@ -151,11 +151,6 @@ pub struct Board {
     #[serde(default)]
     pub out_device: Option<String>,
     #[serde(default)]
-    pub master_db: f32,
-    /// Durée du fondu de « Stop tout » (s).
-    #[serde(default = "default_panic_fade")]
-    pub panic_fade: f64,
-    #[serde(default)]
     pub midi_port: Option<String>,
     /// Ancien « mode de la page » (le mode se règle maintenant pad par pad) : conservé
     /// pour relire les anciens fichiers, sans effet.
@@ -186,10 +181,6 @@ pub enum PadLayout {
     Manual,
 }
 
-fn default_panic_fade() -> f64 {
-    1.0
-}
-
 impl Default for Board {
     fn default() -> Self {
         Self {
@@ -198,8 +189,6 @@ impl Default for Board {
             pages: vec![Page::new("Page 1".into())],
             out_left: 0,
             out_device: None,
-            master_db: 0.0,
-            panic_fade: 1.0,
             midi_port: None,
             default_mode: PadMode::Toggle,
             led_mode: crate::midi::LedMode::Auto,
@@ -255,14 +244,13 @@ impl Board {
         }
     }
 
-    /// Reprend les réglages de l'ordinateur (contrôleur, LED, disposition, fondu de « Tout
-    /// arrêter ») d'un autre soundboard.
+    /// Reprend les réglages de l'ordinateur (contrôleur, LED, disposition, sortie) d'un autre
+    /// soundboard.
     pub fn take_devices(&mut self, from: &Board) {
         self.midi_port = from.midi_port.clone();
         self.led_mode = from.led_mode;
         self.led_port = from.led_port.clone();
         self.layout = from.layout;
-        self.panic_fade = from.panic_fade;
         self.out_left = from.out_left;
         self.out_device = from.out_device.clone();
     }

@@ -524,13 +524,6 @@ impl App {
         {
             self.open_export();
         }
-        // Ajouter des pistes : dialogue « Nouvelles pistes » (nombre, type, entrées).
-        if w::tool_icon(&mut child, Icon::AddTrack, false, stopped)
-            .on_hover_text("Ajouter des pistes : une ou plusieurs, mono ou stéréo, sur des entrées qui se suivent")
-            .clicked()
-        {
-            self.open_new_tracks();
-        }
     }
 
     fn x_of(&self, left: f32, sample: u64) -> f32 {
@@ -1266,6 +1259,44 @@ impl App {
             t::caps(9.5),
             t::TEXT_3,
         );
+        // « + » au-dessus des pistes : ajouter des pistes (nombre, type, entrées).
+        let add_r = Rect::from_center_size(
+            pos2(corner.right() - 18.0, corner.center().y),
+            vec2(22.0, 18.0),
+        );
+        let can_add = self.is_stopped();
+        let add = ui.interact(
+            add_r,
+            ui.make_persistent_id("add_tracks"),
+            if can_add {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let hov = add.hovered() && can_add;
+        if hov {
+            painter.rect_filled(add_r, t::R, t::SURFACE_4);
+        }
+        w::paint_icon(
+            &painter,
+            Icon::Plus,
+            add_r.center(),
+            5.0,
+            if !can_add {
+                t::TEXT_3
+            } else if hov {
+                t::TEXT
+            } else {
+                t::TEXT_2
+            },
+        );
+        if add
+            .on_hover_text("Ajouter des pistes : une ou plusieurs, mono ou stéréo, sur les entrées de votre choix")
+            .clicked()
+        {
+            self.open_new_tracks();
+        }
         self.ruler(ui, ruler_rect);
         let sb_rect = Rect::from_min_max(pos2(tl_left, full.bottom() - SCROLLBAR_H), full.max);
         let tl_all = Rect::from_min_max(
@@ -1637,15 +1668,13 @@ impl App {
                         });
                     let (mr, _) = ui.allocate_exact_size(vec2(152.0, 18.0), Sense::hover());
                     if ms.len() == 2 {
-                        // Stéréo : gauche en haut, droite en bas.
+                        // Stéréo : deux barres bien distinctes, entrée gauche en haut, droite en
+                        // bas (chacune son propre signal).
                         for (k, m) in ms.iter().enumerate() {
-                            let y = mr.center().y - 1.6 + k as f32 * 3.2;
+                            let y = mr.center().y - 3.5 + k as f32 * 7.0;
                             w::meter_h(
                                 ui.painter(),
-                                Rect::from_center_size(
-                                    pos2(mr.center().x, y),
-                                    vec2(mr.width(), 2.6),
-                                ),
+                                Rect::from_center_size(pos2(mr.center().x, y), vec2(mr.width(), 5.0)),
                                 m,
                             );
                         }
@@ -2073,7 +2102,7 @@ impl App {
                     p.text(
                         pos2(rest_lane.center().x, rest.top() + 72.0),
                         Align2::CENTER_CENTER,
-                        "Bouton « Ajouter des pistes » en haut à droite : une ou plusieurs d'un coup, sur les entrées de votre choix.",
+                        "Bouton « + » juste au-dessus, à droite du nombre de pistes : une ou plusieurs d'un coup, sur les entrées de votre choix.",
                         t::regular(12.0),
                         t::TEXT_3,
                     );

@@ -2,9 +2,9 @@
 //! une, ou choisir dans la liste des sessions.
 
 use crate::app::App;
-use crate::sessions::{self, SessionInfo, StartupPrefs};
+use crate::sessions::{self, SessionInfo};
 use crate::ui::theme as t;
-use crate::ui::widgets::{self as w, BtnStyle, Icon};
+use crate::ui::widgets::{self as w, Icon};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
 };
@@ -22,19 +22,13 @@ pub struct Welcome {
     pub filter: String,
     /// Dernière session utilisée (proposée en grand).
     pub last: Option<SessionInfo>,
-    pub show_at_start: bool,
     /// Liste des sessions en cours de lecture (thread d'arrière-plan).
     loading: Option<crossbeam_channel::Receiver<Vec<SessionInfo>>>,
 }
 
 impl Welcome {
     /// L'écran s'affiche tout de suite : la liste (qui lit chaque session) se charge en
-    /// arrière-plan.
-    pub fn new() -> Self {
-        Self::start(None)
-    }
-
-    /// Comme `new`, la fenêtre étant redessinée dès que la liste est prête.
+    /// arrière-plan, la fenêtre étant redessinée dès qu'elle est prête.
     pub fn with_ctx(ctx: &egui::Context) -> Self {
         Self::start(Some(ctx.clone()))
     }
@@ -55,7 +49,6 @@ impl Welcome {
             sessions: Vec::new(),
             filter: String::new(),
             last,
-            show_at_start: StartupPrefs::load().show_welcome,
             loading: Some(rx),
         };
         if spawned.is_err() {
@@ -100,39 +93,9 @@ enum Action {
     Open(PathBuf),
     New,
     Browse,
-    Close,
 }
 
 impl App {
-    pub fn open_welcome(&mut self) {
-        self.close_dialogs();
-        self.welcome = Some(Welcome::new());
-    }
-
-    /// Écran d'accueil ouvert depuis le menu : fenêtre par-dessus la session en cours.
-    pub fn welcome_dialog(&mut self, ctx: &egui::Context) {
-        if self.start_screen {
-            return;
-        }
-        let Some(mut wl) = self.welcome.take() else {
-            return;
-        };
-        wl.poll(ctx);
-        let mut action = None;
-        let modal = egui::Modal::new(egui::Id::unique("welcome"))
-            .frame(t::window_frame().inner_margin(egui::Margin::same(0)))
-            .show(ctx, |ui| {
-                ui.set_width(WELCOME_SIZE.x);
-                ui.set_height(WELCOME_SIZE.y);
-                let full = ui.max_rect();
-                Self::welcome_body(ui, full, &mut wl, &mut action);
-            });
-        if modal.should_close() && action.is_none() {
-            action = Some(Action::Close);
-        }
-        self.welcome_action(wl, action);
-    }
-
     /// Écran d'accueil du lancement : page entière, aucune session affichée derrière tant
     /// que l'utilisateur n'a pas choisi.
     pub fn welcome_page(&mut self, ui: &mut egui::Ui) {
@@ -191,17 +154,10 @@ impl App {
     fn welcome_action(&mut self, wl: Welcome, action: Option<Action>) {
         match action {
             None => self.welcome = Some(wl),
-            Some(Action::Open(path)) => {
-                if self.start_screen || path != self.project.file_path() {
-                    self.stop();
-                    self.autosave();
-                    self.load_session(&path);
-                }
-            }
+            Some(Action::Open(path)) => self.load_session(&path),
             Some(Action::New) => self.open_new_session(),
             // Explorateur intégré ; au lancement, l'accueil revient si on l'annule.
             Some(Action::Browse) => self.open_session(),
-            Some(Action::Close) => self.start_screen = false,
         }
     }
 
@@ -317,37 +273,6 @@ impl App {
         ) {
             *action = Some(Action::Browse);
         }
-
-        // Bas de colonne : afficher au lancement, et continuer sans choisir.
-        let bottom = ui.max_rect().bottom();
-        let mut bui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(Rect::from_min_max(
-                    pos2(ui.max_rect().left(), bottom - 52.0),
-                    ui.max_rect().max,
-                ))
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-        );
-        if bui
-            .checkbox(&mut wl.show_at_start, "Afficher au lancement")
-            .changed()
-        {
-            let mut p = StartupPrefs::load();
-            p.show_welcome = wl.show_at_start;
-            p.save();
-        }
-        if bui
-            .add(
-                egui::Button::new(
-                    egui::RichText::new("Continuer avec une session vide").color(t::TEXT_2),
-                )
-                .frame(false),
-            )
-            .on_hover_text("Fermer cet écran (Échap)")
-            .clicked()
-        {
-            *action = Some(Action::Close);
-        }
     }
 
     fn welcome_right(ui: &mut egui::Ui, wl: &mut Welcome, action: &mut Option<Action>) {
@@ -365,19 +290,6 @@ impl App {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if w::icon_button(
-                    ui,
-                    Icon::Close,
-                    22.0,
-                    BtnStyle::Ghost,
-                    true,
-                    "Fermer (Échap)",
-                )
-                .clicked()
-                {
-                    *action = Some(Action::Close);
-                }
-                ui.add_space(6.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut wl.filter)
                         .hint_text("Rechercher…")

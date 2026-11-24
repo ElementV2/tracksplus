@@ -18,9 +18,6 @@ pub struct SessionInfo {
     #[cfg_attr(not(test), allow(dead_code))]
     pub tracks: usize,
     pub takes: usize,
-    /// Durée (secondes) jusqu'à la fin de la dernière prise.
-    #[allow(dead_code)]
-    pub duration: f64,
     /// Textes calculés une fois à la lecture (pas à chaque image) : date lisible,
     /// résumé « 4 pistes · 12 prises · 12:34 », nom en minuscules pour la recherche.
     pub date: String,
@@ -29,30 +26,14 @@ pub struct SessionInfo {
 }
 
 /// Réglages de l'écran d'accueil (`%APPDATA%\TracksPlus\startup.json`).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StartupPrefs {
-    #[serde(default = "yes")]
-    pub show_welcome: bool,
     /// Sessions ouvertes récemment (la plus récente en premier).
     #[serde(default)]
     pub recent: Vec<PathBuf>,
     /// Dernier dossier où des sons ont été choisis (explorateur de sons).
     #[serde(default)]
     pub sound_dir: Option<PathBuf>,
-}
-
-fn yes() -> bool {
-    true
-}
-
-impl Default for StartupPrefs {
-    fn default() -> Self {
-        Self {
-            show_welcome: true,
-            recent: Vec::new(),
-            sound_dir: None,
-        }
-    }
 }
 
 impl StartupPrefs {
@@ -125,7 +106,6 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
         modified,
         tracks,
         takes,
-        duration,
         date: fmt_date(modified),
         summary: fmt_summary(tracks, takes, duration),
     })

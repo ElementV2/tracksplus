@@ -2,7 +2,10 @@
 //! Les onglets sont dans `ui::multitrack` et `ui::soundboard`.
 
 use crate::audio::{self, AudioPrefs, DeviceInfo, Engine, RecTarget, Shared};
-use crate::export::{BitDepth, ExportJob, ExportSettings};
+use crate::export::{
+    BitDepth, ExportFormat, ExportJob, ExportSettings, Mp3Bitrate, Normalize, OggQuality,
+    SAMPLE_RATES,
+};
 use crate::midi::Midi;
 use crate::player::Player;
 use crate::project::{self, Clip, PROJECT_EXT, Project, RecFormat};
@@ -10,7 +13,7 @@ use crate::recorder::{FinishError, RecResult, RecSpec, Recorder};
 use crate::recovery;
 use crate::render::{self, PeakData, Peaks};
 use crate::sampler::PadCmd;
-use crate::soundboard::{Board, SampleCache, db_to_gain};
+use crate::soundboard::{Board, SampleCache};
 use crate::ui::theme as t;
 use crate::ui::widgets::{self as w, BtnStyle, Icon, MeterState};
 use eframe::egui::{self, Align2, Color32, Key, Rect, vec2};
@@ -64,7 +67,7 @@ pub struct NewTracksDialog {
     pub focus: bool,
 }
 
-pub struct AudioDialog {
+pub struct SettingsDialog {
     pub prefs: AudioPrefs,
     pub hosts: Vec<String>,
     pub ins: Vec<DeviceInfo>,
@@ -74,9 +77,11 @@ pub struct AudioDialog {
     pub default_out: Option<String>,
     pub listed_host: Option<String>,
     pub error: Option<String>,
+    /// Onglet affiché : 0 = carte son, 1 = soundboard.
+    pub tab: usize,
 }
 
-impl AudioDialog {
+impl SettingsDialog {
     fn new(prefs: &AudioPrefs) -> Self {
         let mut d = Self {
             prefs: prefs.clone(),
@@ -87,6 +92,7 @@ impl AudioDialog {
             default_out: None,
             listed_host: None,
             error: None,
+            tab: 0,
         };
         if d.prefs.host.is_none() {
             d.prefs.host = Some(audio::default_host_name());
@@ -183,7 +189,8 @@ pub type SaveAsDone = (Project, Board, Vec<PathBuf>, Vec<String>);
 enum TrackChoice {
     All,
     None,
-    Timeline,
+    /// Pistes sélectionnées dans la colonne de gauche.
+    Selected,
     Custom,
 }
 
@@ -235,8 +242,6 @@ pub struct SbState {
     pub midi_page: Option<usize>,
     /// Contrôleur déjà passé dans sa disposition (mode « Programmer »).
     pub layout_port: Option<String>,
-    /// Fenêtre « Réglages du soundboard » ouverte.
-    pub settings_open: bool,
     /// Dernier envoi des LED du contrôleur.
     pub led_at: f64,
     /// Gros sons en cours de copie dans la session (le pad joue l'original en attendant).
@@ -322,7 +327,7 @@ pub struct App {
     pub scrub_at: f64,
     /// Rectangle de sélection des prises en cours (glisser sur les pistes).
     pub marquee: Option<crate::ui::multitrack::Marquee>,
-    pub audio_dlg: Option<AudioDialog>,
+    pub settings_dlg: Option<SettingsDialog>,
     pub export_dlg: Option<ExportDialog>,
     pub export_job: Option<ExportJob>,
     pub new_dlg: Option<NewSessionDialog>,
@@ -433,7 +438,7 @@ impl App {
             marquee: None,
             playhead_drag: false,
             scrub_at: 0.0,
-            audio_dlg: None,
+            settings_dlg: None,
             export_dlg: None,
             export_job: None,
             new_dlg: None,
@@ -510,15 +515,16 @@ impl App {
                     true,
                 );
             }
-        } else if err.is_none() && crate::sessions::StartupPrefs::load().show_welcome {
-            // Écran d'accueil : reprendre, créer, ouvrir ou choisir une session.
+        } else {
+            // Écran d'accueil : aucune session tant que l'utilisateur n'a pas choisi de
+            // reprendre, créer, ouvrir ou choisir une session.
             app.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&cc.egui_ctx));
             app.start_screen = true;
         }
         if let Some(e) = err {
-            let mut d = AudioDialog::new(&app.prefs);
+            let mut d = SettingsDialog::new(&app.prefs);
             d.error = Some(e);
-            app.audio_dlg = Some(d);
+            app.settings_dlg = Some(d);
         }
         app
     }
@@ -535,14 +541,11 @@ impl App {
         self.engine.status.sample_rate.max(1)
     }
 
-    /// Envoie au moteur les réglages du soundboard (sortie, volume) et au MIDI le canal.
+    /// Envoie au moteur la sortie du soundboard et au MIDI le canal.
     pub fn sync_engine_to_board(&mut self) {
         let out_ch = self.engine.status.pad_out_channels.max(1) as usize;
         self.engine.pad(PadCmd::SetOutput {
             left: (self.prefs.pad_out().left as usize).min(out_ch - 1),
-        });
-        self.engine.pad(PadCmd::SetMaster {
-            gain: db_to_gain(self.board.master_db),
         });
         self.midi.shared.lock().tx = self.engine.pad_tx.clone();
         self.sb.midi_dirty = true;
@@ -1395,7 +1398,7 @@ impl App {
     /// Soundboard de la session qui vient d'être ouverte ou créée (les réglages du
     /// contrôleur restent ceux de l'ordinateur).
     fn load_session_board(&mut self) {
-        self.engine.pad(PadCmd::StopAll { fade: 0 });
+        self.engine.pad(PadCmd::StopAll);
         let fresh = !self
             .project
             .dir
@@ -1419,7 +1422,7 @@ impl App {
 
     /// Remplace le soundboard affiché (sons à charger, MIDI, sortie).
     fn set_board(&mut self, b: Board) {
-        self.engine.pad(PadCmd::StopAll { fade: 0 });
+        self.engine.pad(PadCmd::StopAll);
         self.board = b;
         self.retain_sounds();
         self.board_changed = None;
@@ -1775,7 +1778,7 @@ impl App {
             return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
         }
         self.stop();
-        self.engine.pad(PadCmd::StopAll { fade: 0 });
+        self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
         let res = match Engine::open(&prefs, &prefs.pad_out()) {
@@ -1831,7 +1834,7 @@ impl App {
         }
         // Fenêtre « Carte son » ouverte : elle montre les nouvelles valeurs.
         let now = self.prefs.clone();
-        if let Some(d) = &mut self.audio_dlg {
+        if let Some(d) = &mut self.settings_dlg {
             if d.prefs == before {
                 d.prefs = now;
             }
@@ -1858,6 +1861,7 @@ impl App {
             dir: self.project.dir.join("Export"),
             tracks: Vec::new(),
             range: None,
+            ..Default::default()
         });
         let with_audio: HashSet<u64> = self
             .project
@@ -1882,9 +1886,9 @@ impl App {
         });
     }
 
-    pub fn open_audio(&mut self) {
+    pub fn open_settings(&mut self) {
         self.close_dialogs();
-        self.audio_dlg = Some(AudioDialog::new(&self.prefs));
+        self.settings_dlg = Some(SettingsDialog::new(&self.prefs));
     }
 
     pub fn open_new_session(&mut self) {
@@ -1904,21 +1908,16 @@ impl App {
     }
 
     pub fn close_dialogs(&mut self) {
-        self.audio_dlg = None;
+        self.settings_dlg = None;
         self.export_dlg = None;
         self.new_dlg = None;
         self.update_dlg = false;
         self.browser = None;
-        // Échap sur l'accueil du lancement : on continue avec une session vide.
-        if self.welcome.take().is_some() {
-            self.start_screen = false;
-        }
     }
 
     pub fn dialog_open(&self) -> bool {
-        self.audio_dlg.is_some()
+        self.settings_dlg.is_some()
             || self.tracks_dlg.is_some()
-            || self.sb.settings_open
             || self.export_dlg.is_some()
             || self.new_dlg.is_some()
             || self.export_job.is_some()
@@ -2150,13 +2149,17 @@ impl App {
             self.tab = tab;
         }
 
-        // Centre : transport (visible dans les deux onglets : on peut enregistrer en lançant des pads).
+        // Centre : le transport de l'onglet affiché (multipiste ou pads).
         let mut cui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(center)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        self.transport_controls(&mut cui);
+        if self.tab == 0 {
+            self.transport_controls(&mut cui);
+        } else {
+            self.pads_transport(&mut cui);
+        }
 
         // Droite : carte son (pastille raccourcie pour tenir dans la place restante).
         let mut rui = ui.new_child(
@@ -2228,7 +2231,7 @@ impl App {
             .on_hover_text(format!("{full_label}\nRéglages de la carte son"))
             .clicked()
         {
-            self.open_audio();
+            self.open_settings();
         }
         rui.add_space(8.0);
         self.update_pill(&mut rui);
@@ -2360,16 +2363,10 @@ impl App {
             self.open_new_session();
         }
         if ui
-            .add_enabled(stopped, egui::Button::new("Ouvrir…"))
+            .add_enabled(stopped, egui::Button::new("Ouvrir une session…"))
             .clicked()
         {
             self.open_session();
-        }
-        if ui
-            .add_enabled(stopped, egui::Button::new("Sessions récentes…"))
-            .clicked()
-        {
-            self.open_welcome();
         }
         if ui
             .add(egui::Button::new("Enregistrer").shortcut_text("Ctrl+S"))
@@ -2443,8 +2440,8 @@ impl App {
             self.import_board();
         }
         ui.separator();
-        if ui.button("Réglages audio…").clicked() {
-            self.open_audio();
+        if ui.button("Réglages…").clicked() {
+            self.open_settings();
         }
         self.update_menu(ui);
     }
@@ -2587,18 +2584,42 @@ impl App {
         w::section(ui, title);
     }
 
-    fn audio_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut dlg) = self.audio_dlg.take() else {
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.settings_dlg.take() else {
             return;
         };
         let mut close = false;
         let mut apply = false;
         let mut recheck = false;
-        egui::Modal::new(egui::Id::unique("audio_dlg"))
+        egui::Modal::new(egui::Id::unique("settings_dlg"))
             .frame(t::window_frame())
             .show(ctx, |ui| {
-                ui.set_width(480.0);
-                close = Self::dialog_header(ui, "Carte son");
+                ui.set_width(520.0);
+                // Même hauteur pour tous les onglets : la fenêtre ne saute pas d'un onglet à
+                // l'autre.
+                ui.set_min_height(600.0);
+                close = Self::dialog_header(ui, "Réglages");
+                // Onglets : d'autres réglages de l'application pourront s'y ajouter.
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), 30.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        w::view_tabs(ui, &mut dlg.tab, &["CARTE SON", "SOUNDBOARD"]);
+                    },
+                );
+                {
+                    let y = ui.cursor().top();
+                    let r = ui.max_rect();
+                    w::hline(ui.painter(), r.left(), r.right(), y, t::LINE);
+                }
+                ui.add_space(12.0);
+                if dlg.tab == 1 {
+                    // « Changer… » (sortie des pads) : onglet Carte son.
+                    if self.sb_settings(ui) {
+                        dlg.tab = 0;
+                    }
+                    return;
+                }
                 // Notes affichées sous la grille (retour à la ligne dans la largeur du dialogue).
                 let mut hints: Vec<&str> = Vec::new();
                 egui::Grid::new("audio_grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
@@ -2853,7 +2874,7 @@ impl App {
             }
         }
         if !close {
-            self.audio_dlg = Some(dlg);
+            self.settings_dlg = Some(dlg);
         }
     }
 
@@ -3053,10 +3074,41 @@ impl App {
         let mut close = false;
         let mut go = false;
         let sr = self.project.sample_rate.max(1);
+        if self.selection.is_none() {
+            d.range = RangeChoice::All;
+        }
+        d.s.fit_format();
+        // Pistes avec de l'audio : (id, nom, position, canaux).
+        let with_audio: Vec<(u64, String, usize, usize)> = self
+            .project
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.clips.is_empty())
+            .map(|(i, t)| (t.id, t.name.clone(), i, t.channels()))
+            .collect();
+        let all: HashSet<u64> = with_audio.iter().map(|x| x.0).collect();
+        let picked: HashSet<u64> = all
+            .iter()
+            .copied()
+            .filter(|id| self.selected_tracks.contains(id))
+            .collect();
+        let session_len = self.project.end();
+        let all_label = format!(
+            "Toute la session · {}",
+            fmt_duration(session_len / sr as u64)
+        );
+        let sel_label = self.selection.map(|(a, b)| {
+            format!(
+                "Plage In/Out · {} → {}",
+                fmt_time_short(a, sr),
+                fmt_time_short(b, sr)
+            )
+        });
         egui::Modal::new(egui::Id::unique("export_dlg"))
             .frame(t::window_frame())
             .show(ctx, |ui| {
-                ui.set_width(560.0);
+                ui.set_width(660.0);
                 close = Self::dialog_header(ui, "Exporter");
                 // Contenu défilant si la fenêtre est trop basse : le bouton « Exporter »
                 // reste toujours visible.
@@ -3065,49 +3117,50 @@ impl App {
                     .max_height(max_h)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        Self::section(ui, "Pistes");
-                        let with_audio: Vec<(u64, String, usize)> = self
-                            .project
-                            .tracks
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, t)| !t.clips.is_empty())
-                            .map(|(i, t)| (t.id, t.name.clone(), i))
-                            .collect();
-                        ui.horizontal(|ui| {
-                            // Même sélecteur que le reste de l'app : le choix qui correspond
-                            // aux pistes cochées est en surbrillance (aucun si choix à la main).
-                            let all: HashSet<u64> = with_audio.iter().map(|x| x.0).collect();
-                            let timeline: HashSet<u64> = all
-                                .iter()
-                                .copied()
-                                .filter(|id| self.selected_tracks.contains(id))
-                                .collect();
+                        // ------------------------------------------------ Contenu
+                        Self::section(ui, "Contenu");
+                        exp_row(ui, "Pistes", |ui| {
+                            // Le choix qui correspond aux pistes cochées est en surbrillance
+                            // (aucun si elles sont cochées à la main).
                             let mut choice = if d.tracks == all {
                                 TrackChoice::All
                             } else if d.tracks.is_empty() {
                                 TrackChoice::None
-                            } else if !timeline.is_empty() && d.tracks == timeline {
-                                TrackChoice::Timeline
+                            } else if !picked.is_empty() && d.tracks == picked {
+                                TrackChoice::Selected
                             } else {
                                 TrackChoice::Custom
                             };
-                            let mut options =
-                                vec![(TrackChoice::All, "Toutes"), (TrackChoice::None, "Aucune")];
-                            if !timeline.is_empty() {
-                                options.push((TrackChoice::Timeline, "Sélection de la timeline"));
+                            let mut options = vec![
+                                (
+                                    TrackChoice::All,
+                                    "Toutes",
+                                    "Toutes les pistes qui contiennent de l'audio.",
+                                ),
+                                (
+                                    TrackChoice::None,
+                                    "Aucune",
+                                    "Tout décocher, pour choisir les pistes une par une ci-dessous.",
+                                ),
+                            ];
+                            if !picked.is_empty() {
+                                options.push((
+                                    TrackChoice::Selected,
+                                    "Pistes sélectionnées",
+                                    "Les pistes sélectionnées dans la fenêtre principale (clic sur leur nom).",
+                                ));
                             }
-                            if w::segmented(ui, "exp_choice", &mut choice, &options) {
+                            if w::segmented_tips(ui, "exp_choice", &mut choice, &options) {
                                 d.tracks = match choice {
-                                    TrackChoice::All => all,
-                                    TrackChoice::Timeline => timeline,
+                                    TrackChoice::All => all.clone(),
+                                    TrackChoice::Selected => picked.clone(),
                                     TrackChoice::None | TrackChoice::Custom => HashSet::new(),
                                 };
                             }
                             ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} / {} sélectionnée(s)",
+                                    "{} / {} cochée(s)",
                                     d.tracks.len(),
                                     with_audio.len()
                                 ))
@@ -3115,102 +3168,205 @@ impl App {
                                 .color(t::TEXT_3),
                             );
                         });
-                        egui::Frame::new()
-                            .fill(t::SURFACE)
-                            .corner_radius(t::R)
-                            .inner_margin(8)
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .max_height(150.0)
-                                    .auto_shrink([false, true])
-                                    .show(ui, |ui| {
-                                        egui::Grid::new("exp_tracks")
-                                            .num_columns(3)
-                                            .spacing([18.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for (k, (id, name, idx)) in
-                                                    with_audio.iter().enumerate()
-                                                {
-                                                    let mut on = d.tracks.contains(id);
-                                                    let txt = egui::RichText::new(format!(
-                                                        "{:02}  {}",
-                                                        idx + 1,
-                                                        short(name, 18)
-                                                    ));
-                                                    if ui.checkbox(&mut on, txt).changed() {
-                                                        if on {
-                                                            d.tracks.insert(*id);
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(EXP_LABEL_W + ui.spacing().item_spacing.x);
+                            egui::Frame::new()
+                                .fill(t::INSET)
+                                .corner_radius(t::R)
+                                .inner_margin(8)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::ScrollArea::vertical()
+                                        .max_height(130.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            egui::Grid::new("exp_tracks")
+                                                .num_columns(3)
+                                                .spacing([18.0, 4.0])
+                                                .show(ui, |ui| {
+                                                    for (k, (id, name, idx, ch)) in
+                                                        with_audio.iter().enumerate()
+                                                    {
+                                                        let mut on = d.tracks.contains(id);
+                                                        let txt = egui::RichText::new(format!(
+                                                            "{:02}  {}",
+                                                            idx + 1,
+                                                            short(name, 16)
+                                                        ));
+                                                        let tip = if *ch == 2 {
+                                                            "Piste stéréo : fichier stéréo"
                                                         } else {
-                                                            d.tracks.remove(id);
+                                                            "Piste mono : fichier mono"
+                                                        };
+                                                        if ui
+                                                            .checkbox(&mut on, txt)
+                                                            .on_hover_text(tip)
+                                                            .changed()
+                                                        {
+                                                            if on {
+                                                                d.tracks.insert(*id);
+                                                            } else {
+                                                                d.tracks.remove(id);
+                                                            }
+                                                        }
+                                                        if k % 3 == 2 {
+                                                            ui.end_row();
                                                         }
                                                     }
-                                                    if k % 3 == 2 {
-                                                        ui.end_row();
-                                                    }
-                                                }
-                                            });
-                                    });
-                            });
-
-                        Self::section(ui, "Plage");
-                        ui.horizontal(|ui| {
-                            ui.radio_value(
-                                &mut d.range,
-                                RangeChoice::All,
-                                format!(
-                                    "Toute la session ({})",
-                                    fmt_duration(self.project.end() / sr as u64)
-                                ),
+                                                });
+                                        });
+                                });
+                        });
+                        ui.add_space(4.0);
+                        exp_row(ui, "Fichiers", |ui| {
+                            ui.checkbox(&mut d.s.stems, "Pistes séparées").on_hover_text(
+                                "Un fichier par piste, mono ou stéréo comme la piste : pour remixer ailleurs ou envoyer les pistes à un ingé son.",
                             );
-                            let sel_txt = match self.selection {
-                                Some((a, b)) => format!(
-                                    "Sélection {} → {}",
-                                    fmt_time_short(a, sr),
-                                    fmt_time_short(b, sr)
-                                ),
-                                None => "Sélection (glisser sur la règle)".into(),
-                            };
-                            ui.add_enabled_ui(self.selection.is_some(), |ui| {
-                                ui.radio_value(&mut d.range, RangeChoice::Selection, sel_txt);
-                            });
-                        });
-
-                        Self::section(ui, "Contenu");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut d.s.stems, "Pistes séparées (WAV mono)");
-                            ui.checkbox(&mut d.s.mix, "Mix stéréo des pistes");
-                        });
-
-                        Self::section(ui, "Format");
-                        ui.horizontal(|ui| {
-                            for r in [44100, 48000, 88200, 96000] {
-                                ui.selectable_value(
-                                    &mut d.s.sample_rate,
-                                    r,
-                                    format!("{} kHz", fmt_khz(r)),
+                            ui.add_space(10.0);
+                            ui.checkbox(&mut d.s.mix, "Mix").on_hover_text(
+                                "Les pistes cochées mélangées dans un seul fichier : la version à faire écouter.",
+                            );
+                            if d.s.mix {
+                                ui.add_space(4.0);
+                                w::segmented_tips(
+                                    ui,
+                                    "exp_mixch",
+                                    &mut d.s.mix_mono,
+                                    &[
+                                        (false, "Stéréo", "Le mix normal, en deux canaux gauche et droite."),
+                                        (
+                                            true,
+                                            "Mono",
+                                            "Un seul canal : diffusion sur une seule enceinte, vérification de la compatibilité mono.",
+                                        ),
+                                    ],
                                 );
                             }
                         });
-                        ui.horizontal(|ui| {
-                            for b in BitDepth::ALL {
-                                ui.selectable_value(&mut d.s.depth, b, b.label());
+                        exp_row(ui, "Plage", |ui| {
+                            let mut opts = vec![(
+                                RangeChoice::All,
+                                all_label.as_str(),
+                                "Du début de la session jusqu'à la fin du dernier clip.",
+                            )];
+                            if let Some(l) = &sel_label {
+                                opts.push((
+                                    RangeChoice::Selection,
+                                    l.as_str(),
+                                    "Seulement entre les repères In et Out posés sur la règle : un extrait, un seul morceau du concert.",
+                                ));
+                            }
+                            w::segmented_tips(ui, "exp_range", &mut d.range, &opts);
+                            if sel_label.is_none() {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Plage In/Out : Ctrl+clic et Alt+clic sur la règle",
+                                    )
+                                    .font(t::regular(12.0))
+                                    .color(t::TEXT_3),
+                                );
                             }
                         });
-                        ui.add_enabled(
-                            d.s.depth == BitDepth::I16,
-                            egui::Checkbox::new(&mut d.s.dither, "Dither (recommandé en 16 bits)"),
-                        );
 
+                        // ------------------------------------------------ Format
+                        Self::section(ui, "Format");
+                        exp_row(ui, "Format", |ui| {
+                            if w::segmented_tips(ui, "exp_fmt", &mut d.s.format, &EXPORT_FORMATS) {
+                                d.s.fit_format();
+                            }
+                        });
+                        let lossy = d.s.format.is_lossy();
+                        match d.s.format {
+                            ExportFormat::Mp3 => exp_row(ui, "Débit", |ui| {
+                                let opts: Vec<(Mp3Bitrate, &str, &str)> = Mp3Bitrate::ALL
+                                    .iter()
+                                    .map(|&b| (b, b.label(), mp3_tip(b)))
+                                    .collect();
+                                w::segmented_tips(ui, "exp_mp3", &mut d.s.mp3_bitrate, &opts);
+                            }),
+                            ExportFormat::Ogg => exp_row(ui, "Qualité", |ui| {
+                                let opts: Vec<(OggQuality, &str, &str)> = OggQuality::ALL
+                                    .iter()
+                                    .map(|&q| (q, q.label(), ogg_tip(q)))
+                                    .collect();
+                                w::segmented_tips(ui, "exp_ogg", &mut d.s.ogg_quality, &opts);
+                            }),
+                            _ => exp_row(ui, "Résolution", |ui| {
+                                let opts: Vec<(BitDepth, &str, &str)> = d
+                                    .s
+                                    .format
+                                    .depths()
+                                    .iter()
+                                    .map(|&b| (b, b.label(), depth_tip(b)))
+                                    .collect();
+                                w::segmented_tips(ui, "exp_depth", &mut d.s.depth, &opts);
+                                if d.s.output_depth() == Some(BitDepth::I16) {
+                                    ui.add_space(10.0);
+                                    ui.checkbox(&mut d.s.dither, "Dither").on_hover_text(
+                                        "Un bruit infime ajouté au passage en 16 bits : évite le grain dans les fins de morceau et les fondus. À laisser coché.",
+                                    );
+                                }
+                            }),
+                        }
+                        exp_row(ui, "Fréquence", |ui| {
+                            let rates: Vec<(u32, String)> = SAMPLE_RATES
+                                .iter()
+                                .copied()
+                                .filter(|&r| !lossy || r <= 48000)
+                                .map(|r| (r, format!("{} kHz", fmt_khz(r).replace('.', ","))))
+                                .collect();
+                            let opts: Vec<(u32, &str, &str)> = rates
+                                .iter()
+                                .map(|(r, l)| (*r, l.as_str(), rate_tip(*r)))
+                                .collect();
+                            w::segmented_tips(ui, "exp_rate", &mut d.s.sample_rate, &opts);
+                        });
+                        if d.s.output_rate() != sr {
+                            exp_hint(
+                                ui,
+                                &format!(
+                                    "Session enregistrée en {} kHz : conversion de fréquence de haute qualité à l'export.",
+                                    fmt_khz(sr).replace('.', ",")
+                                ),
+                            );
+                        }
+                        if lossy {
+                            exp_hint(
+                                ui,
+                                "MP3 et Ogg s'arrêtent à 48 kHz. Pour archiver ou retravailler, préférez WAV ou FLAC.",
+                            );
+                        }
+
+                        // ------------------------------------------------ Volume
+                        Self::section(ui, "Volume");
+                        exp_row(ui, "Normalisation", |ui| {
+                            w::segmented_tips(ui, "exp_norm", &mut d.s.normalize, &NORMALIZE_OPTS);
+                        });
+                        if !d.s.normalize.is_off() {
+                            exp_hint(
+                                ui,
+                                if matches!(d.s.normalize, Normalize::Lufs(_)) {
+                                    "Appliquée à chaque fichier séparément. Crête vraie gardée sous −1 dBTP (le gain est réduit si besoin)."
+                                } else {
+                                    "Appliquée à chaque fichier séparément : chaque piste atteint la même crête."
+                                },
+                            );
+                        }
+
+                        // ------------------------------------------------ Destination
                         Self::section(ui, "Destination");
-                        ui.horizontal(|ui| {
+                        exp_row(ui, "Dossier", |ui| {
                             let mut txt = d.s.dir.display().to_string();
+                            let w_edit = (ui.available_width() - 96.0).max(120.0);
                             if ui
-                                .add(egui::TextEdit::singleline(&mut txt).desired_width(470.0))
+                                .add(egui::TextEdit::singleline(&mut txt).desired_width(w_edit))
+                                .on_hover_text("Dossier où les fichiers sont écrits (créé si besoin). Un fichier du même nom est remplacé.")
                                 .changed()
                             {
                                 d.s.dir = PathBuf::from(txt);
                             }
-                            if ui.button("…").clicked()
+                            if w::secondary_button(ui, "Choisir…").clicked()
                                 && let Some(p) = rfd::FileDialog::new()
                                     .set_directory(&self.project.dir)
                                     .pick_folder()
@@ -3219,17 +3375,59 @@ impl App {
                             }
                         });
                     });
+
+                // ------------------------------------------------ Résumé + Exporter
                 ui.add_space(14.0);
-                let n_files = if d.s.stems { d.tracks.len() } else { 0 }
-                    + usize::from(d.s.mix && !d.tracks.is_empty());
+                let chosen: Vec<usize> = with_audio
+                    .iter()
+                    .filter(|x| d.tracks.contains(&x.0))
+                    .map(|x| x.3)
+                    .collect();
+                let mut chans: Vec<usize> = Vec::new();
+                if d.s.stems {
+                    chans.extend(&chosen);
+                }
+                if d.s.mix && !chosen.is_empty() {
+                    chans.push(if d.s.mix_mono { 1 } else { 2 });
+                }
+                let n_files = chans.len();
+                let len = match (d.range, self.selection) {
+                    (RangeChoice::Selection, Some((a, b))) => b.saturating_sub(a),
+                    _ => session_len,
+                };
+                let secs = len as f64 / sr as f64;
+                let bytes: f64 = chans.iter().map(|&c| d.s.estimated_bytes(secs, c)).sum();
+                let mut parts = vec![
+                    format!("{n_files} fichier(s)"),
+                    d.s.format.label().to_string(),
+                ];
+                match d.s.format {
+                    ExportFormat::Mp3 => parts.push(d.s.mp3_bitrate.label().to_string()),
+                    ExportFormat::Ogg => parts.push(d.s.ogg_quality.label().to_string()),
+                    _ => {
+                        if let Some(b) = d.s.output_depth() {
+                            parts.push(b.label().to_string());
+                        }
+                        if d.s.dither_applies() {
+                            parts.push("dither".into());
+                        }
+                    }
+                }
+                parts.push(format!("{} kHz", fmt_khz(d.s.output_rate()).replace('.', ",")));
+                if let Some((_, l, _)) = NORMALIZE_OPTS
+                    .iter()
+                    .find(|o| o.0 == d.s.normalize && !o.0.is_off())
+                {
+                    parts.push((*l).to_string());
+                }
+                if n_files > 0 {
+                    parts.push(format!("≈ {}", fmt_bytes(bytes)));
+                }
                 ui.horizontal(|ui| {
-                    let conv = if d.s.sample_rate != sr {
-                        " · conversion de fréquence"
-                    } else {
-                        ""
-                    };
                     ui.label(
-                        egui::RichText::new(format!("{n_files} fichier(s){conv}")).color(t::TEXT_3),
+                        egui::RichText::new(parts.join(" · "))
+                            .font(t::regular(12.0))
+                            .color(t::TEXT_3),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if w::primary_button(ui, Some(Icon::Export), "Exporter", n_files > 0)
@@ -3290,11 +3488,14 @@ impl App {
                         }
                     });
                 });
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut d.keep_tracks,
-                    "Reprendre les pistes et les entrées actuelles",
-                );
+                // Au lancement, aucune session n'est ouverte : rien à reprendre.
+                if !self.start_screen {
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut d.keep_tracks,
+                        "Reprendre les pistes et les entrées actuelles",
+                    );
+                }
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3482,7 +3683,7 @@ impl App {
                 .show(ui, |ui| self.welcome_page(ui));
             self.new_session_dialog(&ctx);
             self.browser_dialog(&ctx);
-            self.audio_dialog(&ctx);
+            self.settings_dialog(&ctx);
             self.update_dialog(&ctx);
             self.save_as_dialog(&ctx);
             // Fenêtre « Nouvelle session » annulée : retour à l'accueil.
@@ -3538,12 +3739,11 @@ impl App {
             self.soundboard_ui(ui);
         }
 
-        self.audio_dialog(&ctx);
+        self.settings_dialog(&ctx);
         self.export_dialog(&ctx);
         self.new_session_dialog(&ctx);
         self.new_tracks_dialog(&ctx);
         self.update_dialog(&ctx);
-        self.welcome_dialog(&ctx);
         self.browser_dialog(&ctx);
         self.save_as_dialog(&ctx);
     }
@@ -3669,6 +3869,163 @@ pub fn out_dest_label(device: &str, channels: u16, left: u16) -> String {
         device.to_string()
     } else {
         format!("{device} · Sorties {}–{}", left + 1, left + 2)
+    }
+}
+
+/// Largeur de la colonne des libellés de la fenêtre d'export.
+const EXP_LABEL_W: f32 = 104.0;
+
+/// Ligne de la fenêtre d'export : libellé à gauche, réglages à droite.
+fn exp_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(EXP_LABEL_W, 24.0), egui::Sense::hover());
+        ui.painter().text(
+            r.left_center(),
+            Align2::LEFT_CENTER,
+            label,
+            t::regular(12.0),
+            t::TEXT_2,
+        );
+        add(ui);
+    });
+    ui.add_space(4.0);
+}
+
+/// Petite ligne d'explication sous un réglage de la fenêtre d'export.
+fn exp_hint(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(EXP_LABEL_W + ui.spacing().item_spacing.x);
+        ui.label(
+            egui::RichText::new(text)
+                .font(t::regular(11.5))
+                .color(t::TEXT_3),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// Formats d'export, avec leur bulle d'aide.
+const EXPORT_FORMATS: [(ExportFormat, &str, &str); 6] = [
+    (
+        ExportFormat::Wav,
+        "WAV",
+        "Non compressé, lu partout : envoi à un studio, import dans un autre logiciel audio. Passe en RF64 au-delà de 4 Go.",
+    ),
+    (
+        ExportFormat::Bwf,
+        "BWF",
+        "WAV avec horodatage et description : en post-production vidéo, chaque fichier se recale seul à sa position.",
+    ),
+    (
+        ExportFormat::Aiff,
+        "AIFF",
+        "Non compressé, l'équivalent Apple du WAV : quand le studio qui reçoit travaille sur Mac et le demande.",
+    ),
+    (
+        ExportFormat::Flac,
+        "FLAC",
+        "Sans perte, environ 2× plus léger que le WAV : archivage, envoi d'un concert entier à un mixeur.",
+    ),
+    (
+        ExportFormat::Mp3,
+        "MP3",
+        "Compressé, lisible partout : écoute rapide, envoi par e-mail ou messagerie, démo à faire écouter.",
+    ),
+    (
+        ExportFormat::Ogg,
+        "Ogg Vorbis",
+        "Compressé, un peu meilleur que le MP3 à débit égal : sons de jeux vidéo, applications, web.",
+    ),
+];
+
+/// Normalisations proposées, avec leur bulle d'aide.
+const NORMALIZE_OPTS: [(Normalize, &str, &str); 6] = [
+    (
+        Normalize::Off,
+        "Aucune",
+        "Volume d'origine, tel qu'enregistré : pour un mixeur qui veut toute la dynamique.",
+    ),
+    (
+        Normalize::Peak(-0.1),
+        "Crête −0,1 dB",
+        "Le point le plus fort amené juste sous 0 dB : le plus fort possible sans rien changer au son.",
+    ),
+    (
+        Normalize::Peak(-1.0),
+        "Crête −1 dB",
+        "Comme −0,1 dB avec 1 dB de marge : plus sûr avant une conversion en MP3.",
+    ),
+    (
+        Normalize::Lufs(-14.0),
+        "−14 LUFS",
+        "Volume perçu des plateformes de streaming musical : le morceau ne sera ni baissé ni remonté.",
+    ),
+    (
+        Normalize::Lufs(-16.0),
+        "−16 LUFS",
+        "Volume conseillé pour les podcasts et la voix parlée.",
+    ),
+    (
+        Normalize::Lufs(-23.0),
+        "−23 LUFS",
+        "Norme radio et télé européenne (EBU R128) : livraison à une chaîne.",
+    ),
+];
+
+fn depth_tip(b: BitDepth) -> &'static str {
+    match b {
+        BitDepth::I16 => "Qualité CD : fichier final très compatible, pressage CD.",
+        BitDepth::I24 => {
+            "Standard studio : mixage, mastering, échange entre studios. Le bon choix par défaut."
+        }
+        BitDepth::I32 => "Rarement demandé : seulement si un studio ou un outil l'exige.",
+        BitDepth::F32 => {
+            "Ne sature jamais, même au-dessus de 0 dB : fichiers de travail à retoucher ensuite."
+        }
+    }
+}
+
+fn rate_tip(r: u32) -> &'static str {
+    match r {
+        44100 => "Fréquence du CD et de la musique en ligne : livraison d'un morceau fini.",
+        48000 => {
+            "Norme vidéo, télé et cinéma : tout ce qui accompagne une image (clip, film, captation)."
+        }
+        88200 => "Haute résolution, multiple du CD : mastering qui finira en 44,1 kHz.",
+        96000 => "Haute résolution studio : archivage, distribution haute résolution.",
+        176400 => {
+            "Très haute résolution, multiple du CD : archivage. Fichiers 4× plus lourds qu'en 44,1 kHz."
+        }
+        _ => "Très haute résolution : archivage. Fichiers 4× plus lourds qu'en 48 kHz.",
+    }
+}
+
+fn mp3_tip(b: Mp3Bitrate) -> &'static str {
+    match b {
+        Mp3Bitrate::Cbr128 => "Léger : maquette envoyée par e-mail, écoute rapide sur téléphone.",
+        Mp3Bitrate::Cbr192 => "Bon compromis : écoute au casque, partage en ligne.",
+        Mp3Bitrate::Cbr256 => "Très bonne qualité : écoute attentive, diffusion en ligne.",
+        Mp3Bitrate::Cbr320 => "Qualité MP3 maximale : version d'écoute d'un morceau fini.",
+        Mp3Bitrate::V0 => "Débit variable : qualité proche du 320 kbit/s, fichier plus léger.",
+    }
+}
+
+fn ogg_tip(q: OggQuality) -> &'static str {
+    match q {
+        OggQuality::Q5 => "Léger : sons de jeux vidéo, applications, web.",
+        OggQuality::Q7 => "Très bonne qualité : musique, écoute attentive.",
+        OggQuality::Q9 => "Qualité Ogg maximale : version d'écoute d'un morceau fini.",
+    }
+}
+
+/// Taille lisible (« 1,2 Go », « 350 Mo »).
+fn fmt_bytes(b: f64) -> String {
+    if b >= 1e9 {
+        format!("{:.1} Go", b / 1e9).replace('.', ",")
+    } else if b >= 1e6 {
+        format!("{:.0} Mo", b / 1e6)
+    } else {
+        "< 1 Mo".into()
     }
 }
 

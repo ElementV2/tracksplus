@@ -253,8 +253,6 @@ pub enum Icon {
     Speaker,
     Snap,
     Undo,
-    /// Réglages (curseurs).
-    Settings,
     /// Casque (monitoring direct).
     Headphones,
     /// Flèche vers le bas sur une ligne (mise à jour, téléchargement).
@@ -271,8 +269,6 @@ pub enum Icon {
     Trash,
     /// Rétablir (annuler en miroir).
     Redo,
-    /// Nouvelle piste : piste avec un « + ».
-    AddTrack,
     /// Plage barrée (effacer la plage de temps).
     ClearRange,
 }
@@ -455,14 +451,6 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
                 );
             }
         }
-        Icon::Settings => {
-            // Trois curseurs horizontaux avec leur bouton, décalés.
-            for (k, x) in [(-1.0f32, 0.35f32), (0.0, -0.4), (1.0, 0.15)] {
-                let y = c.y + k * 0.55 * s;
-                p.line_segment([pos2(c.x - 0.8 * s, y), pos2(c.x + 0.8 * s, y)], st);
-                p.circle_filled(pos2(c.x + x * s, y), 0.22 * s, col);
-            }
-        }
         Icon::Scissors => {
             // Deux lames croisées et deux anneaux.
             let ring = 0.24 * s;
@@ -515,21 +503,6 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
                 col,
                 Stroke::NONE,
             ));
-        }
-        Icon::AddTrack => {
-            // Trois lignes de pistes et un « + ».
-            for k in 0..3 {
-                let y = c.y + (-0.6 + 0.45 * k as f32) * s;
-                let x1 = if k == 2 {
-                    c.x + 0.05 * s
-                } else {
-                    c.x + 0.85 * s
-                };
-                p.line_segment([pos2(c.x - 0.85 * s, y), pos2(x1, y)], st);
-            }
-            let pc = c + vec2(0.55, 0.45) * s;
-            p.line_segment([pc + vec2(-0.32, 0.0) * s, pc + vec2(0.32, 0.0) * s], st);
-            p.line_segment([pc + vec2(0.0, -0.32) * s, pc + vec2(0.0, 0.32) * s], st);
         }
         Icon::ClearRange => {
             // Plage entre crochets, barrée.
@@ -847,12 +820,12 @@ pub fn fit_text(ui: &Ui, text: &str, font: &FontId, max_w: f32) -> String {
 }
 
 pub fn view_tabs(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
-    view_tabs_rects(ui, value, labels).0
+    view_tabs_resps(ui, value, labels).0
 }
 
 /// Comme `view_tabs`, et retourne aussi la zone de chaque onglet (cibles de dépôt).
-pub fn view_tabs_rects(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool, Vec<Rect>) {
-    let mut rects = Vec::new();
+pub fn view_tabs_resps(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool, Vec<Response>) {
+    let mut resps = Vec::new();
     let mut changed = false;
     ui.spacing_mut().item_spacing.x = 2.0;
     let h = ui.available_height();
@@ -861,7 +834,6 @@ pub fn view_tabs_rects(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool
             .painter()
             .layout_no_wrap(l.to_string(), t::semibold(11.0), t::TEXT);
         let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 24.0, h), Sense::click());
-        rects.push(rect);
         let sel = *value == i;
         let p = ui.painter();
         if resp.hovered() && !sel {
@@ -896,8 +868,9 @@ pub fn view_tabs_rects(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool
             *value = i;
             changed = true;
         }
+        resps.push(resp);
     }
-    (changed, rects)
+    (changed, resps)
 }
 
 /// Contrôle segmenté plat (choix exclusif court).
@@ -907,11 +880,22 @@ pub fn segmented<T: PartialEq + Copy>(
     value: &mut T,
     options: &[(T, &str)],
 ) -> bool {
+    let opts: Vec<(T, &str, &str)> = options.iter().map(|&(v, l)| (v, l, "")).collect();
+    segmented_tips(ui, id, value, &opts)
+}
+
+/// Sélecteur segmenté avec une bulle d'aide par option (texte vide : pas de bulle).
+pub fn segmented_tips<T: PartialEq + Copy>(
+    ui: &mut Ui,
+    id: &str,
+    value: &mut T,
+    options: &[(T, &str, &str)],
+) -> bool {
     let mut changed = false;
     let font = t::medium(11.0);
     let widths: Vec<f32> = options
         .iter()
-        .map(|(_, l)| {
+        .map(|(_, l, _)| {
             ui.painter()
                 .layout_no_wrap(l.to_string(), font.clone(), t::TEXT)
                 .size()
@@ -924,9 +908,12 @@ pub fn segmented<T: PartialEq + Copy>(
     ui.painter()
         .rect_filled(rect, CornerRadius::same(t::R), t::INSET);
     let mut x = rect.left() + 2.0;
-    for (k, ((v, l), w)) in options.iter().zip(widths).enumerate() {
+    for (k, ((v, l, tip), w)) in options.iter().zip(widths).enumerate() {
         let r = Rect::from_min_size(pos2(x, rect.top() + 2.0), vec2(w, rect.height() - 4.0));
-        let resp = ui.interact(r, ui.make_persistent_id((id, k)), Sense::click());
+        let mut resp = ui.interact(r, ui.make_persistent_id((id, k)), Sense::click());
+        if !tip.is_empty() {
+            resp = resp.on_hover_text(*tip);
+        }
         let sel = *value == *v;
         let p = ui.painter();
         if sel {

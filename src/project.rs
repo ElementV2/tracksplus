@@ -503,7 +503,7 @@ impl Project {
     }
 
     /// Nom de fichier unique pour une nouvelle prise.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new_take_file(&self, track_name: &str) -> String {
         self.new_take_file_avoiding(track_name, &HashSet::new())
     }

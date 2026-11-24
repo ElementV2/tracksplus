@@ -118,8 +118,144 @@ impl App {
     }
 
     pub fn stop_all_pads(&mut self) {
-        let fade = (self.board.panic_fade * self.sr() as f64) as usize;
-        self.engine.pad(PadCmd::StopAll { fade });
+        self.engine.pad(PadCmd::StopAll);
+    }
+
+    /// Pads en lecture : nombre, temps restant (s) du dernier à finir hors boucles, et
+    /// présence d'une boucle.
+    fn pads_status(&self) -> (usize, Option<f64>, bool) {
+        let (mut n, mut rem, mut looped) = (0, None::<f64>, false);
+        for (slot, pad) in self.board.all_pads() {
+            let Some(pos) = self.pad_playing(slot) else {
+                continue;
+            };
+            n += 1;
+            if pad.looped {
+                looped = true;
+            } else if let Some(LoadState::Ready(s)) = self.cache.map.get(&pad.path) {
+                let pr = pad.params(s);
+                let r = (pr.end as f64 - pos as f64).max(0.0) / s.sample_rate as f64;
+                rem = Some(rem.map_or(r, |x| x.max(r)));
+            }
+        }
+        (n, rem, looped)
+    }
+
+    /// Transport du soundboard (barre du haut) : tout arrêter, voyant de lecture et
+    /// compteur (temps restant du dernier pad à finir, nombre de pads en lecture). Même
+    /// emplacement que le transport du multipiste : le compteur ne bouge pas d'un onglet à
+    /// l'autre.
+    pub fn pads_transport(&mut self, ui: &mut egui::Ui) {
+        let (n, rem, looped) = self.pads_status();
+        let playing = n > 0;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        // Place des deux premiers boutons du multipiste (début, stop).
+        ui.add_space(2.0 * 30.0 + 2.0 * 2.0);
+        if w::icon_button(
+            ui,
+            Icon::Stop,
+            30.0,
+            if playing {
+                BtnStyle::Tinted(t::REC)
+            } else {
+                BtnStyle::Ghost
+            },
+            playing,
+            "Tout arrêter, tout de suite (Échap)",
+        )
+        .clicked()
+        {
+            self.stop_all_pads();
+        }
+        // Voyant de lecture : vert dès qu'un pad joue.
+        let (pr, presp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+        if playing {
+            ui.painter().rect_filled(pr, t::R, t::PLAY);
+        }
+        w::paint_icon(
+            ui.painter(),
+            Icon::Play,
+            pr.center(),
+            30.0 * 0.24,
+            if playing {
+                Color32::BLACK
+            } else {
+                t::TEXT_2.gamma_multiply(0.3)
+            },
+        );
+        presp.on_hover_text(match n {
+            0 => "Aucun pad en lecture".to_string(),
+            1 => "1 pad en lecture".to_string(),
+            n => format!("{n} pads en lecture"),
+        });
+        ui.add_space(10.0);
+        let (rect, resp) = ui.allocate_exact_size(vec2(168.0, 30.0), Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, t::R, t::INSET);
+        let main_pos = pos2(rect.left() + 62.0, rect.center().y);
+        match rem {
+            Some(r) => w::counter(
+                p,
+                main_pos,
+                &format!("−{}", fmt_secs(r)),
+                t::medium(14.0),
+                t::TEXT,
+            ),
+            None if looped => {
+                p.text(
+                    main_pos,
+                    Align2::CENTER_CENTER,
+                    "BOUCLE",
+                    t::medium(13.0),
+                    t::TEXT,
+                );
+            }
+            None => w::counter(p, main_pos, &fmt_secs(0.0), t::medium(14.0), t::TEXT_3),
+        }
+        p.text(
+            pos2(rect.right() - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            match n {
+                0 => "PADS".to_string(),
+                1 => "1 PAD".to_string(),
+                n => format!("{n} PADS"),
+            },
+            t::medium(9.5),
+            if playing { t::PLAY } else { t::TEXT_3 },
+        );
+        resp.on_hover_text(if looped && rem.is_some() {
+            "Temps restant du dernier pad à finir (les boucles tournent jusqu'à l'arrêt)"
+        } else {
+            "Temps restant du dernier pad à finir"
+        });
+        // Prise multipiste en cours : rappel visible depuis le soundboard.
+        if self.is_recording() {
+            ui.add_space(8.0);
+            let blink = (self.now * 1.6).fract() < 0.55;
+            let g = ui
+                .painter()
+                .layout_no_wrap("REC".into(), t::semibold(10.5), Color32::BLACK);
+            let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 22.0), Sense::click());
+            let bg = if blink {
+                t::REC
+            } else {
+                t::mix(t::REC, t::SURFACE, 0.4)
+            };
+            ui.painter().rect_filled(r, t::R, bg);
+            ui.painter()
+                .circle_filled(pos2(r.left() + 10.0, r.center().y), 3.5, Color32::BLACK);
+            ui.painter().galley(
+                pos2(r.left() + 18.0, r.center().y - g.size().y / 2.0),
+                g,
+                Color32::BLACK,
+            );
+            if resp
+                .on_hover_text("Enregistrement multipiste en cours — clic : aller au multipiste")
+                .clicked()
+            {
+                self.tab = 0;
+            }
+        }
     }
 
     fn pad_playing(&self, slot: u16) -> Option<u64> {
@@ -577,7 +713,6 @@ impl App {
             self.sb.selected = None;
         }
         self.confirm_delete_page_dialog(ui.ctx());
-        self.sb_settings_dialog(ui.ctx());
         // Éditeur toujours présent (même sans pad sélectionné) : la grille ne change pas de
         // taille quand on clique sur un pad.
         let has_pad = self.sb.selected.and_then(|s| self.board.pad(s)).is_some();
@@ -701,76 +836,10 @@ impl App {
         {
             let ui = &mut child;
             ui.spacing_mut().item_spacing.x = 6.0;
-            {
-                let g =
-                    ui.painter()
-                        .layout_no_wrap("Tout arrêter".into(), t::semibold(11.5), t::TEXT);
-                let (r, resp) =
-                    ui.allocate_exact_size(vec2(g.size().x + 34.0, 24.0), Sense::click());
-                let bg = if resp.hovered() {
-                    t::REC
-                } else {
-                    t::mix(t::REC, t::SURFACE_2, 0.45)
-                };
-                ui.painter().rect_filled(r, t::R, bg);
-                w::paint_icon(
-                    ui.painter(),
-                    Icon::Stop,
-                    pos2(r.left() + 13.0, r.center().y),
-                    4.5,
-                    Color32::BLACK,
-                );
-                ui.painter().galley(
-                    pos2(r.left() + 23.0, r.center().y - g.size().y / 2.0),
-                    g,
-                    Color32::BLACK,
-                );
-                if resp
-                    .on_hover_text(format!(
-                        "Arrêt de tous les pads en fondu de {:.1} s (Échap)",
-                        self.board.panic_fade
-                    ))
-                    .clicked()
-                {
-                    self.stop_all_pads();
-                }
-            }
 
-            let mut db = self.board.master_db;
-            // Valeur à largeur fixe : bouger le curseur ne décale rien dans la barre.
-            let (vr, _) = ui.allocate_exact_size(vec2(56.0, 20.0), Sense::hover());
-            ui.painter().text(
-                pos2(vr.right(), vr.center().y),
-                Align2::RIGHT_CENTER,
-                format!("{} dB", w::fmt_db(db)),
-                t::medium(10.5),
-                t::TEXT_2,
-            );
-            let r = ui
-                .add_sized(
-                    [110.0, 20.0],
-                    egui::Slider::new(&mut db, -40.0..=6.0)
-                        .show_value(false)
-                        .trailing_fill(true),
-                )
-                .on_hover_text("Volume général des pads — double-clic : 0 dB");
-            if r.changed() {
-                self.board.master_db = db;
-                self.engine.pad(PadCmd::SetMaster {
-                    gain: crate::soundboard::db_to_gain(db),
-                });
-                self.board_changed = Some(self.now);
-            }
-            if slider_double_clicked(ui, &r) {
-                self.board.master_db = 0.0;
-                self.engine.pad(PadCmd::SetMaster { gain: 1.0 });
-                self.board_changed = Some(self.now);
-            }
-            let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            w::paint_icon(ui.painter(), Icon::Speaker, ir.center(), 5.5, t::TEXT_2);
             ui.add_space(6.0);
 
-            // Réglages (sortie, contrôleur MIDI, LED, grille) et voyant d'activité MIDI.
+            // Voyant d'activité MIDI.
             let active = self.now - self.sb.midi_seen < 0.15;
             let (dr, dresp) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
             let dot = if active {
@@ -791,33 +860,6 @@ impl App {
                 _ if self.midi.connected.is_empty() => "Aucun contrôleur MIDI".into(),
                 _ => format!("MIDI : {}", self.midi.connected.join(", ")),
             });
-            let (gc, gr) = self.grid_dims();
-            let summary = format!(
-                "Sortie : {}\nContrôleur MIDI : {}\nGrille : {} × {}",
-                self.prefs
-                    .pad_output
-                    .clone()
-                    .or_else(|| self.engine.status.output.clone())
-                    .unwrap_or_else(|| "—".into()),
-                self.board
-                    .midi_port
-                    .clone()
-                    .unwrap_or_else(|| "aucun".into()),
-                gc,
-                gr
-            );
-            if w::tool_button(
-                ui,
-                Some(Icon::Settings),
-                "Réglages",
-                self.sb.settings_open,
-                true,
-            )
-            .on_hover_text(summary)
-            .clicked()
-            {
-                self.sb.settings_open = !self.sb.settings_open;
-            }
         }
         let right_edge = child.min_rect().left();
 
@@ -842,42 +884,38 @@ impl App {
                 .map(|p| p.name.to_uppercase())
                 .collect();
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let before = ui.cursor().left();
+            let mut remove_page = None;
             ui.scope(|ui| {
                 ui.set_height(full.height());
-                let (changed, rects) = w::view_tabs_rects(ui, &mut page, &refs);
+                let (changed, resps) = w::view_tabs_resps(ui, &mut page, &refs);
                 if changed {
                     self.sb.page = page;
                 }
-                self.sb.page_tabs = rects;
-            });
-            // Menu contextuel de la page active (renommer / supprimer).
-            let tabs_rect = Rect::from_min_max(
-                pos2(before, full.top()),
-                pos2(ui.cursor().left(), full.bottom()),
-            );
-            let mut remove_page = None;
-            ui.interact(
-                tabs_rect,
-                ui.make_persistent_id("page_tabs_ctx"),
-                Sense::click(),
-            )
-            .on_hover_text("Clic droit : renommer ou supprimer la page")
-            .context_menu(|ui| {
-                let i = self.sb.page;
-                ui.set_width(200.0);
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.board.pages[i].name)
-                            .desired_width(180.0),
-                    )
-                    .changed()
-                {
-                    self.board_changed = Some(self.now);
-                }
-                if self.board.pages.len() > 1 && ui.button("Supprimer la page").clicked() {
-                    remove_page = Some(i);
-                    ui.close();
+                self.sb.page_tabs = resps.iter().map(|r| r.rect).collect();
+                // Clic : afficher la page ; clic droit : la renommer ou la supprimer.
+                for (i, r) in resps.into_iter().enumerate() {
+                    if r.secondary_clicked() {
+                        self.sb.page = i;
+                    }
+                    r.on_hover_text("Clic droit : renommer ou supprimer la page")
+                        .context_menu(|ui| {
+                            ui.set_width(200.0);
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.board.pages[i].name)
+                                        .desired_width(180.0),
+                                )
+                                .changed()
+                            {
+                                self.board_changed = Some(self.now);
+                            }
+                            if self.board.pages.len() > 1
+                                && ui.button("Supprimer la page").clicked()
+                            {
+                                remove_page = Some(i);
+                                ui.close();
+                            }
+                        });
                 }
             });
             if let Some(i) = remove_page {
@@ -895,19 +933,11 @@ impl App {
         });
     }
 
-    /// Réglages du soundboard : sortie, contrôleur MIDI, LED, taille de la grille.
-    fn sb_settings_dialog(&mut self, ctx: &egui::Context) {
-        if !self.sb.settings_open {
-            return;
-        }
-        let mut close = false;
+    /// Onglet « Soundboard » des réglages : sortie, contrôleur MIDI, LED, disposition et
+    /// taille de la grille. `true` : aller à l'onglet « Carte son » (choix de la sortie).
+    pub fn sb_settings(&mut self, ui: &mut egui::Ui) -> bool {
         let mut open_audio = false;
-        let resp = egui::Modal::new(egui::Id::unique("sb_settings"))
-            .frame(t::window_frame())
-            .show(ctx, |ui| {
-                ui.set_width(460.0);
-                close = Self::dialog_header(ui, "Réglages du soundboard");
-                egui::Grid::new("sb_settings_grid")
+        egui::Grid::new("sb_settings_grid")
                     .num_columns(2)
                     .spacing([16.0, 10.0])
                     .show(ui, |ui| {
@@ -932,7 +962,11 @@ impl App {
                                 ))
                                 .color(t::TEXT),
                             );
-                            if ui.button("Changer…").clicked() {
+                            if ui
+                                .button("Changer…")
+                                .on_hover_text("Les sorties se règlent dans l'onglet « Carte son »")
+                                .clicked()
+                            {
                                 open_audio = true;
                             }
                         });
@@ -1138,24 +1172,18 @@ impl App {
                         });
                         ui.end_row();
                     });
-                ui.add_space(10.0);
-                ui.add(
+        ui.add_space(10.0);
+        ui.add(
                     egui::Label::new(
                         egui::RichText::new(
-                            "Les sorties (multipiste, soundboard, monitoring) se règlent ensemble dans « Carte son ». Le contrôleur MIDI déclenche les pads même fenêtre réduite.",
+                            "Les sorties (multipiste, soundboard, monitoring) se règlent ensemble dans l'onglet « Carte son ». Le contrôleur MIDI déclenche les pads même fenêtre réduite.",
                         )
                         .font(t::regular(11.5))
                         .color(t::TEXT_3),
                     )
                     .wrap(),
                 );
-            });
-        if close || resp.should_close() || open_audio {
-            self.sb.settings_open = false;
-        }
-        if open_audio {
-            self.open_audio();
-        }
+        open_audio
     }
 
     fn pad_grid(&mut self, ui: &mut egui::Ui) {
