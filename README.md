@@ -126,17 +126,23 @@ Conçu pour ne jamais perdre une prise :
 
 ## Compiler
 
-Prérequis : [Rust](https://rustup.rs) stable.
+Prérequis : [Rust](https://rustup.rs) stable. Les builds se font en local (pas de CI GitHub) :
 
-```sh
-# Windows avec ASIO (Dante VSC) — télécharge le SDK Steinberg, nécessite LLVM/clang
-cargo build --release --features asio
-# macOS / Linux (Linux : libasound2-dev)
-cargo build --release
-```
+| Script | Rôle |
+| --- | --- |
+| `scripts/check.sh` | « CI » locale : formatage, lint strict, tests, test de charge 64 pistes temps réel, build release Linux, compilation Windows et macOS |
+| `scripts/build-windows.sh` | Depuis Linux : `dist/TracksPlus.exe` **avec ASIO** (Dante VSC), autonome (aucune DLL à installer). Prérequis : `apt install mingw-w64 clang`, `rustup target add x86_64-pc-windows-gnu`. Le SDK ASIO est récupéré automatiquement |
+| `scripts/build-macos.sh` | Sur un Mac : `dist/TracksPlus.app` universelle (Apple Silicon + Intel) |
 
-La CI GitHub (`.github/workflows/build.yml`) produit un `.exe` Windows (ASIO) et une `.app`
-macOS universelle. Police : [Inter](https://rsms.me/inter/) (licence OFL, `assets/fonts`).
+Sous Windows avec Visual Studio, `cargo build --release --features asio` fonctionne aussi
+(variable `CPAL_ASIO_DIR` vers le SDK ASIO). Linux : `cargo build --release` (paquet
+`libasound2-dev`). Le workflow GitHub (`.github/workflows/build.yml`) ne se lance plus qu'à
+la main.
+
+Licences : police [Inter](https://rsms.me/inter/) (OFL, `assets/fonts`) ; SDK ASIO de
+Steinberg en double licence GPLv3 / licence Steinberg (à signer, gratuite, pour distribuer
+une version non GPL) ; `vendor/asio-sys` est une copie d'asio-sys (Apache-2.0) avec une
+seule modification pour la compilation MinGW.
 
 ## Architecture
 

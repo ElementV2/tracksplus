@@ -1,8 +1,8 @@
 name: Build
 
+# Lancement manuel uniquement (onglet Actions → Build → Run workflow) :
+# les builds sont faits localement, sans consommer de minutes GitHub.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 jobs:

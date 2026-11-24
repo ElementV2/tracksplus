@@ -1,0 +1,22 @@
+# Compilation croisée Windows depuis Linux (MinGW) : exécutable autonome, sans DLL
+# MinGW à livrer. La bibliothèque C++ (utilisée par le pilote ASIO) est liée en statique :
+# on empêche le crate `cc` de la demander en dynamique, puis on l'ajoute nous-mêmes.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=-Wl,-Bstatic",
+  "-C", "link-arg=-Wl,--start-group",
+  "-C", "link-arg=-lstdc++",
+  "-C", "link-arg=-lgcc",
+  "-C", "link-arg=-lgcc_eh",
+  "-C", "link-arg=-lmingw32",
+  "-C", "link-arg=-lmingwex",
+  "-C", "link-arg=-lmsvcrt",
+  "-C", "link-arg=-lkernel32",
+  "-C", "link-arg=-Wl,--end-group",
+]
+
+[env]
+CXXSTDLIB_x86_64_pc_windows_gnu = ""

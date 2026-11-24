@@ -32,3 +32,8 @@ jack = ["cpal/jack"]
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Copie locale de asio-sys : permet la compilation croisée Windows (MinGW) avec ASIO.
+# Seule modification : voir vendor/asio-sys/build.rs (« TracksPlus »).
+[patch.crates-io]
+asio-sys = { path = "vendor/asio-sys" }
