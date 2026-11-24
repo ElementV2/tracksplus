@@ -14,7 +14,17 @@ use std::collections::HashSet;
 
 const HEADER_W: f32 = 284.0;
 /// Hauteur du panneau de réglages d'une piste dépliée.
-const INSPECTOR_H: f32 = 104.0;
+const INSPECTOR_H: f32 = 132.0;
+
+/// Piste du bandeau de vumètres : id, nom, canaux, armée, position, étiquette, couleur.
+type MeterTrack = (u64, String, Vec<u16>, bool, usize, String, Color32);
+
+/// Couleur d'une piste : celle choisie, sinon selon sa position.
+pub fn track_color(track: &crate::project::Track, idx: usize) -> Color32 {
+    track
+        .color
+        .map_or(t::color(idx), |c| t::PALETTE[c as usize % t::PALETTE.len()])
+}
 const RULER_H: f32 = 24.0;
 const SCROLLBAR_H: f32 = 12.0;
 const CLIP_HEADER: f32 = 13.0;
@@ -1191,7 +1201,7 @@ impl App {
                 if !ui.is_rect_visible(row) && !dragging_here {
                     continue;
                 }
-                let color = t::color(idx);
+                let color = track_color(&self.project.tracks[idx], idx);
                 let header = Rect::from_min_size(row.min, vec2(HEADER_W, track_h));
                 let lane = Rect::from_min_max(pos2(row.left() + HEADER_W, row.top()), row.max);
                 let selected = self.selected_tracks.contains(&tid);
@@ -1426,6 +1436,7 @@ impl App {
                 let mut new_input: Option<Option<u16>> = None;
                 let mut new_stereo: Option<bool> = None;
                 let (mut arm_toggle, mut monitor_toggle) = (false, false);
+                let mut new_color: Option<u8> = None;
                 hdr.horizontal(|ui| {
                     // Étiquette d'entrée présentée en liste déroulante (« IN 1 ▾ »).
                     let (r, resp) = ui.allocate_exact_size(
@@ -1523,6 +1534,7 @@ impl App {
                     let track = &self.project.tracks[idx];
                     let (stereo, input, armed, monitor) =
                         (track.stereo, track.input, track.armed, track.monitor);
+                    let cur_color = track_color(track, idx);
                     egui::Grid::new(("track_panel", tid))
                         .num_columns(2)
                         .spacing([10.0, 6.0])
@@ -1543,6 +1555,23 @@ impl App {
                                 }
                             });
                             ui.end_row();
+                            ui.label(egui::RichText::new("Couleur").font(t::regular(11.5)).color(t::TEXT_2));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (i, c) in t::PALETTE.iter().enumerate() {
+                                    let (r, resp) = ui.allocate_exact_size(vec2(15.0, 18.0), Sense::click());
+                                    ui.painter().circle_filled(r.center(), 5.5, *c);
+                                    if *c == cur_color {
+                                        ui.painter().circle_stroke(r.center(), 7.0, Stroke::new(1.2, t::TEXT));
+                                    } else if resp.hovered() {
+                                        ui.painter().circle_stroke(r.center(), 7.0, Stroke::new(1.0, t::TEXT_3));
+                                    }
+                                    if resp.clicked() {
+                                        new_color = Some(i as u8);
+                                    }
+                                }
+                            });
+                            ui.end_row();
                             ui.label("");
                             ui.horizontal(|ui| {
                                 if w::tool_button(ui, Some(Icon::Record), "Armée", armed, stopped && input.is_some())
@@ -1560,6 +1589,10 @@ impl App {
                             });
                             ui.end_row();
                         });
+                }
+                if let Some(c) = new_color {
+                    self.project.tracks[idx].color = Some(c);
+                    self.project.dirty = true;
                 }
                 if arm_toggle || monitor_toggle {
                     let track = &mut self.project.tracks[idx];
@@ -1980,7 +2013,7 @@ impl App {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 1.0;
                     let col_w = 44.0;
-                    let tracks: Vec<(u64, String, Vec<u16>, bool, usize, String)> = self
+                    let tracks: Vec<MeterTrack> = self
                         .project
                         .tracks
                         .iter()
@@ -1998,10 +2031,11 @@ impl App {
                                 tr.armed,
                                 i,
                                 label,
+                                track_color(tr, i),
                             )
                         })
                         .collect();
-                    for (id, name, chans, armed, idx, label) in tracks {
+                    for (id, name, chans, armed, idx, label, color) in tracks {
                         let (r, resp) =
                             ui.allocate_exact_size(vec2(col_w, area.height()), Sense::click());
                         let p = ui.painter();
@@ -2049,7 +2083,7 @@ impl App {
                                 vec2(col_w - 12.0, 2.0),
                             ),
                             0.0,
-                            t::color(idx),
+                            color,
                         );
                         p.text(
                             pos2(r.center().x, bottom + 16.0),

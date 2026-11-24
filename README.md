@@ -1,8 +1,8 @@
 # TracksPlus
 
 Enregistreur **multipiste** et **soundboard** dans une seule application. Interface sombre,
-plate et dense, dans l'esprit des stations audio modernes (Bitwig) : gris anthracite, accent
-orange, angles quasi droits, couleurs de pistes désaturées.
+plate et dense : gris anthracite, accent orange, angles quasi droits, couleurs de pistes
+désaturées.
 Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), ASIO, CoreAudio.
 
 | Multipiste | Soundboard |
@@ -19,10 +19,11 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   dans « Carte son » rouvre la carte et reprend ces réglages (en ASIO, buffer et fréquence
   repassent en « Auto »). Indisponible pendant une prise.
 - **Fenêtre** : 1280 × 720 minimum (à l'échelle d'affichage 100 % de Windows).
-- **Pistes** : « Ajouter une piste » → **Mono** ou **Stéréo**, puis l'entrée (un clic crée la
-  piste). Mono = une entrée ; stéréo = une paire fixe (1-2, 3-4…) enregistrée dans un seul WAV
-  stéréo. Sélecteur en grille (1 à 64+, entrées déjà utilisées signalées), réglable ensuite
-  depuis l'étiquette « IN » de la piste (mono / stéréo et entrée).
+- **Pistes** : « Ajouter des pistes » → nombre de pistes, **Mono** ou **Stéréo**, première
+  entrée et nom. Mono = une entrée ; stéréo = une paire fixe (1-2, 3-4…) enregistrée dans un
+  seul WAV stéréo. La flèche à gauche du nom déplie le panneau de la piste : type (mono /
+  stéréo), entrée (sélecteur en grille, entrées déjà utilisées signalées), **couleur**,
+  armement et monitoring.
   Armement, **monitoring direct** (casque : l'entrée de la piste est écoutée en temps réel sur
   la sortie « Monitoring »), **M**ute / **S**olo pour la lecture, renommage par double-clic.
 - **Vumètres pro** : crête façon IEC 60268-18 (échelle dB non linéaire, plus précise près de 0),
@@ -79,8 +80,7 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   de sortie** (courbes douces), gain en dB, couleur, nom, touche clavier et MIDI du pad.
 - **Contrôleur USB** : choix du port MIDI (ou tous), déclenchement direct dans le thread
   audio : fonctionne même fenêtre réduite. En disposition manuelle, **MIDI learn** par pad
-  (notes et CC). **Touches clavier** assignables par pad (pratique aussi avec un Stream
-  Deck). Le code MIDI d'un pad s'affiche dans l'éditeur, pas sur la grille.
+  (notes et CC). **Touches clavier** assignables par pad. Le code MIDI d'un pad s'affiche dans l'éditeur, pas sur la grille.
 - **Disposition automatique** (par défaut) : quand le contrôleur choisi dans les réglages est
   un modèle reconnu, la grille prend **sa taille et sa disposition**, sans MIDI learn : **le
   MIDI appartient à la case**, pas au son. Glisser un son dans une case le fait jouer par le
@@ -107,7 +107,7 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   | Arturia MiniLab 3 | 1 × 8 (banque A) | — | — |
 
   Les contrôleurs sont utilisés dans leur réglage d'usine. Les Launchpad récents passent
-  seuls en mode « Programmer », l'APC40 mkII en mode « Ableton » (LED pilotées), le Push 2 en
+  seuls en mode « Programmer », l'APC40 mkII dans le mode où l'ordinateur pilote ses LED, le Push 2 en
   mode « User » s'il est branché sur son port User. Sans boutons de page, les pages se
   changent à l'écran. Ports à choisir : pour l'APC Key 25 mk2, le second port (celui des
   pads) ; pour les Launchkey, le port principal (pas « MIDIIN2 »).
@@ -157,6 +157,22 @@ Conçu pour ne jamais perdre une prise :
   `crash.log` du dossier de configuration). Sauvegarde automatique du montage toutes les 30 s.
 - Sons du soundboard limités à 30 min (chargés en mémoire).
 
+## Installation et mises à jour
+
+- **Télécharger** : page [Releases](https://github.com/ElementV2/tracksplus/releases) →
+  `TracksPlus-Setup-<version>.exe` (Windows 10/11 64 bits, aucun prérequis), ou la version
+  portable (`…-windows-portable.zip`, sans installation).
+- **Mises à jour depuis l'application** : TracksPlus regarde au lancement si une version plus
+  récente est publiée (désactivable). Si oui, une pastille **« Version x.y.z »** apparaît en
+  haut à droite, et un point orange sur le menu ☰. Elle ouvre les nouveautés et le bouton
+  **« Installer et redémarrer »** : l'installeur est téléchargé, TracksPlus se ferme, se met
+  à jour et se relance (réglages et sessions conservés). Indisponible pendant une prise.
+  « Ignorer cette version » ne la propose plus. Recherche manuelle : menu ☰ → « Rechercher
+  des mises à jour ». La version portable ouvre la page de téléchargement.
+- L'exécutable n'est pas signé : au premier lancement, Windows SmartScreen peut afficher
+  « Windows a protégé votre ordinateur » → « Informations complémentaires » → « Exécuter
+  quand même ».
+
 ## Raccourcis
 
 | Touche | Multipiste | Soundboard |
@@ -194,6 +210,7 @@ Prérequis : [Rust](https://rustup.rs) stable. Les builds se font en local (pas 
 | --- | --- |
 | `scripts/check.sh` | « CI » locale : formatage, lint strict, tests, test de charge 64 pistes temps réel, build release Linux, compilation Windows et macOS |
 | `scripts/package-windows.ps1` | **À distribuer** — sous Windows : `dist/TracksPlus-Setup-<version>.exe` (installeur : menu Démarrer, raccourci bureau, désinstallation) et `dist/TracksPlus-<version>-windows-portable.zip`, avec ASIO et WASAPI, exécutable autonome. Prérequis : Visual Studio Build Tools (C++), `winget install LLVM.LLVM` et `winget install JRSoftware.InnoSetup`. Le SDK ASIO est téléchargé automatiquement |
+| `scripts/release.ps1` | **Publier une version** : `-Notes notes.md`. Vérifie que tout est commité et poussé, construit le paquet Windows puis crée la release GitHub `v<version>` (installeur + portable + notes). Les applications installées la proposent ensuite d'elles-mêmes. Avant : monter `version` dans `Cargo.toml`. Prérequis : `gh auth login` |
 | `scripts/build-windows.sh` | Depuis Linux : `dist/TracksPlus.exe` **avec ASIO** (Dante VSC), autonome (aucune DLL à installer). Prérequis : `apt install mingw-w64 clang`, `rustup target add x86_64-pc-windows-gnu`. Le SDK ASIO est récupéré automatiquement |
 | `scripts/build-macos.sh` | Sur un Mac : `dist/TracksPlus.app` universelle (Apple Silicon + Intel) |
 
@@ -202,10 +219,13 @@ Sous Windows avec Visual Studio, `cargo build --release --features asio` fonctio
 `libasound2-dev`). Le workflow GitHub (`.github/workflows/build.yml`) ne se lance plus qu'à
 la main.
 
-Licences : police [Inter](https://rsms.me/inter/) (OFL, `assets/fonts`) ; SDK ASIO de
-Steinberg en double licence GPLv3 / licence Steinberg (à signer, gratuite, pour distribuer
-une version non GPL) ; `vendor/asio-sys` est une copie d'asio-sys (Apache-2.0) avec une
-seule modification pour la compilation MinGW.
+## Licence
+
+TracksPlus est distribué sous licence **GNU GPL v3** (voir [`LICENSE`](LICENSE)).
+
+Composants tiers : police [Inter](https://rsms.me/inter/) (OFL, `assets/fonts`) ; SDK ASIO
+de Steinberg, utilisé sous sa licence GPLv3 ; `vendor/asio-sys` est une copie d'asio-sys
+(Apache-2.0) avec une seule modification pour la compilation MinGW.
 
 ## Architecture
 
@@ -218,4 +238,5 @@ seule modification pour la compilation MinGW.
 | `src/recorder.rs` / `src/player.rs` | Threads disque : enregistrement et lecture multipiste |
 | `src/render.rs` / `src/export.rs` | Lecture des prises, formes d'onde, export |
 | `src/project.rs` | Session, pistes, prises, repères |
+| `src/update.rs` | Mises à jour : dernière release GitHub, téléchargement et lancement de l'installeur |
 | `src/app.rs`, `src/ui/*` | Interface (egui) : thème, widgets, onglets |

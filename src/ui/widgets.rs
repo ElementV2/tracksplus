@@ -258,6 +258,8 @@ pub enum Icon {
     Settings,
     /// Casque (monitoring direct).
     Headphones,
+    /// Flèche vers le bas sur une ligne (mise à jour, téléchargement).
+    Download,
 }
 
 pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
@@ -297,6 +299,12 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
         Icon::Plus => {
             p.line_segment([c + vec2(-0.65, 0.0) * s, c + vec2(0.65, 0.0) * s], st);
             p.line_segment([c + vec2(0.0, -0.65) * s, c + vec2(0.0, 0.65) * s], st);
+        }
+        Icon::Download => {
+            p.line_segment([c + vec2(0.0, -0.75) * s, c + vec2(0.0, 0.35) * s], st);
+            p.line_segment([c + vec2(-0.45, -0.05) * s, c + vec2(0.0, 0.4) * s], st);
+            p.line_segment([c + vec2(0.45, -0.05) * s, c + vec2(0.0, 0.4) * s], st);
+            p.line_segment([c + vec2(-0.65, 0.8) * s, c + vec2(0.65, 0.8) * s], st);
         }
         Icon::Close => {
             p.line_segment([c + vec2(-0.5, -0.5) * s, c + vec2(0.5, 0.5) * s], st);

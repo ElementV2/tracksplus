@@ -1,4 +1,4 @@
-//! Contrôleurs MIDI USB (Launchpad, APC, nanoPAD, Stream Deck en mode MIDI…).
+//! Contrôleurs MIDI USB (pads, grilles, claviers à pads…).
 //!
 //! Les messages déclenchent les pads directement depuis le thread MIDI vers le
 //! moteur audio (latence minimale, même si la fenêtre est réduite), et sont aussi

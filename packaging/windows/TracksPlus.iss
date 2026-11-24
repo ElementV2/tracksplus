@@ -52,6 +52,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#Exe}"; DestDir: "{app}"; DestName: "TracksPlus.exe"; Flags: ignoreversion
 Source: "..\..\assets\fonts\Inter-LICENSE.txt"; DestDir: "{app}\Licences"; DestName: "Inter (police) - OFL.txt"; Flags: ignoreversion
 Source: "LISEZMOI.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENCE (GPLv3).txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\TracksPlus"; Filename: "{app}\TracksPlus.exe"
@@ -59,6 +60,8 @@ Name: "{autodesktop}\TracksPlus"; Filename: "{app}\TracksPlus.exe"; Tasks: deskt
 
 [Run]
 Filename: "{app}\TracksPlus.exe"; Description: "{cm:LaunchProgram,TracksPlus}"; Flags: nowait postinstall skipifsilent
+; Mise à jour depuis l'application (installation silencieuse) : TracksPlus est relancé.
+Filename: "{app}\TracksPlus.exe"; Flags: nowait runasoriginaluser skipifnotsilent
 
 ; Les réglages (%APPDATA%\TracksPlus) et les sessions (Musique\TracksPlus) appartiennent à
 ; l'utilisateur : ils sont conservés à la désinstallation.

@@ -1,6 +1,5 @@
-//! Direction artistique : sombre, plate et dense, inspirée des stations audio modernes
-//! (Bitwig). Gris anthracite neutres, séparateurs fins, angles presque droits,
-//! un seul accent orange, couleurs de pistes désaturées.
+//! Direction artistique : sombre, plate et dense. Gris anthracite neutres, séparateurs
+//! fins, angles presque droits, un seul accent orange, couleurs de pistes désaturées.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke,

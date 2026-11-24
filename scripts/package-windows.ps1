@@ -68,6 +68,7 @@ Remove-Item -Recurse -Force (Split-Path $stage) -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force (Join-Path $stage 'Licences') | Out-Null
 Copy-Item $exe (Join-Path $stage 'TracksPlus.exe')
 Copy-Item 'packaging\windows\LISEZMOI.txt' $stage
+Copy-Item 'LICENSE' (Join-Path $stage 'LICENCE (GPLv3).txt')
 Copy-Item 'assets\fonts\Inter-LICENSE.txt' (Join-Path $stage 'Licences\Inter (police) - OFL.txt')
 $zip = Join-Path $dist "TracksPlus-$version-windows-portable.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue

@@ -241,6 +241,14 @@ pub struct App {
     pub expanded_tracks: HashSet<u64>,
     /// Dialogue « Nouvelles pistes » ouvert.
     pub tracks_dlg: Option<NewTracksDialog>,
+    /// Mises à jour : recherche / téléchargement, réglages, fenêtre ouverte.
+    pub updater: crate::update::Updater,
+    pub update_settings: crate::update::Settings,
+    pub update_dlg: bool,
+    /// Recherche automatique du lancement déjà faite.
+    pub update_checked: bool,
+    /// « Installer et redémarrer » demandé : l'installeur sera lancé dès qu'il est prêt.
+    pub update_install: bool,
     /// Piste en cours de renommage (champ de saisie à la place du nom).
     pub renaming_track: Option<u64>,
     /// Donner le focus au champ de renommage à la prochaine image.
@@ -383,6 +391,11 @@ impl App {
 
             stop_armed_until: 0.0,
             confirm_close: false,
+            updater: Default::default(),
+            update_settings: crate::update::Settings::load(),
+            update_dlg: false,
+            update_checked: false,
+            update_install: false,
             rec_watch: (0, 0.0),
             last_autosave: 0.0,
             awake: None,
@@ -1443,10 +1456,11 @@ impl App {
         });
     }
 
-    fn close_dialogs(&mut self) {
+    pub fn close_dialogs(&mut self) {
         self.audio_dlg = None;
         self.export_dlg = None;
         self.new_dlg = None;
+        self.update_dlg = false;
     }
 
     pub fn dialog_open(&self) -> bool {
@@ -1456,6 +1470,7 @@ impl App {
             || self.export_dlg.is_some()
             || self.new_dlg.is_some()
             || self.export_job.is_some()
+            || self.update_dlg
     }
 
     pub fn zoom_to_fit(&mut self) {
@@ -1613,6 +1628,7 @@ impl App {
         lui.spacing_mut().item_spacing.x = 6.0;
         lui.add_space(6.0);
         let more = w::icon_button(&mut lui, Icon::More, 28.0, BtnStyle::Ghost, true, "Menu");
+        self.update_menu_dot(&lui, more.rect);
         egui::Popup::menu(&more)
             .width(250.0)
             .show(|ui| self.main_menu(ui));
@@ -1727,6 +1743,8 @@ impl App {
         {
             self.open_audio();
         }
+        rui.add_space(8.0);
+        self.update_pill(&mut rui);
     }
 
     fn transport_controls(&mut self, ui: &mut egui::Ui) {
@@ -1963,6 +1981,7 @@ impl App {
         if ui.button("Réglages audio…").clicked() {
             self.open_audio();
         }
+        self.update_menu(ui);
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -2881,6 +2900,7 @@ impl eframe::App for App {
             }
             self.update_playhead();
             self.soundboard_background(ctx);
+            self.update_background(ctx);
         }));
         if res.is_err() {
             self.notify("Erreur interne (tâches de fond) — l'audio continue", true);
@@ -2992,6 +3012,7 @@ impl App {
         self.export_dialog(&ctx);
         self.new_session_dialog(&ctx);
         self.new_tracks_dialog(&ctx);
+        self.update_dialog(&ctx);
         self.toast_ui(&ctx);
 
         self.confirm_close_dialog(&ctx);

@@ -111,6 +111,9 @@ pub struct Track {
     /// de monitoring.
     #[serde(default)]
     pub monitor: bool,
+    /// Couleur choisie (indice dans la palette) ; `None` = couleur selon la position.
+    #[serde(default)]
+    pub color: Option<u8>,
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
     pub clips: Vec<Clip>,
 }
@@ -216,6 +219,7 @@ impl Project {
             mute: false,
             solo: false,
             monitor: false,
+            color: None,
             clips: Vec::new(),
         });
         self.dirty = true;

@@ -12,6 +12,7 @@ mod render;
 mod sampler;
 mod soundboard;
 mod ui;
+mod update;
 
 /// Une seule instance à la fois : deux TracksPlus se disputeraient la carte son (ASIO
 /// n'accepte qu'une application) et les mêmes réglages. Le verrou est tenu tant que le
