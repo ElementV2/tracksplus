@@ -22,13 +22,28 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # La feature `asio` télécharge le SDK ASIO de Steinberg et utilise le LLVM du runner.
+      # Le script de asio-sys sait télécharger le SDK Steinberg, mais sa décompression
+      # PowerShell (Expand-Archive) plante sur les runners actuels. On le fournit nous-mêmes
+      # via CPAL_ASIO_DIR, ce qui court-circuite ce téléchargement.
+      - name: SDK ASIO
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 -o asio_sdk.zip https://www.steinberg.net/asiosdk
+          unzip -q -o asio_sdk.zip -d asio_sdk
+          header=$(find "$PWD/asio_sdk" -name asiodrivers.h | head -n 1)
+          test -n "$header" || { echo "asiodrivers.h introuvable dans le SDK"; exit 1; }
+          root=$(dirname "$(dirname "$header")")
+          ls "$root"
+          echo "CPAL_ASIO_DIR=$(cygpath -w "$root")" >> "$GITHUB_ENV"
       - name: Build (ASIO + WASAPI)
         run: cargo build --release --features asio
       - uses: actions/upload-artifact@v4
+        # Un quota de stockage plein ne doit pas faire échouer la compilation.
+        continue-on-error: true
         with:
           name: TracksPlus-windows
           path: target/release/tracksplus.exe
+          retention-days: 5
 
   macos:
     runs-on: macos-latest
@@ -54,6 +69,8 @@ jobs:
           codesign --force --deep -s - $APP
           ditto -c -k --keepParent $APP TracksPlus-macos.zip
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: TracksPlus-macos
           path: TracksPlus-macos.zip
+          retention-days: 5
