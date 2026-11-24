@@ -185,16 +185,17 @@ impl App {
                     i.consume_key(none, Key::Delete) || i.consume_key(none, Key::Backspace),
                 )
             });
-        if space {
-            if self.is_stopped() {
-                self.play();
-            } else {
-                self.stop();
-            }
-        }
-        if rec {
+        // Pendant un enregistrement, le clavier ne peut pas l'arrêter d'un seul appui :
+        // il faut confirmer (deuxième appui) pour éviter une coupure accidentelle.
+        if space || rec {
             if self.is_recording() {
-                self.stop();
+                self.request_stop_recording();
+            } else if space {
+                if self.is_stopped() {
+                    self.play();
+                } else {
+                    self.stop();
+                }
             } else {
                 self.record();
             }
@@ -969,6 +970,7 @@ impl App {
             sa = sa.vertical_scroll_offset(y);
         }
         let mut lanes_top = body.top();
+        let audible = self.project.audible();
         let out = sa.show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             lanes_top = ui.cursor().top();
@@ -1172,7 +1174,7 @@ impl App {
 
                 // ---- prises
                 let inner = lane.shrink2(vec2(0.0, 3.0));
-                let muted = !self.project.audible().get(idx).copied().unwrap_or(true);
+                let muted = !audible.get(idx).copied().unwrap_or(true);
                 let ccol = if muted {
                     t::mix(color, t::TEXT_3, 0.75)
                 } else {

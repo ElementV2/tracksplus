@@ -200,6 +200,18 @@ impl Shared {
 pub struct RecTarget {
     pub channel: usize,
     pub prod: Producer<f32>,
+    /// Trames perdues (tampon plein) pas encore compensées par du silence.
+    pub pending: usize,
+}
+
+impl RecTarget {
+    pub fn new(channel: usize, prod: Producer<f32>) -> Self {
+        Self {
+            channel,
+            prod,
+            pending: 0,
+        }
+    }
 }
 
 enum InCmd {
@@ -236,6 +248,7 @@ pub struct Engine {
     /// Objets rendus par le callback pour être libérés hors du thread audio.
     garbage_rx: Receiver<Consumer<f32>>,
     sample_garbage_rx: Receiver<Arc<SampleData>>,
+    in_garbage_rx: Receiver<Vec<RecTarget>>,
 }
 
 impl Engine {
@@ -243,6 +256,7 @@ impl Engine {
     pub fn offline() -> Self {
         let (_tx, garbage_rx) = bounded(1);
         let (_tx2, sample_garbage_rx) = bounded(1);
+        let (_tx3, in_garbage_rx) = bounded(1);
         Self {
             shared: Arc::new(Shared::new()),
             status: EngineStatus {
@@ -256,6 +270,7 @@ impl Engine {
             pad_tx: None,
             garbage_rx,
             sample_garbage_rx,
+            in_garbage_rx,
         }
     }
 
@@ -316,6 +331,7 @@ impl Engine {
         };
 
         let (garbage_tx, garbage_rx) = bounded(16);
+        let (in_garbage_tx, in_garbage_rx) = bounded(16);
         let (sample_garbage_tx, sample_garbage_rx) = bounded(256);
         let mut pad_tx = None;
         let mut status = EngineStatus {
@@ -339,6 +355,7 @@ impl Engine {
                 channels: channels as usize,
                 rx,
                 targets: Vec::with_capacity(MAX_INPUTS),
+                garbage: in_garbage_tx,
                 shared: shared.clone(),
             };
             let stream = match fmt {
@@ -423,6 +440,7 @@ impl Engine {
             pad_tx,
             garbage_rx,
             sample_garbage_rx,
+            in_garbage_rx,
         })
     }
 
@@ -444,14 +462,33 @@ impl Engine {
             .map_err(|_| anyhow!("Moteur audio occupé"))
     }
 
-    pub fn stop_record(&self) {
-        if let Some(tx) = &self.in_tx {
-            let _ = tx.try_send(InCmd::Stop);
+    /// Demande l'arrêt de l'enregistrement et attend que le callback rende les cibles
+    /// (jusqu'à `timeout`). Leurs producteurs sont libérés ici, hors du thread audio :
+    /// le thread disque voit alors la fin de prise et écrit tout ce qui reste.
+    pub fn stop_record(&self, timeout: std::time::Duration) -> bool {
+        let Some(tx) = &self.in_tx else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        // Envoi fiable même si la file était momentanément pleine.
+        while tx.try_send(InCmd::Stop).is_err() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.in_garbage_rx.recv_timeout(left) {
+                // Liste vide = celle remplacée au démarrage ; on attend celle de la prise.
+                Ok(v) if v.is_empty() => continue,
+                Ok(_) => return true,
+                Err(_) => return false,
+            }
         }
     }
 
     pub fn start_playback(&self, cons: Consumer<f32>) {
-        self.shared.out_frames.store(0, Ordering::Relaxed);
         if let Some(tx) = &self.out_tx {
             let _ = tx.try_send(OutCmd::Play(cons));
         }
@@ -467,6 +504,7 @@ impl Engine {
     pub fn collect_garbage(&self) {
         while self.garbage_rx.try_recv().is_ok() {}
         while self.sample_garbage_rx.try_recv().is_ok() {}
+        while self.in_garbage_rx.try_recv().is_ok() {}
     }
 
     pub fn pad(&self, cmd: PadCmd) {
@@ -503,7 +541,17 @@ struct InState {
     channels: usize,
     rx: Receiver<InCmd>,
     targets: Vec<RecTarget>,
+    /// Les listes de cibles remplacées sont rendues à l'interface pour y être libérées.
+    garbage: Sender<Vec<RecTarget>>,
     shared: Arc<Shared>,
+}
+
+impl InState {
+    fn dispose(&self, v: Vec<RecTarget>) {
+        if let Err(e) = self.garbage.try_send(v) {
+            std::mem::forget(e.into_inner());
+        }
+    }
 }
 
 fn build_input<T>(dev: &cpal::Device, cfg: StreamConfig, mut st: InState) -> Result<cpal::Stream>
@@ -516,10 +564,17 @@ where
         cfg,
         move |data: &[T], _| {
             while let Ok(cmd) = st.rx.try_recv() {
+                // Aucune libération mémoire ici : l'ancienne liste part vers l'interface,
+                // qui relâche les producteurs (le thread disque voit alors la fin de prise).
                 match cmd {
-                    InCmd::Record(t) => st.targets = t,
-                    // Les producteurs sont relâchés ici : le thread disque voit alors la fin.
-                    InCmd::Stop => st.targets.clear(),
+                    InCmd::Record(t) => {
+                        let old = std::mem::replace(&mut st.targets, t);
+                        st.dispose(old);
+                    }
+                    InCmd::Stop => {
+                        let old = std::mem::take(&mut st.targets);
+                        st.dispose(old);
+                    }
                 }
             }
             let ch = st.channels;
@@ -540,19 +595,15 @@ where
             if !st.targets.is_empty() {
                 for t in &mut st.targets {
                     let c = t.channel;
-                    let n = frames.min(t.prod.slots());
-                    if n < frames {
+                    let lost = feed_target(t, frames, |f| {
+                        if c < ch {
+                            data[f * ch + c].to_sample::<f32>()
+                        } else {
+                            0.0
+                        }
+                    });
+                    if lost {
                         sh.overruns.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Ok(chunk) = t.prod.write_chunk_uninit(n) {
-                        let it = (0..n).map(|f| {
-                            if c < ch {
-                                data[f * ch + c].to_sample::<f32>()
-                            } else {
-                                0.0
-                            }
-                        });
-                        chunk.fill_from_iter(it);
                     }
                 }
                 sh.rec_frames.fetch_add(frames as u64, Ordering::Relaxed);
@@ -562,6 +613,34 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+/// Écrit un bloc d'une entrée dans son tampon disque, sans jamais décaler la piste :
+/// si des trames ont dû être perdues (disque en retard), autant de silence est inséré
+/// à leur place dès que le tampon a de nouveau de la place. Retourne `true` en cas de perte.
+fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize) -> f32) -> bool {
+    if t.pending > 0 {
+        let z = t.pending.min(t.prod.slots());
+        if let Ok(chunk) = t.prod.write_chunk_uninit(z) {
+            chunk.fill_from_iter(std::iter::repeat_n(0.0f32, z));
+        }
+        t.pending -= z;
+    }
+    let n = if t.pending > 0 {
+        0
+    } else {
+        frames.min(t.prod.slots())
+    };
+    if n > 0
+        && let Ok(chunk) = t.prod.write_chunk_uninit(n)
+    {
+        chunk.fill_from_iter((0..n).map(&sample));
+    }
+    if n < frames {
+        t.pending += frames - n;
+        return true;
+    }
+    false
 }
 
 const MAX_BLOCK: usize = 4096;
@@ -649,6 +728,8 @@ where
                     OutCmd::Play(c) => {
                         st.release();
                         st.cons = Some(c);
+                        // Remis à zéro ici, au moment exact où la nouvelle lecture commence.
+                        st.shared.out_frames.store(0, Ordering::Relaxed);
                     }
                     OutCmd::Stop => st.release(),
                 }
@@ -673,4 +754,35 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Après une saturation, la piste reçoit du silence à la place des trames perdues :
+    /// la suite reste à la bonne position (synchronisation entre pistes préservée).
+    #[test]
+    fn overrun_keeps_alignment() {
+        let (prod, mut cons) = rtrb::RingBuffer::new(100);
+        let mut t = RecTarget::new(0, prod);
+        assert!(!feed_target(&mut t, 80, |_| 1.0));
+        // Seules 20 trames tiennent : 30 sont perdues.
+        assert!(feed_target(&mut t, 50, |_| 2.0));
+        assert_eq!(t.pending, 30);
+        let mut got: Vec<f32> = Vec::new();
+        while let Ok(x) = cons.pop() {
+            got.push(x);
+        }
+        assert!(!feed_target(&mut t, 40, |_| 3.0));
+        while let Ok(x) = cons.pop() {
+            got.push(x);
+        }
+        // 80 + 50 + 40 trames au total, la dernière série au bon endroit.
+        assert_eq!(got.len(), 170);
+        assert!(got[..80].iter().all(|&x| x == 1.0));
+        assert!(got[80..100].iter().all(|&x| x == 2.0));
+        assert!(got[100..130].iter().all(|&x| x == 0.0));
+        assert!(got[130..].iter().all(|&x| x == 3.0));
+    }
 }

@@ -54,7 +54,7 @@ impl Mixer {
 impl Player {
     /// Prépare la lecture à partir de `pos`. Le consommateur est à donner au moteur.
     pub fn start(project: &Project, pos: u64, audible: Vec<bool>) -> (Self, Consumer<f32>) {
-        let cap = (project.sample_rate as usize / 4).max(BLOCK * 4) * 2;
+        let cap = (project.sample_rate as usize / 2).max(BLOCK * 4) * 2;
         let audible: Arc<Vec<AtomicBool>> =
             Arc::new(audible.into_iter().map(AtomicBool::new).collect());
         let (mut prod, cons) = RingBuffer::new(cap);
@@ -70,7 +70,7 @@ impl Player {
             mix: vec![0.0; BLOCK],
         };
         // Pré-remplissage pour éviter un trou au démarrage.
-        for _ in 0..4 {
+        for _ in 0..8 {
             mixer.fill(&mut prod);
         }
         let stop = Arc::new(AtomicBool::new(false));

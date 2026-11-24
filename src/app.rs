@@ -6,7 +6,8 @@ use crate::export::{BitDepth, ExportJob, ExportSettings};
 use crate::midi::Midi;
 use crate::player::Player;
 use crate::project::{self, Clip, PROJECT_EXT, Project, RecFormat};
-use crate::recorder::{RecSpec, Recorder};
+use crate::recorder::{RecResult, RecSpec, Recorder};
+use crate::recovery;
 use crate::render::{self, PeakData, Peaks};
 use crate::sampler::PadCmd;
 use crate::soundboard::{Board, SampleCache, db_to_gain};
@@ -162,6 +163,16 @@ pub struct App {
     title: String,
     pub export_last: Option<ExportSettings>,
     pub now: f64,
+    /// Instant jusqu'auquel un second appui clavier arrête l'enregistrement.
+    pub stop_armed_until: f64,
+    /// Fenêtre de confirmation de fermeture pendant un enregistrement.
+    pub confirm_close: bool,
+    /// Suivi de la progression de l'enregistrement (détection de perte de signal).
+    pub rec_watch: (u64, f64),
+    /// Dernière sauvegarde automatique.
+    pub last_autosave: f64,
+    /// Empêche la mise en veille de l'ordinateur pendant un enregistrement.
+    pub awake: Option<keepawake::KeepAwake>,
     // Soundboard
     pub board: Board,
     pub board_path: PathBuf,
@@ -241,6 +252,11 @@ impl App {
             title: String::new(),
             export_last: None,
             now: 0.0,
+            stop_armed_until: 0.0,
+            confirm_close: false,
+            rec_watch: (0, 0.0),
+            last_autosave: 0.0,
+            awake: None,
             board_path: Board::default_path().unwrap_or_else(|| PathBuf::from("soundboard.json")),
             board,
             board_changed: None,
@@ -267,6 +283,10 @@ impl App {
         let paths: Vec<PathBuf> = app.board.all_pads().map(|(_, p)| p.path.clone()).collect();
         for p in paths {
             app.cache.request(&p, Some(&cc.egui_ctx));
+        }
+        // Enregistrement interrompu lors de la dernière utilisation : on restaure.
+        if let Some(path) = recovery::interrupted_session() {
+            app.load_session(&path);
         }
         if let Some(e) = err {
             let mut d = AudioDialog::new(&app.prefs);
@@ -432,14 +452,44 @@ impl App {
                 peaks: peaks.clone(),
                 cons,
             });
-            targets.push(RecTarget {
-                channel: input as usize,
-                prod,
-            });
+            targets.push(RecTarget::new(input as usize, prod));
             self.live.push(LiveTake { track_id, peaks });
         }
-        let recorder = Recorder::start(specs, sr, self.project.rec_format);
+        // Sécurité : la session et le journal des prises sont écrits AVANT de lancer
+        // l'enregistrement, pour pouvoir tout retrouver après un crash.
+        let journal = recovery::Journal {
+            start: self.playhead,
+            sample_rate: sr,
+            takes: specs
+                .iter()
+                .map(|s| recovery::JournalTake {
+                    track_id: s.track_id,
+                    file: s.file.clone(),
+                })
+                .collect(),
+        };
+        let _ = self.project.save();
+        recovery::remember_session(&self.project);
+        if let Err(e) = recovery::write_journal(&self.project.dir, &journal) {
+            self.notify(
+                format!("Attention : journal de secours non écrit ({e:#})"),
+                true,
+            );
+        }
+        let recorder = match Recorder::start(specs, sr, self.project.rec_format) {
+            Ok(r) => r,
+            Err(e) => {
+                recovery::remove_journal(&self.project.dir);
+                self.live.clear();
+                self.notify(
+                    format!("Impossible de démarrer l'écriture disque : {e}"),
+                    true,
+                );
+                return;
+            }
+        };
         if let Err(e) = self.engine.start_record(targets) {
+            recovery::remove_journal(&self.project.dir);
             let _ = recorder.finish();
             self.live.clear();
             self.notify(format!("{e:#}"), true);
@@ -452,6 +502,15 @@ impl App {
             self.player = Some(player);
         }
         self.recorder = Some(recorder);
+        // Pas de mise en veille pendant la prise (sans effet si le système refuse).
+        self.awake = keepawake::Builder::default()
+            .idle(true)
+            .sleep(true)
+            .reason("Enregistrement multipiste en cours")
+            .app_name("TracksPlus")
+            .app_reverse_domain("app.tracksplus")
+            .create()
+            .ok();
         self.transport = Transport::Recording {
             start: self.playhead,
         };
@@ -467,68 +526,195 @@ impl App {
                 self.player = None;
             }
             Transport::Recording { start } => {
-                self.engine.stop_record();
+                // 1) Le callback rend les cibles ; leurs producteurs sont libérés ici.
+                let released = self
+                    .engine
+                    .stop_record(std::time::Duration::from_millis(1500));
                 self.engine.stop_playback();
                 self.player = None;
-                let results = self
-                    .recorder
-                    .take()
-                    .map(Recorder::finish)
-                    .unwrap_or_default();
-                let mut errors = Vec::new();
-                let mut max_len = 0;
-                for r in results {
-                    if let Some(e) = &r.error {
-                        errors.push(e.clone());
-                    }
-                    if r.frames == 0 {
-                        let _ = std::fs::remove_file(self.project.audio_dir().join(&r.file));
-                        continue;
-                    }
-                    max_len = max_len.max(r.frames);
-                    let id = self.project.alloc_id();
-                    if let Some(l) = self.live.iter().find(|l| l.track_id == r.track_id) {
-                        self.peaks.insert(id, l.peaks.clone());
-                    }
-                    if let Some(tr) = self.project.track_mut(r.track_id) {
-                        tr.clips.push(Clip {
-                            id,
-                            file: r.file,
-                            start,
-                            offset: 0,
-                            len: r.frames,
-                            src_len: r.frames,
-                            fade_in: 0,
-                            fade_out: 0,
-                        });
-                    }
-                }
-                self.live.clear();
-                self.playhead = start + max_len;
-                self.project.dirty = true;
-                let save = self.project.save();
-                let overruns = self.engine.shared.overruns.swap(0, Ordering::Relaxed);
-                if !errors.is_empty() {
-                    self.notify(
-                        format!("Erreur d'enregistrement : {}", errors.join(" ; ")),
-                        true,
-                    );
-                } else if overruns > 0 {
-                    self.notify(
-                        format!("Attention : {overruns} pertes de données (disque trop lent ?)"),
-                        true,
-                    );
-                } else if let Err(e) = save {
-                    self.notify(format!("Sauvegarde impossible : {e:#}"), true);
-                } else {
-                    self.notify(
-                        format!("Prise enregistrée · {}", fmt_time(max_len, self.sr())),
-                        false,
-                    );
-                }
+                // 2) Le thread disque écrit tout ce qui reste puis ferme les fichiers.
+                let finished = self.recorder.take().map(Recorder::finish);
+                self.awake = None;
+                self.live_takes_to_clips(start, finished, released);
             }
         }
         self.transport = Transport::Stopped;
+    }
+
+    /// Ajoute les prises terminées à la session, la sauvegarde et nettoie le journal.
+    fn live_takes_to_clips(
+        &mut self,
+        start: u64,
+        finished: Option<Result<Vec<RecResult>, String>>,
+        released: bool,
+    ) {
+        let results = match finished {
+            Some(Ok(r)) => r,
+            other => {
+                // Thread disque en échec : on garde le journal et on récupère depuis les fichiers.
+                let why = match other {
+                    Some(Err(e)) => e,
+                    _ => "enregistreur absent".into(),
+                };
+                self.live.clear();
+                let n = recovery::recover(&mut self.project).unwrap_or(0);
+                self.load_peaks();
+                self.notify(
+                    format!(
+                        "Problème d'écriture ({why}) : {n} prise(s) récupérée(s) depuis le disque"
+                    ),
+                    true,
+                );
+                return;
+            }
+        };
+        let mut errors = Vec::new();
+        let mut max_len = 0;
+        for r in results {
+            if let Some(e) = &r.error {
+                errors.push(e.clone());
+            }
+            let peaks = self
+                .live
+                .iter()
+                .find(|l| l.track_id == r.track_id)
+                .map(|l| l.peaks.clone());
+            // Une prise longue peut être répartie sur plusieurs fichiers : une prise par
+            // fichier, posées bout à bout.
+            let mut pos = start;
+            for seg in &r.segments {
+                if seg.frames == 0 {
+                    let _ = std::fs::remove_file(self.project.audio_dir().join(&seg.file));
+                    continue;
+                }
+                let id = self.project.alloc_id();
+                if let Some(p) = &peaks {
+                    // La forme d'onde en direct couvre toute la prise ; chaque fichier en a
+                    // une à lui, calculée à part pour rester exacte.
+                    if r.segments.len() == 1 {
+                        self.peaks.insert(id, p.clone());
+                    } else {
+                        let pk: Peaks = Arc::new(RwLock::new(PeakData::default()));
+                        let path = self.project.audio_dir().join(&seg.file);
+                        let pk2 = pk.clone();
+                        std::thread::spawn(move || render::compute_peaks(&path, &pk2));
+                        self.peaks.insert(id, pk);
+                    }
+                }
+                if let Some(tr) = self.project.track_mut(r.track_id) {
+                    tr.clips.push(Clip {
+                        id,
+                        file: seg.file.clone(),
+                        start: pos,
+                        offset: 0,
+                        len: seg.frames,
+                        src_len: seg.frames,
+                        fade_in: 0,
+                        fade_out: 0,
+                    });
+                }
+                pos += seg.frames;
+            }
+            max_len = max_len.max(r.frames());
+        }
+        self.live.clear();
+        self.playhead = start + max_len;
+        self.project.dirty = true;
+        let save = self.project.save();
+        if save.is_ok() {
+            // Les prises sont référencées dans la session : le journal n'est plus utile.
+            recovery::remove_journal(&self.project.dir);
+        }
+        let overruns = self.engine.shared.overruns.swap(0, Ordering::Relaxed);
+        if !errors.is_empty() {
+            self.notify(
+                format!("Erreur d'enregistrement : {}", errors.join(" ; ")),
+                true,
+            );
+        } else if let Err(e) = save {
+            self.notify(format!("Sauvegarde de la session impossible (les fichiers sont bien sur le disque) : {e:#}"), true);
+        } else if overruns > 0 {
+            self.notify(
+                format!("Prise enregistrée, mais {overruns} saturations disque compensées par du silence"),
+                true,
+            );
+        } else if !released {
+            self.notify(
+                "Prise enregistrée (la carte son ne répondait plus à l'arrêt)",
+                true,
+            );
+        } else {
+            self.notify(
+                format!(
+                    "Prise enregistrée et sauvegardée · {}",
+                    fmt_time(max_len, self.sr())
+                ),
+                false,
+            );
+        }
+    }
+
+    /// Arrêt de l'enregistrement demandé au clavier : il faut appuyer deux fois.
+    pub fn request_stop_recording(&mut self) {
+        if !self.is_recording() {
+            return;
+        }
+        if self.now < self.stop_armed_until {
+            self.stop_armed_until = 0.0;
+            self.stop();
+        } else {
+            self.stop_armed_until = self.now + 2.0;
+            self.notify(
+                "Enregistrement en cours — appuyez encore une fois pour l'arrêter",
+                true,
+            );
+        }
+    }
+
+    /// Alertes en direct pendant un enregistrement (bandeau rouge en haut).
+    pub fn live_alerts(&mut self) -> Vec<String> {
+        let mut alerts = Vec::new();
+        if !self.is_recording() {
+            self.rec_watch = (0, self.now);
+            return alerts;
+        }
+        let frames = self.engine.shared.rec_frames.load(Ordering::Relaxed);
+        if frames != self.rec_watch.0 {
+            self.rec_watch = (frames, self.now);
+        } else if self.now - self.rec_watch.1 > 1.0 {
+            alerts.push(
+                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion / l'horloge Dante"
+                    .to_string(),
+            );
+        }
+        let ov = self.engine.shared.overruns.load(Ordering::Relaxed);
+        if ov > 0 {
+            alerts.push(format!("{ov} pertes de données : le disque ne suit pas"));
+        }
+        if let Some(r) = &self.recorder {
+            for e in r.errors() {
+                alerts.push(format!("Erreur disque : {e}"));
+            }
+        }
+        if let Some(free) = self.disk_free {
+            let armed = self.live.len().max(1) as u64;
+            let bps = match self.project.rec_format {
+                RecFormat::Int24 => 3,
+                RecFormat::Float32 => 4,
+            } * self.sr() as u64
+                * armed;
+            let secs = free / bps.max(1);
+            if secs < 600 {
+                alerts.push(format!(
+                    "Disque presque plein : ≈ {} d'enregistrement restant",
+                    fmt_duration(secs)
+                ));
+            }
+        }
+        if let Some(e) = self.engine.shared.last_error.lock().clone() {
+            alerts.push(format!("Carte son : {e}"));
+        }
+        alerts
     }
 
     fn update_playhead(&mut self) {
@@ -773,11 +959,33 @@ impl App {
         };
         self.stop();
         self.autosave();
-        match Project::load(&path) {
-            Ok(p) => {
+        self.load_session(&path);
+    }
+
+    /// Charge une session (et récupère les prises d'un enregistrement interrompu).
+    pub fn load_session(&mut self, path: &Path) {
+        match Project::load(path) {
+            Ok(mut p) => {
+                let recovered = recovery::recover(&mut p);
                 self.project = p;
                 self.reset_view_for_session();
                 self.load_peaks();
+                recovery::remember_session(&self.project);
+                match recovered {
+                    Ok(n) if n > 0 => {
+                        self.zoom_to_fit();
+                        self.notify(
+                            format!("Enregistrement interrompu récupéré : {n} prise(s) restaurée(s) dans « {} »", self.project.name),
+                            false,
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        self.notify(format!("Récupération incomplète : {e:#}"), true);
+                        return;
+                    }
+                    _ => {}
+                }
                 if self.project.has_audio()
                     && self.project.sample_rate != self.engine.status.sample_rate
                 {
@@ -871,6 +1079,9 @@ impl App {
     }
 
     fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
+        if self.is_recording() {
+            return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
+        }
         self.stop();
         self.engine.pad(PadCmd::StopAll { fade: 0 });
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
@@ -898,6 +1109,10 @@ impl App {
     }
 
     pub fn open_export(&mut self) {
+        if self.is_recording() {
+            self.notify("Export indisponible pendant l'enregistrement", true);
+            return;
+        }
         if !self.project.has_audio() {
             self.notify("Rien à exporter pour l'instant", true);
             return;
@@ -1237,9 +1452,18 @@ impl App {
         } else {
             BtnStyle::Tinted(t::REC)
         };
-        if w::icon_button(ui, Icon::Record, 30.0, rec_style, true, "Enregistrer (R)").clicked() {
+        if w::icon_button(
+            ui,
+            Icon::Record,
+            30.0,
+            rec_style,
+            true,
+            "Enregistrer (R) — pendant une prise : deux clics pour arrêter",
+        )
+        .clicked()
+        {
             if recording {
-                self.stop();
+                self.request_stop_recording();
             } else {
                 self.record();
             }
@@ -2013,14 +2237,56 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Appelé à chaque image, et aussi quand la fenêtre est réduite : les tâches de fond
+    /// (libération mémoire du moteur, MIDI, LED, sons chargés) ne s'arrêtent jamais.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.now = ctx.input(|i| i.time);
+            self.engine.collect_garbage();
+            if self.cache.poll() {
+                self.sb.midi_dirty = true;
+            }
+            self.update_playhead();
+            self.soundboard_background(ctx);
+        }));
+        if res.is_err() {
+            self.notify("Erreur interne (tâches de fond) — l'audio continue", true);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.now = ctx.input(|i| i.time);
-        self.engine.collect_garbage();
-        if self.cache.poll() {
-            self.sb.midi_dirty = true;
+        // Une erreur dans l'interface ne doit jamais interrompre l'enregistrement :
+        // les threads audio et disque sont indépendants, on rattrape l'erreur et on continue.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui)));
+        if let Err(e) = res {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "erreur inconnue".into());
+            self.notify(
+                format!("Erreur interne de l'interface (l'audio continue) : {msg}"),
+                true,
+            );
         }
-        self.update_playhead();
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    fn on_exit(&mut self) {
+        self.midi.leds_off(self.board.led_mode);
+        self.stop();
+        self.autosave();
+        self.board_changed = Some(0.0);
+        self.save_board_now();
+    }
+}
+
+impl App {
+    fn frame(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // (temps, mémoire, MIDI, LED : traités dans `logic`, appelé juste avant)
         self.update_meters(&ctx);
         self.global_keys(&ctx);
         self.update_title(&ctx);
@@ -2029,12 +2295,50 @@ impl eframe::App for App {
         {
             self.save_board_now();
         }
-        self.soundboard_background(&ctx);
+
+        // Fermeture de la fenêtre pendant une prise : on demande confirmation.
+        if ctx.input(|i| i.viewport().close_requested()) && self.is_recording() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        // Sauvegarde automatique des modifications (montage, pistes…).
+        if !self.is_recording()
+            && self.project.dirty
+            && self.project.has_audio()
+            && self.now - self.last_autosave > 30.0
+        {
+            self.last_autosave = self.now;
+            let _ = self.project.save();
+        }
 
         egui::Panel::top("top")
             .exact_size(44.0)
             .frame(egui::Frame::new().fill(t::SURFACE))
             .show(ui, |ui| self.top_bar(ui));
+        let alerts = self.live_alerts();
+        if !alerts.is_empty() {
+            let blink = (self.now * 2.0).fract() < 0.6;
+            egui::Panel::top("alerts")
+                .exact_size(26.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(if blink {
+                            t::REC
+                        } else {
+                            t::mix(t::REC, t::BG, 0.35)
+                        })
+                        .inner_margin(egui::Margin::symmetric(12, 0)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(alerts.join("   ·   "))
+                                .font(t::semibold(11.5))
+                                .color(Color32::BLACK),
+                        );
+                    });
+                });
+        }
         egui::Panel::bottom("status")
             .exact_size(22.0)
             .frame(
@@ -2055,15 +2359,44 @@ impl eframe::App for App {
         self.new_session_dialog(&ctx);
         self.toast_ui(&ctx);
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        self.confirm_close_dialog(&ctx);
     }
 
-    fn on_exit(&mut self) {
-        self.midi.leds_off(self.board.led_mode);
-        self.stop();
-        self.autosave();
-        self.board_changed = Some(0.0);
-        self.save_board_now();
+    fn confirm_close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        if !self.is_recording() {
+            self.confirm_close = false;
+            return;
+        }
+        let mut keep = false;
+        let mut quit = false;
+        egui::Modal::new(egui::Id::unique("confirm_close")).frame(t::window_frame()).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(egui::RichText::new("ENREGISTREMENT EN COURS").font(t::semibold(12.0)).color(t::REC));
+            ui.add_space(8.0);
+            ui.label("Fermer TracksPlus arrêterait la prise. Les fichiers déjà enregistrés seraient conservés.");
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if w::primary_button(ui, None, "Continuer l'enregistrement", true).clicked() {
+                    keep = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Arrêter, sauvegarder et quitter").clicked() {
+                        quit = true;
+                    }
+                });
+            });
+        });
+        if keep {
+            self.confirm_close = false;
+        }
+        if quit {
+            self.confirm_close = false;
+            self.stop();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 

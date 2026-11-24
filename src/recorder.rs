@@ -1,4 +1,12 @@
 //! Thread disque : vide les ring buffers d'entrée dans des fichiers WAV mono.
+//!
+//! Sécurité « live » :
+//! - en-têtes WAV mis à jour toutes les 2 s et données forcées sur le disque (fsync)
+//!   toutes les 10 s : après un crash, les fichiers sont lisibles (voir `recovery`) ;
+//! - au-delà de ~2 Go un fichier est clos et la prise continue dans `nom_p2.wav`,
+//!   `nom_p3.wav`… (un WAV ne peut pas dépasser 4 Go) ;
+//! - à l'arrêt, tout ce qui reste dans les tampons est écrit avant de fermer ;
+//! - toute erreur disque est remontée immédiatement à l'interface.
 
 use crate::project::RecFormat;
 use crate::render::{PeakAccum, Peaks};
@@ -6,11 +14,20 @@ use hound::{WavSpec, WavWriter};
 use rtrb::Consumer;
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Taille maximale d'un fichier avant passage au suivant (marge sous la limite 32 bits,
+/// et compatible avec les logiciels qui lisent la taille en entier signé).
+pub const MAX_SEGMENT_BYTES: u64 = 2_000_000_000;
+const FLUSH_EVERY: Duration = Duration::from_secs(2);
+const SYNC_EVERY: Duration = Duration::from_secs(10);
+/// À l'arrêt, abandon seulement si plus rien n'avance pendant ce délai.
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+const WRITE_BUFFER: usize = 256 * 1024;
 
 pub struct RecSpec {
     pub track_id: u64,
@@ -20,29 +37,124 @@ pub struct RecSpec {
     pub cons: Consumer<f32>,
 }
 
+/// Un fichier d'une prise (une prise longue peut en compter plusieurs).
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub file: String,
+    pub frames: u64,
+}
+
 #[derive(Debug)]
 pub struct RecResult {
     pub track_id: u64,
-    pub file: String,
-    pub frames: u64,
+    pub segments: Vec<Segment>,
     pub error: Option<String>,
 }
 
+impl RecResult {
+    pub fn frames(&self) -> u64 {
+        self.segments.iter().map(|s| s.frames).sum()
+    }
+}
+
+/// Nom du k-ième fichier d'une prise (k = 1 : nom de base).
+pub fn segment_name(base: &str, k: usize) -> String {
+    if k <= 1 {
+        base.to_string()
+    } else {
+        format!("{}_p{k}.wav", base.trim_end_matches(".wav"))
+    }
+}
+
+type Errors = Arc<parking_lot::Mutex<Vec<String>>>;
+
 pub struct Recorder {
     stop: Arc<AtomicBool>,
+    /// Erreurs disque survenues pendant la prise (affichées en direct).
+    errors: Errors,
     handle: Option<JoinHandle<Vec<RecResult>>>,
 }
 
-struct Lane {
-    spec: RecSpec,
-    writer: Option<WavWriter<BufWriter<File>>>,
-    acc: PeakAccum,
+struct SegWriter {
+    w: WavWriter<BufWriter<File>>,
+    /// Second accès au fichier pour forcer l'écriture sur le disque.
+    file: File,
     frames: u64,
+}
+
+/// Consommateur séparé de l'état d'écriture (emprunts disjoints dans la boucle).
+struct Lane {
+    cons: Consumer<f32>,
+    st: LaneState,
+}
+
+struct LaneState {
+    track_id: u64,
+    file: String,
+    peaks: Peaks,
+    dir: PathBuf,
+    cur: Option<SegWriter>,
+    done: Vec<Segment>,
+    acc: PeakAccum,
     error: Option<String>,
 }
 
+fn open_segment(path: &Path, wav: WavSpec) -> std::io::Result<SegWriter> {
+    let file = File::create(path)?;
+    let sync = file.try_clone()?;
+    let w = WavWriter::new(BufWriter::with_capacity(WRITE_BUFFER, file), wav)
+        .map_err(std::io::Error::other)?;
+    Ok(SegWriter {
+        w,
+        file: sync,
+        frames: 0,
+    })
+}
+
+impl LaneState {
+    fn fail(&mut self, errors: &Errors, msg: String) {
+        errors.lock().push(msg.clone());
+        self.error.get_or_insert(msg);
+    }
+
+    /// Ferme le fichier en cours (en-tête final + fsync).
+    fn close_current(&mut self, errors: &Errors) {
+        if let Some(seg) = self.cur.take() {
+            let name = segment_name(&self.file, self.done.len() + 1);
+            let frames = seg.frames;
+            let file = seg.file;
+            if let Err(e) = seg.w.finalize() {
+                self.fail(errors, format!("{name} : {e}"));
+            }
+            let _ = file.sync_all();
+            self.done.push(Segment { file: name, frames });
+        }
+    }
+
+    fn open_next(&mut self, wav: WavSpec, errors: &Errors) {
+        let name = segment_name(&self.file, self.done.len() + 1);
+        match open_segment(&self.dir.join(&name), wav) {
+            Ok(w) => self.cur = Some(w),
+            Err(e) => self.fail(errors, format!("{name} : {e}")),
+        }
+    }
+}
+
 impl Recorder {
-    pub fn start(specs: Vec<RecSpec>, sample_rate: u32, format: RecFormat) -> Self {
+    pub fn start(
+        specs: Vec<RecSpec>,
+        sample_rate: u32,
+        format: RecFormat,
+    ) -> std::io::Result<Self> {
+        Self::start_with_limit(specs, sample_rate, format, MAX_SEGMENT_BYTES)
+    }
+
+    pub fn start_with_limit(
+        specs: Vec<RecSpec>,
+        sample_rate: u32,
+        format: RecFormat,
+        max_bytes: u64,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let wav = match format {
@@ -59,23 +171,31 @@ impl Recorder {
                 sample_format: hound::SampleFormat::Float,
             },
         };
+        let errors: Errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let errors2 = errors.clone();
         let handle = std::thread::Builder::new()
             .name("tracksplus-disk-writer".into())
-            .spawn(move || run(specs, wav, format, stop2))
-            .expect("thread d'enregistrement");
-        Self {
+            .spawn(move || run(specs, wav, format, max_bytes, stop2, errors2))?;
+        Ok(Self {
             stop,
+            errors,
             handle: Some(handle),
-        }
+        })
+    }
+
+    /// Erreurs disque survenues depuis le début de la prise.
+    pub fn errors(&self) -> Vec<String> {
+        self.errors.lock().clone()
     }
 
     /// Termine les fichiers (à appeler après `Engine::stop_record`).
-    pub fn finish(mut self) -> Vec<RecResult> {
+    /// Retourne une erreur si le thread disque s'est arrêté anormalement.
+    pub fn finish(mut self) -> Result<Vec<RecResult>, String> {
         self.stop.store(true, Ordering::Release);
-        self.handle
-            .take()
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default()
+        match self.handle.take().map(|h| h.join()) {
+            Some(Ok(r)) => Ok(r),
+            _ => Err("le thread d'écriture disque s'est arrêté anormalement".into()),
+        }
     }
 }
 
@@ -83,79 +203,120 @@ fn run(
     specs: Vec<RecSpec>,
     wav: WavSpec,
     format: RecFormat,
+    max_bytes: u64,
     stop: Arc<AtomicBool>,
+    errors: Errors,
 ) -> Vec<RecResult> {
+    let bytes_per_frame = (wav.bits_per_sample / 8) as u64;
+    let max_frames = (max_bytes.saturating_sub(1024) / bytes_per_frame).max(1);
     let mut lanes: Vec<Lane> = specs
         .into_iter()
         .map(|spec| {
-            let (writer, error) = match WavWriter::create(&spec.path, wav) {
-                Ok(w) => (Some(w), None),
-                Err(e) => (None, Some(format!("{}: {e}", spec.path.display()))),
-            };
-            Lane {
-                spec,
-                writer,
+            let dir = spec
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let mut st = LaneState {
+                track_id: spec.track_id,
+                file: spec.file,
+                peaks: spec.peaks,
+                dir,
+                cur: None,
+                done: Vec::new(),
                 acc: PeakAccum::default(),
-                frames: 0,
-                error,
+                error: None,
+            };
+            st.open_next(wav, &errors);
+            Lane {
+                cons: spec.cons,
+                st,
             }
         })
         .collect();
 
     let mut last_flush = Instant::now();
-    let mut stop_seen: Option<Instant> = None;
+    let mut last_sync = Instant::now();
+    let mut last_progress = Instant::now();
     let mut peaks_tmp = Vec::with_capacity(1024);
     loop {
         let mut worked = false;
         for lane in &mut lanes {
-            let n = lane.spec.cons.slots();
+            let n = lane.cons.slots();
             if n == 0 {
                 continue;
             }
             worked = true;
-            let Ok(chunk) = lane.spec.cons.read_chunk(n) else {
+            let Ok(chunk) = lane.cons.read_chunk(n) else {
                 continue;
             };
+            let st = &mut lane.st;
             let (a, b) = chunk.as_slices();
             for &s in a.iter().chain(b) {
-                lane.acc.push(s, &mut peaks_tmp);
-                if let Some(w) = &mut lane.writer {
-                    let r = match format {
-                        RecFormat::Int24 => {
-                            w.write_sample((s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32)
-                        }
-                        RecFormat::Float32 => w.write_sample(s),
-                    };
-                    if let Err(e) = r {
-                        lane.error = Some(e.to_string());
-                        lane.writer = None;
+                st.acc.push(s, &mut peaks_tmp);
+                if st.cur.as_ref().is_some_and(|c| c.frames >= max_frames) {
+                    // Fichier plein : on passe au suivant sans interrompre la prise.
+                    st.close_current(&errors);
+                    st.open_next(wav, &errors);
+                }
+                let Some(seg) = st.cur.as_mut() else {
+                    continue;
+                };
+                let r = match format {
+                    RecFormat::Int24 => seg
+                        .w
+                        .write_sample((s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32),
+                    RecFormat::Float32 => seg.w.write_sample(if s.is_finite() { s } else { 0.0 }),
+                };
+                match r {
+                    Ok(()) => seg.frames += 1,
+                    Err(e) => {
+                        let msg = format!("{} : {e}", st.file);
+                        st.fail(&errors, msg);
+                        // Le fichier reste valide jusqu'ici : on le ferme proprement.
+                        st.close_current(&errors);
                     }
                 }
             }
             chunk.commit_all();
-            lane.frames += n as u64;
             if !peaks_tmp.is_empty() {
-                lane.spec.peaks.write().extend(&peaks_tmp);
+                st.peaks.write().extend(&peaks_tmp);
                 peaks_tmp.clear();
             }
         }
+        if worked {
+            last_progress = Instant::now();
+        }
 
-        // Mise à jour régulière de l'en-tête WAV : en cas de crash, les fichiers restent lisibles.
-        if last_flush.elapsed() > Duration::from_secs(2) {
+        // En-têtes à jour toutes les 2 s, données forcées sur le disque toutes les 10 s.
+        if last_flush.elapsed() > FLUSH_EVERY {
+            let sync = last_sync.elapsed() > SYNC_EVERY;
             for lane in &mut lanes {
-                if let Some(w) = &mut lane.writer {
-                    let _ = w.flush();
+                let st = &mut lane.st;
+                let mut err = None;
+                if let Some(seg) = &mut st.cur {
+                    if let Err(e) = seg.w.flush() {
+                        err = Some(format!("{} : {e}", st.file));
+                    } else if sync {
+                        let _ = seg.file.sync_data();
+                    }
+                }
+                if let Some(msg) = err {
+                    st.fail(&errors, msg);
                 }
             }
             last_flush = Instant::now();
+            if sync {
+                last_sync = Instant::now();
+            }
         }
 
         if stop.load(Ordering::Acquire) {
-            let t = *stop_seen.get_or_insert_with(Instant::now);
-            let done = lanes
+            let drained = lanes
                 .iter()
-                .all(|l| l.spec.cons.is_abandoned() && l.spec.cons.is_empty());
-            if done || t.elapsed() > Duration::from_secs(2) {
+                .all(|l| l.cons.is_abandoned() && l.cons.is_empty());
+            // On n'abandonne que si plus rien n'arrive (carte débranchée, etc.).
+            if drained || last_progress.elapsed() > STALL_TIMEOUT {
                 break;
             }
         }
@@ -166,21 +327,16 @@ fn run(
 
     lanes
         .into_iter()
-        .map(|mut l| {
+        .map(|l| {
+            let mut l = l.st;
             l.acc.flush(&mut peaks_tmp);
-            l.spec.peaks.write().extend(&peaks_tmp);
+            l.peaks.write().extend(&peaks_tmp);
             peaks_tmp.clear();
-            let mut error = l.error;
-            if let Some(w) = l.writer
-                && let Err(e) = w.finalize()
-            {
-                error.get_or_insert(e.to_string());
-            }
+            l.close_current(&errors);
             RecResult {
-                track_id: l.spec.track_id,
-                file: l.spec.file,
-                frames: l.frames,
-                error,
+                track_id: l.track_id,
+                segments: l.done,
+                error: l.error,
             }
         })
         .collect()
@@ -216,7 +372,8 @@ mod tests {
                 }],
                 48000,
                 format,
-            );
+            )
+            .unwrap();
             let signal: Vec<f32> = (0..20000)
                 .map(|i| ((i % 200) as f32 / 100.0) - 1.0)
                 .collect();
@@ -229,8 +386,8 @@ mod tests {
                 }
             }
             drop(prod);
-            let res = rec.finish();
-            assert_eq!(res[0].frames, 20000);
+            let res = rec.finish().unwrap();
+            assert_eq!(res[0].frames(), 20000);
             assert!(res[0].error.is_none());
             assert_eq!(
                 peaks.read().l0.len(),
@@ -259,6 +416,47 @@ mod tests {
             assert!(out.iter().all(|&s| s == 0.0));
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    /// Une prise longue est répartie sur plusieurs fichiers, sans perte d'échantillon.
+    #[test]
+    fn long_take_rolls_over_files() {
+        let dir = std::env::temp_dir().join(format!("tp-seg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut prod, cons) = rtrb::RingBuffer::new(100_000);
+        let peaks = Arc::new(RwLock::new(PeakData::default()));
+        // Limite de 30 000 octets ≈ 9 650 trames en 24 bits.
+        let rec = Recorder::start_with_limit(
+            vec![RecSpec {
+                track_id: 1,
+                file: "T_001.wav".into(),
+                path: dir.join("T_001.wav"),
+                peaks,
+                cons,
+            }],
+            48000,
+            RecFormat::Int24,
+            30_000,
+        )
+        .unwrap();
+        for i in 0..25_000 {
+            prod.push((i % 100) as f32 / 1000.0).unwrap();
+        }
+        drop(prod);
+        let res = rec.finish().unwrap();
+        let segs = &res[0].segments;
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[1].file, "T_001_p2.wav");
+        assert_eq!(res[0].frames(), 25_000);
+        let mut total = 0;
+        for sg in segs {
+            let r = hound::WavReader::open(dir.join(&sg.file)).unwrap();
+            assert_eq!(r.duration() as u64, sg.frames);
+            total += sg.frames;
+        }
+        assert_eq!(total, 25_000);
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 
@@ -289,7 +487,7 @@ mod load_test {
                 cons: c,
             });
         }
-        let rec = Recorder::start(specs, sr as u32, RecFormat::Int24);
+        let rec = Recorder::start(specs, sr as u32, RecFormat::Int24).unwrap();
         let block = 256;
         let secs = 10;
         let start = Instant::now();
@@ -311,11 +509,11 @@ mod load_test {
             sent += block;
         }
         drop(prods);
-        let res = rec.finish();
+        let res = rec.finish().unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(overruns, 0);
-        assert!(res.iter().all(
-            |r| r.frames == (sr * secs).div_ceil(block) as u64 * block as u64 && r.error.is_none()
-        ));
+        assert!(res.iter().all(|r| r.frames()
+            == (sr * secs).div_ceil(block) as u64 * block as u64
+            && r.error.is_none()));
     }
 }

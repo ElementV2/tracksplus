@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Nombre d'échantillons résumés par un point de forme d'onde.
-pub const PEAK_BLOCK: usize = 512;
+pub const PEAK_BLOCK: usize = 1024;
 
 /// Facteur entre les deux niveaux de détail de la forme d'onde.
 pub const PEAK_L1: usize = 16;
@@ -200,6 +200,21 @@ impl TrackRenderer {
     pub fn render(&mut self, pos: u64, out: &mut [f32]) {
         out.fill(0.0);
         let end = pos + out.len() as u64;
+        // Fichiers ouverts uniquement autour de la position de lecture : ouverture un peu
+        // en avance (pas de trou au début d'une prise), fermeture une fois la prise passée.
+        // Le nombre de fichiers ouverts reste ainsi borné, même avec des centaines de prises.
+        const LOOKAHEAD: u64 = 96_000;
+        for cs in &mut self.clips {
+            let c = &cs.clip;
+            if c.end() <= pos || c.start > end + LOOKAHEAD {
+                cs.src = None;
+            } else if cs.src.is_none() && !cs.failed && c.start >= end {
+                match WavSource::open(&cs.path) {
+                    Ok(s) => cs.src = Some(s),
+                    Err(_) => cs.failed = true,
+                }
+            }
+        }
         for cs in &mut self.clips {
             let c = &cs.clip;
             if c.end() <= pos || c.start >= end || cs.failed {

@@ -70,12 +70,40 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   **Tout arrêter** avec fondu (Échap). Le soundboard est sauvegardé automatiquement et peut
   être enregistré / rechargé comme fichier.
 
+## Fiabilité en live
+
+Conçu pour ne jamais perdre une prise :
+
+- **Écriture directe sur disque** par un thread dédié, tampon de 4 s par piste ; le callback
+  audio n'alloue ni ne libère jamais de mémoire et ne prend aucun verrou. Testé à 64 pistes
+  48 kHz en temps réel sans aucune perte.
+- **Si le disque prend du retard**, les trames manquantes sont remplacées par du silence au
+  même endroit : la piste ne se décale jamais par rapport aux autres. Alerte immédiate.
+- **En-têtes WAV mis à jour toutes les 2 s, données forcées sur le disque toutes les 10 s.**
+- **Prises longues** : au-delà de 2 Go, la prise continue sans coupure dans `nom_p2.wav`,
+  `nom_p3.wav`… (un WAV ne peut pas dépasser 4 Go), posés bout à bout dans la session.
+- **Récupération après crash ou coupure** : la session et un journal des prises sont écrits
+  avant le lancement de l'enregistrement. Si l'application est tuée en pleine prise, elle
+  rouvre la session au redémarrage, répare les fichiers (en-têtes recalés sur la taille
+  réelle) et replace les prises sur la timeline.
+- **À l'arrêt**, tout ce qui reste dans les tampons est écrit, les fichiers sont fermés et la
+  session sauvegardée immédiatement.
+- **Pas d'arrêt accidentel** : pendant une prise, Espace / R / le bouton Rec demandent une
+  confirmation (second appui) ; fermer la fenêtre demande confirmation ; changer de carte son
+  ou exporter est bloqué.
+- **Alertes en direct** (bandeau rouge) : plus de signal de la carte (horloge Dante, câble),
+  erreur disque, disque presque plein, saturation disque, erreur du pilote.
+- **Pas de mise en veille** de l'ordinateur pendant une prise.
+- **Une erreur d'interface n'arrête jamais l'audio** (rattrapée, journalisée dans
+  `crash.log` du dossier de configuration). Sauvegarde automatique du montage toutes les 30 s.
+- Sons du soundboard limités à 30 min (chargés en mémoire).
+
 ## Raccourcis
 
 | Touche | Multipiste | Soundboard |
 | --- | --- | --- |
-| Espace | Lecture / Stop | |
-| R | Enregistrer / Stop | |
+| Espace | Lecture / Stop (pendant une prise : deux appuis) | |
+| R | Enregistrer (pendant une prise : deux appuis pour arrêter) | |
 | M | Ajouter un repère | |
 | ← / → | Repère précédent / suivant | |
 | Origine / Entrée | Début (ou début de la sélection) | |

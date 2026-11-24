@@ -380,6 +380,18 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| anyhow!("Codec non supporté : {e}"))?;
 
+    // Les sons sont chargés en mémoire : au-delà de 30 min, on refuse plutôt que de
+    // risquer de saturer la mémoire de la machine en plein spectacle.
+    const MAX_SECONDS: u64 = 30 * 60;
+    if let Some(n) = track.codec_params.n_frames
+        && n / src_sr.max(1) as u64 > MAX_SECONDS
+    {
+        return Err(anyhow!(
+            "Son trop long ({} min) : 30 min maximum pour un pad",
+            n / src_sr.max(1) as u64 / 60
+        ));
+    }
+    let max_frames = MAX_SECONDS as usize * src_sr.max(1) as usize;
     let mut left = Vec::new();
     let mut right = Vec::new();
     let mut buf: Option<SampleBuffer<f32>> = None;
@@ -405,6 +417,9 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
             *b = SampleBuffer::new(decoded.capacity() as u64, spec);
         }
         b.copy_interleaved_ref(decoded);
+        if left.len() > max_frames {
+            return Err(anyhow!("Son trop long : 30 min maximum pour un pad"));
+        }
         for frame in b.samples().chunks(ch) {
             left.push(frame[0]);
             right.push(if ch > 1 { frame[1] } else { frame[0] });
