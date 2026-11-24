@@ -234,7 +234,8 @@ impl Midi {
             return;
         }
         let mut msgs: Vec<(MidiKey, [u8; 3])> = Vec::new();
-        for (name, _) in &self.outs {
+        // Le modèle est déduit du nom de la première sortie (un contrôleur à la fois).
+        if let Some((name, _)) = self.outs.first() {
             let m = mode.resolve(name);
             for &(k, st) in states {
                 if let Some(msg) = led_message(m, k, st) {
@@ -251,7 +252,6 @@ impl Midi {
                     msgs.push((*k, msg));
                 }
             }
-            break;
         }
         let present: Vec<MidiKey> = states.iter().map(|(k, _)| *k).collect();
         for (k, msg) in msgs {
