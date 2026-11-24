@@ -1,3 +1,8 @@
+# Windows (MSVC) : runtime C liée en statique, pour un exécutable qui démarre sur
+# n'importe quel PC sans installer le « Visual C++ Redistributable ».
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
 # Compilation croisée Windows depuis Linux (MinGW) : exécutable autonome, sans DLL
 # MinGW à livrer. La bibliothèque C++ (utilisée par le pilote ASIO) est liée en statique :
 # on empêche le crate `cc` de la demander en dynamique, puis on l'ajoute nous-mêmes.

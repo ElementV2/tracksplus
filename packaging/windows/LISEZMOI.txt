@@ -1,0 +1,29 @@
+TracksPlus — enregistreur multipiste et soundboard
+===================================================
+
+Démarrage
+---------
+1. Lancez TracksPlus (menu Démarrer ou bureau).
+2. Cliquez sur la pastille de la carte son en haut à droite :
+   - Dante Virtual Soundcard, RME, Focusrite… : pilote « ASIO », puis votre carte ;
+   - sinon : pilote « WASAPI ».
+   La fréquence doit être la même que celle de la carte (Dante Controller pour Dante).
+3. Onglet Multipiste : « Ajouter une piste » → Mono ou Stéréo → l'entrée.
+   Armez les pistes (pastille rouge) puis ⏺ (touche R).
+   Pendant une prise, il faut appuyer deux fois pour arrêter (sécurité).
+
+Où sont mes fichiers ?
+----------------------
+- Sessions et enregistrements : dossier Musique\TracksPlus
+  (WAV 24 bits ou 32 bits flottant, lisibles par tous les logiciels audio).
+- Réglages : %APPDATA%\TracksPlus
+Ces dossiers sont conservés si vous désinstallez l'application.
+
+En cas de crash ou de coupure de courant pendant une prise, relancez TracksPlus :
+la session est rouverte et les prises sont récupérées automatiquement.
+
+Désinstaller
+------------
+Paramètres Windows → Applications → TracksPlus → Désinstaller.
+
+ASIO is a trademark and software of Steinberg Media Technologies GmbH.

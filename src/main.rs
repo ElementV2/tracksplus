@@ -39,12 +39,19 @@ fn install_crash_log() {
 
 fn main() -> eframe::Result {
     install_crash_log();
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("TracksPlus")
+        .with_inner_size([1440.0, 880.0])
+        .with_min_inner_size([1100.0, 620.0])
+        .with_drag_and_drop(true);
+    // Icône de la fenêtre et de la barre des tâches.
+    if let Ok(icon) =
+        eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/tracksplus.png"))
+    {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("TracksPlus")
-            .with_inner_size([1440.0, 880.0])
-            .with_min_inner_size([1100.0, 620.0])
-            .with_drag_and_drop(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

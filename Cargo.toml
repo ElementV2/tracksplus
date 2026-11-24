@@ -2,6 +2,7 @@
 name = "tracksplus"
 version = "0.1.0"
 edition = "2024"
+description = "Enregistreur multipiste et soundboard pour le live"
 
 [dependencies]
 anyhow = "1.0.105"
@@ -22,6 +23,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 keepawake = "0.6.1"
 
+[build-dependencies]
+# Icône et informations de version intégrées à l'exécutable Windows.
+winresource = "0.1"
+
 [features]
 default = []
 # Pilotes ASIO sous Windows (Dante Virtual Soundcard, RME, Focusrite…).
@@ -32,6 +37,7 @@ jack = ["cpal/jack"]
 [profile.release]
 opt-level = 3
 lto = "thin"
+strip = "symbols"
 
 # Copie locale de asio-sys : permet la compilation croisée Windows (MinGW) avec ASIO.
 # Seule modification : voir vendor/asio-sys/build.rs (« TracksPlus »).
