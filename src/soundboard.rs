@@ -208,7 +208,7 @@ impl Board {
             std::fs::create_dir_all(d)?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        crate::project::write_synced(&tmp, serde_json::to_string_pretty(self)?.as_bytes())?;
         std::fs::rename(tmp, path)?;
         Ok(())
     }

@@ -91,7 +91,9 @@ impl App {
     fn assign_files(&mut self, start_slot: u16, files: Vec<PathBuf>) {
         let mut slot = start_slot as usize;
         let page = start_slot as usize / crate::sampler::PADS_PER_PAGE;
-        let page_end = (page + 1) * crate::sampler::PADS_PER_PAGE;
+        // Uniquement les cases visibles de la grille (pas de pad caché).
+        let visible = (self.board.cols * self.board.rows).min(crate::sampler::PADS_PER_PAGE);
+        let page_end = page * crate::sampler::PADS_PER_PAGE + visible;
         let mut first = true;
         for f in files.into_iter().filter(|f| is_audio_file(f)) {
             // Le premier fichier remplace le pad visé, les suivants vont dans les pads vides.
@@ -105,6 +107,10 @@ impl App {
             }
             let color = (slot % t::PALETTE.len()) as u8;
             let old = self.board.pad(slot as u16).cloned();
+            if old.is_some() {
+                // L'ancien son s'arrête : le prochain appui lancera bien le nouveau.
+                self.engine.pad(PadCmd::Stop { slot: slot as u16 });
+            }
             let mut pad = Pad::new(f.clone(), color);
             pad.mode = self.board.default_mode;
             if let Some(o) = old {
@@ -163,6 +169,7 @@ impl App {
             }
             self.midi.shared.lock().map = map;
         }
+        self.release_held_keys(ctx);
         // LED du contrôleur : état de chaque pad associé à un contrôle MIDI.
         if self.board.led_mode != LedMode::Off {
             let states: Vec<(MidiKey, LedState)> = self
@@ -244,9 +251,45 @@ impl App {
                     self.sb.held_keys.insert(key, slot);
                     self.press_pad(slot);
                 }
-            } else if let Some(slot) = self.sb.held_keys.remove(&key) {
+            }
+            // Les relâchements sont traités dans `release_held_keys` (toujours, quel que
+            // soit l'onglet ou les touches de modification).
+        }
+    }
+
+    /// Relâche les pads « maintenir » : relâchement de touche (même avec Ctrl/Alt ou
+    /// depuis un autre onglet), perte de focus de la fenêtre ou bouton souris relâché.
+    pub fn release_held_keys(&mut self, ctx: &egui::Context) {
+        let (released, focused, mouse_up) = ctx.input(|i| {
+            let r: Vec<Key> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: false,
+                        ..
+                    } => Some(*key),
+                    _ => None,
+                })
+                .collect();
+            (r, i.focused, !i.pointer.primary_down())
+        });
+        for key in released {
+            if let Some(slot) = self.sb.held_keys.remove(&key) {
                 self.release_pad(slot);
             }
+        }
+        if !focused {
+            let held: Vec<u16> = self.sb.held_keys.drain().map(|(_, s)| s).collect();
+            for slot in held {
+                self.release_pad(slot);
+            }
+        }
+        if (!focused || mouse_up)
+            && let Some(slot) = self.sb.mouse_down.take()
+        {
+            self.release_pad(slot);
         }
     }
 
@@ -273,6 +316,15 @@ impl App {
                 master_panel(ui, "PADS", &mut m);
                 self.master_pad = m;
             });
+        // Le pad sélectionné doit être sur la page affichée.
+        if self
+            .sb
+            .selected
+            .is_some_and(|s| s as usize / PADS_PER_PAGE != self.sb.page)
+        {
+            self.sb.selected = None;
+        }
+        self.confirm_delete_page_dialog(ui.ctx());
         if self.sb.selected.and_then(|s| self.board.pad(s)).is_some() {
             egui::Panel::bottom("sb_editor")
                 .resizable(true)
@@ -316,6 +368,74 @@ impl App {
         modes.all(|m| m == first).then_some(first)
     }
 
+    /// Suppression d'une page : confirmation, arrêt des pads concernés (les pages
+    /// suivantes changent de numéro de case).
+    fn confirm_delete_page_dialog(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.sb.confirm_delete_page else {
+            return;
+        };
+        if i >= self.board.pages.len() || self.board.pages.len() <= 1 {
+            self.sb.confirm_delete_page = None;
+            return;
+        }
+        let n = self.board.pages[i].pads.iter().flatten().count();
+        let name = self.board.pages[i].name.clone();
+        let mut keep = false;
+        let mut delete = false;
+        egui::Modal::new(egui::Id::unique("confirm_del_page"))
+            .frame(t::window_frame())
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(egui::RichText::new("SUPPRIMER LA PAGE").font(t::semibold(11.5)));
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "La page « {name} » et ses {n} pad(s) seront supprimés."
+                ));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Annuler").clicked() {
+                        keep = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Supprimer").color(Color32::BLACK),
+                                )
+                                .fill(t::REC),
+                            )
+                            .clicked()
+                        {
+                            delete = true;
+                        }
+                    });
+                });
+            });
+        if keep {
+            self.sb.confirm_delete_page = None;
+        }
+        if delete {
+            self.sb.confirm_delete_page = None;
+            // Arrêt des sons des pages renumérotées et remise à zéro des états liés aux cases.
+            for pg in i..self.board.pages.len() {
+                for k in 0..PADS_PER_PAGE {
+                    self.engine.pad(PadCmd::Stop {
+                        slot: Board::slot(pg, k),
+                    });
+                }
+            }
+            self.sb.held_keys.clear();
+            self.sb.mouse_down = None;
+            self.sb.learn_key = None;
+            self.sb.learn_midi = None;
+            self.sb.drag_pad = None;
+            self.board.pages.remove(i);
+            self.sb.page = self.sb.page.min(self.board.pages.len() - 1);
+            self.sb.selected = None;
+            self.board_modified();
+        }
+    }
+
     fn sb_header(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
         w::hline(
@@ -356,10 +476,7 @@ impl App {
                     }
                 });
             if let Some(i) = remove_page {
-                self.board.pages.remove(i);
-                self.sb.page = self.sb.page.min(self.board.pages.len() - 1);
-                self.sb.selected = None;
-                self.board_modified();
+                self.sb.confirm_delete_page = Some(i);
             }
             if self.board.pages.len() < MAX_PAGES && w::icon_button(ui, Icon::Plus, 22.0, BtnStyle::Ghost, true, "Nouvelle page").clicked() {
                 let n = self.board.pages.len() + 1;
@@ -1503,9 +1620,10 @@ impl App {
 /// Garde des réglages cohérents (début < fin, fondus dans la zone jouée).
 fn sanitize(pad: &mut Pad, s: Option<&SampleData>) {
     let dur = s.map_or(f64::MAX, |s| s.frames as f64 / s.sample_rate as f64);
-    pad.start = pad.start.clamp(0.0, dur);
+    pad.start = pad.start.clamp(0.0, (dur - 0.01).max(0.0));
     if let Some(e) = pad.end {
-        let e = e.clamp(pad.start + 0.01, dur);
+        let lo = (pad.start + 0.01).min(dur);
+        let e = e.clamp(lo, dur);
         pad.end = if (e - dur).abs() < 1e-4 {
             None
         } else {
@@ -1515,7 +1633,7 @@ fn sanitize(pad: &mut Pad, s: Option<&SampleData>) {
     let end = pad.end.unwrap_or(dur);
     let len = (end - pad.start).max(0.0);
     pad.fade_in = pad.fade_in.clamp(0.0, len);
-    pad.fade_out = pad.fade_out.clamp(0.0, len - pad.fade_in);
+    pad.fade_out = pad.fade_out.clamp(0.0, (len - pad.fade_in).max(0.0));
 }
 
 fn pick_audio_files(multiple: bool) -> Option<Vec<PathBuf>> {

@@ -34,7 +34,7 @@ pub fn journal_path(dir: &Path) -> PathBuf {
 pub fn write_journal(dir: &Path, j: &Journal) -> Result<()> {
     let p = journal_path(dir);
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(j)?)?;
+    crate::project::write_synced(&tmp, serde_json::to_string_pretty(j)?.as_bytes())?;
     std::fs::rename(tmp, p)?;
     Ok(())
 }
@@ -112,8 +112,13 @@ pub fn recover(project: &mut Project) -> Result<usize> {
             if !path.exists() {
                 break;
             }
-            let Ok(frames) = repair_wav(&path) else {
-                break;
+            // Réparation de l'en-tête ; sur un support en lecture seule, on lit la durée telle quelle.
+            let frames = match repair_wav(&path) {
+                Ok(f) => f,
+                Err(_) => match hound::WavReader::open(&path) {
+                    Ok(r) => r.duration() as u64,
+                    Err(_) => break,
+                },
             };
             if frames == 0 {
                 continue;
@@ -122,7 +127,18 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                 .tracks
                 .iter()
                 .any(|t| t.clips.iter().any(|c| c.file == file));
-            if !already {
+            if already {
+                // Prise déjà dans la session : on recale seulement sa longueur sur le fichier réel.
+                for t in &mut project.tracks {
+                    for c in t.clips.iter_mut().filter(|c| c.file == file) {
+                        c.src_len = frames;
+                        if c.offset + c.len > frames {
+                            c.len = frames.saturating_sub(c.offset).max(1);
+                            c.clamp_fades();
+                        }
+                    }
+                }
+            } else {
                 let track_id = if project.tracks.iter().any(|t| t.id == take.track_id) {
                     take.track_id
                 } else {

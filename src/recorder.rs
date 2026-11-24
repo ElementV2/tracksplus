@@ -10,6 +10,7 @@
 
 use crate::project::RecFormat;
 use crate::render::{PeakAccum, Peaks};
+use crossbeam_channel::Sender;
 use hound::{WavSpec, WavWriter};
 use rtrb::Consumer;
 use std::fs::File;
@@ -100,7 +101,11 @@ struct LaneState {
 }
 
 fn open_segment(path: &Path, wav: WavSpec) -> std::io::Result<SegWriter> {
-    let file = File::create(path)?;
+    // Jamais d'écrasement : si le fichier existe déjà, c'est une erreur signalée.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     let sync = file.try_clone()?;
     let w = WavWriter::new(BufWriter::with_capacity(WRITE_BUFFER, file), wav)
         .map_err(std::io::Error::other)?;
@@ -118,15 +123,21 @@ impl LaneState {
     }
 
     /// Ferme le fichier en cours (en-tête final + fsync).
-    fn close_current(&mut self, errors: &Errors) {
+    fn close_current(&mut self, errors: &Errors, sync: &Sender<File>) {
         if let Some(seg) = self.cur.take() {
             let name = segment_name(&self.file, self.done.len() + 1);
-            let frames = seg.frames;
+            let mut frames = seg.frames;
             let file = seg.file;
             if let Err(e) = seg.w.finalize() {
                 self.fail(errors, format!("{name} : {e}"));
+                // Disque plein ou retiré : on recale la longueur sur ce qui est réellement
+                // sur le disque (les derniers échantillons en tampon n'y sont peut-être pas).
+                if let Ok(real) = crate::recovery::repair_wav(&self.dir.join(&name)) {
+                    frames = real.min(frames);
+                }
             }
-            let _ = file.sync_all();
+            // Écriture forcée sur le disque dans un thread à part : jamais de blocage ici.
+            let _ = sync.send(file);
             self.done.push(Segment { file: name, frames });
         }
     }
@@ -183,21 +194,51 @@ impl Recorder {
         })
     }
 
-    /// Erreurs disque survenues depuis le début de la prise.
+    /// Erreurs disque survenues depuis le début de la prise (sans doublons).
     pub fn errors(&self) -> Vec<String> {
-        self.errors.lock().clone()
+        let mut v = self.errors.lock().clone();
+        v.dedup();
+        v
     }
 
     /// Termine les fichiers (à appeler après `Engine::stop_record`).
-    /// Retourne une erreur si le thread disque s'est arrêté anormalement.
-    pub fn finish(mut self) -> Result<Vec<RecResult>, String> {
+    /// N'attend jamais indéfiniment : si le disque ne répond plus, on rend la main à
+    /// l'interface (les fichiers seront réparés par la récupération).
+    pub fn finish(mut self) -> Result<Vec<RecResult>, FinishError> {
         self.stop.store(true, Ordering::Release);
-        match self.handle.take().map(|h| h.join()) {
-            Some(Ok(r)) => Ok(r),
-            _ => Err("le thread d'écriture disque s'est arrêté anormalement".into()),
+        let Some(h) = self.handle.take() else {
+            return Err(FinishError::Panicked);
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let _ = std::thread::Builder::new()
+            .name("tracksplus-finish".into())
+            .spawn(move || {
+                let _ = tx.send(h.join());
+            });
+        match rx.recv_timeout(FINISH_TIMEOUT) {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(_)) => Err(FinishError::Panicked),
+            Err(_) => Err(FinishError::Timeout),
         }
     }
 }
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishError {
+    /// Le thread disque s'est arrêté anormalement.
+    Panicked,
+    /// Le disque ne répond plus (retiré, bloqué).
+    Timeout,
+}
+
+/// Délai maximal d'attente de la fin d'écriture à l'arrêt.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn run(
     specs: Vec<RecSpec>,
@@ -235,6 +276,17 @@ fn run(
         })
         .collect();
 
+    // fsync dans un thread dédié : même lent (disque USB, Windows), il ne bloque jamais
+    // le vidage des tampons.
+    let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<File>();
+    let syncer = std::thread::Builder::new()
+        .name("tracksplus-fsync".into())
+        .spawn(move || {
+            for f in sync_rx {
+                let _ = f.sync_data();
+            }
+        })
+        .ok();
     let mut last_flush = Instant::now();
     let mut last_sync = Instant::now();
     let mut last_progress = Instant::now();
@@ -256,7 +308,7 @@ fn run(
                 st.acc.push(s, &mut peaks_tmp);
                 if st.cur.as_ref().is_some_and(|c| c.frames >= max_frames) {
                     // Fichier plein : on passe au suivant sans interrompre la prise.
-                    st.close_current(&errors);
+                    st.close_current(&errors, &sync_tx);
                     st.open_next(wav, &errors);
                 }
                 let Some(seg) = st.cur.as_mut() else {
@@ -274,7 +326,7 @@ fn run(
                         let msg = format!("{} : {e}", st.file);
                         st.fail(&errors, msg);
                         // Le fichier reste valide jusqu'ici : on le ferme proprement.
-                        st.close_current(&errors);
+                        st.close_current(&errors, &sync_tx);
                     }
                 }
             }
@@ -297,8 +349,8 @@ fn run(
                 if let Some(seg) = &mut st.cur {
                     if let Err(e) = seg.w.flush() {
                         err = Some(format!("{} : {e}", st.file));
-                    } else if sync {
-                        let _ = seg.file.sync_data();
+                    } else if sync && let Ok(f) = seg.file.try_clone() {
+                        let _ = sync_tx.send(f);
                     }
                 }
                 if let Some(msg) = err {
@@ -325,21 +377,27 @@ fn run(
         }
     }
 
-    lanes
+    let results: Vec<RecResult> = lanes
         .into_iter()
         .map(|l| {
             let mut l = l.st;
             l.acc.flush(&mut peaks_tmp);
             l.peaks.write().extend(&peaks_tmp);
             peaks_tmp.clear();
-            l.close_current(&errors);
+            l.close_current(&errors, &sync_tx);
             RecResult {
                 track_id: l.track_id,
                 segments: l.done,
                 error: l.error,
             }
         })
-        .collect()
+        .collect();
+    // Les dernières écritures forcées sur le disque sont terminées avant de rendre la main.
+    drop(sync_tx);
+    if let Some(h) = syncer {
+        let _ = h.join();
+    }
+    results
 }
 
 #[cfg(test)]
@@ -456,6 +514,54 @@ mod tests {
             total += sg.frames;
         }
         assert_eq!(total, 25_000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Un fichier impossible à créer est signalé tout de suite ; les autres pistes
+    /// continuent normalement et l'arrêt se passe sans blocage.
+    #[test]
+    fn disk_error_is_reported_and_others_continue() {
+        let dir = std::env::temp_dir().join(format!("tp-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut p_ok, c_ok) = rtrb::RingBuffer::new(10_000);
+        let (mut p_bad, c_bad) = rtrb::RingBuffer::new(10_000);
+        let rec = Recorder::start(
+            vec![
+                RecSpec {
+                    track_id: 1,
+                    file: "ok.wav".into(),
+                    path: dir.join("ok.wav"),
+                    peaks: Arc::new(RwLock::new(PeakData::default())),
+                    cons: c_ok,
+                },
+                RecSpec {
+                    track_id: 2,
+                    file: "bad.wav".into(),
+                    path: dir.join("absent/bad.wav"),
+                    peaks: Arc::new(RwLock::new(PeakData::default())),
+                    cons: c_bad,
+                },
+            ],
+            48000,
+            RecFormat::Int24,
+        )
+        .unwrap();
+        for _ in 0..5000 {
+            p_ok.push(0.1).unwrap();
+            p_bad.push(0.1).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(rec.errors().len(), 1, "erreur visible pendant la prise");
+        drop(p_ok);
+        drop(p_bad);
+        let t0 = Instant::now();
+        let res = rec.finish().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert_eq!(res[0].frames(), 5000);
+        assert!(res[0].error.is_none());
+        assert!(res[1].error.is_some());
+        assert_eq!(res[1].frames(), 0);
         std::fs::remove_dir_all(dir).ok();
     }
 }

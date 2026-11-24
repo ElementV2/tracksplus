@@ -489,6 +489,8 @@ impl Engine {
     }
 
     pub fn start_playback(&self, cons: Consumer<f32>) {
+        // Remis à zéro ici et dans le callback : pas de saut de la tête au démarrage.
+        self.shared.out_frames.store(0, Ordering::Relaxed);
         if let Some(tx) = &self.out_tx {
             let _ = tx.try_send(OutCmd::Play(cons));
         }

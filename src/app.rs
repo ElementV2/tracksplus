@@ -6,7 +6,7 @@ use crate::export::{BitDepth, ExportJob, ExportSettings};
 use crate::midi::Midi;
 use crate::player::Player;
 use crate::project::{self, Clip, PROJECT_EXT, Project, RecFormat};
-use crate::recorder::{RecResult, RecSpec, Recorder};
+use crate::recorder::{FinishError, RecResult, RecSpec, Recorder};
 use crate::recovery;
 use crate::render::{self, PeakData, Peaks};
 use crate::sampler::PadCmd;
@@ -131,6 +131,8 @@ pub struct SbState {
     pub drag_pad: Option<u16>,
     /// Zones des onglets de page (cibles de dépôt d'un pad).
     pub page_tabs: Vec<Rect>,
+    /// Page dont la suppression attend confirmation.
+    pub confirm_delete_page: Option<usize>,
 }
 
 pub struct App {
@@ -418,6 +420,15 @@ impl App {
             .filter_map(|t| t.input.map(|i| (t.id, t.name.clone(), i)))
             .filter(|(_, _, i)| *i < in_ch)
             .collect();
+        // Pistes armées dont l'entrée n'existe pas sur la carte (ex. Dante revenue avec
+        // moins de canaux) : on enregistre les autres, mais on le signale clairement.
+        let skipped: Vec<String> = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.armed && t.input.is_none_or(|i| i >= in_ch))
+            .map(|t| t.name.clone())
+            .collect();
         if armed.is_empty() {
             self.notify(
                 "Armez au moins une piste (pastille rouge) avec une entrée valide",
@@ -430,19 +441,23 @@ impl App {
             self.notify(format!("{e:#}"), true);
             return;
         }
+        // Journal d'une prise précédente non intégrée (sauvegarde échouée) : on la
+        // récupère avant d'écrire le nouveau journal, pour ne rien perdre.
+        if recovery::journal_path(&self.project.dir).exists()
+            && let Ok(n) = recovery::recover(&mut self.project)
+            && n > 0
+        {
+            self.load_peaks();
+        }
 
         let mut specs = Vec::new();
         let mut targets = Vec::new();
         let mut used = HashSet::new();
         self.live.clear();
         for (track_id, name, input) in armed {
-            let mut file = self.project.new_take_file(&name);
-            let mut k = 2;
-            while used.contains(&file) {
-                file = format!("{}_{k}.wav", file.trim_end_matches(".wav"));
-                k += 1;
-            }
-            used.insert(file.clone());
+            // Nom unique sur le disque et dans cette prise, sans tenir compte de la casse.
+            let file = self.project.new_take_file_avoiding(&name, &used);
+            used.insert(file.to_lowercase());
             let (prod, cons) = rtrb::RingBuffer::new(sr as usize * 4);
             let peaks: Peaks = Arc::new(RwLock::new(PeakData::default()));
             specs.push(RecSpec {
@@ -516,6 +531,20 @@ impl App {
         };
         self.view.nav_until = 0.0;
         self.reveal_recording_tracks();
+        // Une prise modifie la timeline : l'historique d'annulation d'avant ne s'applique
+        // plus (sinon Ctrl+Z pourrait retirer la prise de la session).
+        self.undo.clear();
+        self.redo.clear();
+        if !skipped.is_empty() {
+            self.notify(
+                format!(
+                    "Attention : {} piste(s) armée(s) sans entrée valide ne sont PAS enregistrées : {}",
+                    skipped.len(),
+                    skipped.join(", ")
+                ),
+                true,
+            );
+        }
     }
 
     pub fn stop(&mut self) {
@@ -545,23 +574,31 @@ impl App {
     fn live_takes_to_clips(
         &mut self,
         start: u64,
-        finished: Option<Result<Vec<RecResult>, String>>,
+        finished: Option<Result<Vec<RecResult>, FinishError>>,
         released: bool,
     ) {
         let results = match finished {
             Some(Ok(r)) => r,
-            other => {
-                // Thread disque en échec : on garde le journal et on récupère depuis les fichiers.
-                let why = match other {
-                    Some(Err(e)) => e,
-                    _ => "enregistreur absent".into(),
-                };
+            Some(Err(FinishError::Timeout)) => {
+                // Le disque ne répond plus : surtout ne pas bloquer l'interface. Le journal est
+                // conservé ; les prises seront réparées et réintégrées à la prochaine ouverture.
                 self.live.clear();
+                self.engine.shared.overruns.store(0, Ordering::Relaxed);
+                self.notify(
+                    "Le disque ne répond plus : les prises seront récupérées automatiquement à la prochaine ouverture de la session",
+                    true,
+                );
+                return;
+            }
+            _ => {
+                // Thread disque en échec : on récupère depuis les fichiers grâce au journal.
+                self.live.clear();
+                self.engine.shared.overruns.store(0, Ordering::Relaxed);
                 let n = recovery::recover(&mut self.project).unwrap_or(0);
                 self.load_peaks();
                 self.notify(
                     format!(
-                        "Problème d'écriture ({why}) : {n} prise(s) récupérée(s) depuis le disque"
+                        "Problème d'écriture disque : {n} prise(s) récupérée(s) depuis le disque"
                     ),
                     true,
                 );
@@ -785,11 +822,16 @@ impl App {
         }
     }
 
+    /// Restaure le montage (prises, repères) d'un instantané, sans jamais toucher à la
+    /// configuration actuelle des pistes (armement, entrées, mute/solo, noms) ni
+    /// supprimer de piste : une piste supprimée depuis est simplement rétablie.
     fn restore(&mut self, snap: Snapshot) -> Snapshot {
         let cur = Snapshot {
-            tracks: std::mem::replace(&mut self.project.tracks, snap.tracks),
+            tracks: self.project.tracks.clone(),
             markers: std::mem::replace(&mut self.project.markers, snap.markers),
         };
+        let current = std::mem::take(&mut self.project.tracks);
+        self.project.tracks = project::merge_clips(current, snap.tracks);
         let ids: HashSet<u64> = self
             .project
             .tracks
@@ -803,6 +845,7 @@ impl App {
 
     pub fn undo(&mut self) {
         if !self.is_recording()
+            && self.clip_drag.is_none()
             && let Some(s) = self.undo.pop()
         {
             let cur = self.restore(s);
@@ -812,6 +855,7 @@ impl App {
 
     pub fn redo(&mut self) {
         if !self.is_recording()
+            && self.clip_drag.is_none()
             && let Some(s) = self.redo.pop()
         {
             let cur = self.restore(s);
@@ -922,8 +966,14 @@ impl App {
         }
     }
 
+    /// La session mérite d'être sauvegardée : elle contient de l'audio, ou elle existe
+    /// déjà sur le disque (préparation des pistes et entrées avant un concert).
+    fn worth_saving(&self) -> bool {
+        self.project.has_audio() || self.project.file_path().exists()
+    }
+
     fn autosave(&mut self) {
-        if self.project.dirty && self.project.has_audio() {
+        if self.project.dirty && self.worth_saving() {
             let _ = self.project.save();
         }
         self.save_board_now();
@@ -1415,11 +1465,15 @@ impl App {
             30.0,
             BtnStyle::Ghost,
             !stopped,
-            "Stop (Espace)",
+            "Stop (Espace) — pendant une prise : deux clics pour arrêter",
         )
         .clicked()
         {
-            self.stop();
+            if recording {
+                self.request_stop_recording();
+            } else {
+                self.stop();
+            }
         }
         let play_style = if playing {
             BtnStyle::Active(t::PLAY)
@@ -2271,7 +2325,9 @@ impl eframe::App for App {
                 true,
             );
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // 60 images/s quand la tête avance, 30 sinon (vumètres fluides, moins de charge).
+        let ms = if self.is_stopped() { 33 } else { 16 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
     }
 
     fn on_exit(&mut self) {
@@ -2304,7 +2360,7 @@ impl App {
         // Sauvegarde automatique des modifications (montage, pistes…).
         if !self.is_recording()
             && self.project.dirty
-            && self.project.has_audio()
+            && self.worth_saving()
             && self.now - self.last_autosave > 30.0
         {
             self.last_autosave = self.now;

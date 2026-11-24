@@ -129,8 +129,13 @@ impl WavSource {
 
     pub fn seek(&mut self, frame: u64) {
         let frame = frame.min(self.frames);
-        if frame != self.pos && self.reader.seek(frame as u32).is_ok() {
-            self.pos = frame;
+        if frame != self.pos {
+            if self.reader.seek(frame as u32).is_ok() {
+                self.pos = frame;
+            } else {
+                // Échec de lecture : silence plutôt qu'un mauvais passage audio.
+                self.pos = self.frames;
+            }
         }
     }
 

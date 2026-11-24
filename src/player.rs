@@ -70,7 +70,9 @@ impl Player {
             mix: vec![0.0; BLOCK],
         };
         // Pré-remplissage pour éviter un trou au démarrage.
-        for _ in 0..8 {
+        // Petit pré-remplissage sur le thread appelant (le reste se fait en arrière-plan),
+        // pour ne pas bloquer l'interface à chaque déplacement de la tête.
+        for _ in 0..2 {
             mixer.fill(&mut prod);
         }
         let stop = Arc::new(AtomicBool::new(false));

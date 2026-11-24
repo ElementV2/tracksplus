@@ -772,7 +772,7 @@ impl App {
                     }
                 }
                 DragMode::TrimLeft => {
-                    let lo = m.start as i64 - m.offset as i64;
+                    let lo = (m.start as i64 - m.offset as i64).max(0);
                     let hi = m.end() as i64 - MIN_CLIP as i64;
                     let mut ns = (m.start as i64 + d).clamp(lo, hi);
                     if !points.is_empty() {
@@ -787,6 +787,10 @@ impl App {
                         c.start = ns as u64;
                         c.offset = (m.offset as i64 + (ns - m.start as i64)) as u64;
                         c.len = m.end() - ns as u64;
+                        // Fondus repris depuis l'état d'origine : raccourcir puis rallonger
+                        // ne les réduit pas définitivement.
+                        c.fade_in = m.fade_in;
+                        c.fade_out = m.fade_out;
                         c.clamp_fades();
                     }
                 }
@@ -820,6 +824,8 @@ impl App {
                             .find(|c| c.id == m.id)
                     {
                         c.len = (ne - m.start as i64) as u64;
+                        c.fade_in = m.fade_in;
+                        c.fade_out = m.fade_out;
                         c.clamp_fades();
                     }
                 }
@@ -837,10 +843,10 @@ impl App {
             return;
         };
         let moved_track = match (drag.mode, drag.target, drag.origs.first()) {
-            (DragMode::Move, Some(row), Some((from, _))) => {
-                let to = self.project.tracks[row].id;
-                (to != *from).then_some((*from, to))
-            }
+            (DragMode::Move, Some(row), Some((from, _))) => match self.project.tracks.get(row) {
+                Some(t) => (t.id != *from).then_some((*from, t.id)),
+                None => None,
+            },
             _ => None,
         };
         let unchanged = drag.origs.iter().all(|(_, o)| {

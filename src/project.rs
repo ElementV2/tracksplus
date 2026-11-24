@@ -320,7 +320,7 @@ impl Project {
         let json = serde_json::to_string_pretty(self)?;
         let path = self.file_path();
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json)?;
+        write_synced(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, &path)?;
         self.dirty = false;
         Ok(())
@@ -341,42 +341,93 @@ impl Project {
 
     /// "Enregistrer sous" : copie les fichiers audio dans le nouveau dossier.
     pub fn save_as(&mut self, new_dir: PathBuf, new_name: String) -> Result<()> {
+        // On prépare tout sur une copie : la session courante n'est modifiée qu'une fois
+        // la copie des fichiers et la sauvegarde réussies.
+        let mut next = self.clone();
+        next.dir = new_dir;
+        next.name = new_name;
+        next.ensure_dirs()?;
         let old_audio = self.audio_dir();
-        let old_dir = self.dir.clone();
-        self.dir = new_dir;
-        self.name = new_name;
-        if let Err(e) = self.ensure_dirs() {
-            self.dir = old_dir;
-            return Err(e);
-        }
-        let new_audio = self.audio_dir();
+        let new_audio = next.audio_dir();
         if old_audio != new_audio {
-            for t in &self.tracks {
-                for c in &t.clips {
-                    let src = old_audio.join(&c.file);
-                    let dst = new_audio.join(&c.file);
-                    if src.exists() && !dst.exists() {
-                        std::fs::copy(&src, &dst)
-                            .with_context(|| format!("Copie de {}", src.display()))?;
-                    }
+            let mut files: Vec<&str> = self
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter().map(|c| c.file.as_str()))
+                .collect();
+            files.sort();
+            files.dedup();
+            for f in files {
+                let src = old_audio.join(f);
+                let dst = new_audio.join(f);
+                if src.exists() && !dst.exists() {
+                    let tmp = dst.with_extension("copie");
+                    std::fs::copy(&src, &tmp)
+                        .with_context(|| format!("Copie de {}", src.display()))?;
+                    std::fs::rename(&tmp, &dst)?;
                 }
             }
         }
-        self.save()
+        next.save()?;
+        *self = next;
+        Ok(())
     }
 
     /// Nom de fichier unique pour une nouvelle prise.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_take_file(&self, track_name: &str) -> String {
+        self.new_take_file_avoiding(track_name, &HashSet::new())
+    }
+
+    /// Nom unique, sans collision avec les fichiers existants (y compris les suites
+    /// `_p2` d'une prise longue) ni avec `taken`, sans tenir compte de la casse
+    /// (Windows et macOS ne distinguent pas « Voix » et « voix »).
+    pub fn new_take_file_avoiding(&self, track_name: &str, taken: &HashSet<String>) -> String {
         let base = sanitize(track_name);
-        let dir = self.audio_dir();
+        let existing: HashSet<String> = std::fs::read_dir(self.audio_dir())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
         for n in 1.. {
             let f = format!("{base}_{n:03}.wav");
-            if !dir.join(&f).exists() {
+            let low = f.to_lowercase();
+            let p2 = format!("{base}_{n:03}_p2.wav").to_lowercase();
+            if !existing.contains(&low) && !existing.contains(&p2) && !taken.contains(&low) {
                 return f;
             }
         }
         unreachable!()
     }
+}
+
+/// Fusion pour Annuler / Rétablir : prend les prises de `snap`, garde la configuration
+/// des pistes de `current` (armement, entrées, mute/solo, noms), rétablit les pistes
+/// supprimées depuis et conserve celles créées depuis.
+pub fn merge_clips(mut current: Vec<Track>, snap: Vec<Track>) -> Vec<Track> {
+    let mut merged = Vec::with_capacity(current.len().max(snap.len()));
+    for st in snap {
+        match current.iter().position(|t| t.id == st.id) {
+            Some(i) => {
+                let mut t = current.remove(i);
+                t.clips = st.clips;
+                merged.push(t);
+            }
+            None => merged.push(st),
+        }
+    }
+    merged.extend(current);
+    merged
+}
+
+/// Écrit un fichier et force son contenu sur le disque (résiste à une coupure de courant).
+pub fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data)?;
+    f.sync_all()
 }
 
 pub fn sanitize(s: &str) -> String {
@@ -489,6 +540,38 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].end(), 3000);
         assert_eq!((c[1].start, c[1].offset), (5000, 4000));
+    }
+
+    #[test]
+    fn undo_merge_keeps_track_config() {
+        let (mut p, t) = clip_project();
+        let snap = p.tracks.clone();
+        // Après l'instantané : coupe, réglages de piste, nouvelle piste.
+        p.split_at(4000, None, None);
+        p.track_mut(t).unwrap().armed = false;
+        p.track_mut(t).unwrap().input = Some(5);
+        let t2 = p.add_track(Some("Nouvelle".into()), Some(1));
+        let merged = merge_clips(p.tracks.clone(), snap);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].clips.len(), 1, "montage annulé");
+        assert_eq!(merged[0].input, Some(5), "configuration conservée");
+        assert!(!merged[0].armed);
+        assert_eq!(merged[1].id, t2, "piste créée depuis conservée");
+    }
+
+    #[test]
+    fn take_names_never_collide() {
+        let dir = std::env::temp_dir().join(format!("tp-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Project::new("N".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        std::fs::write(p.audio_dir().join("Voix_001.wav"), b"x").unwrap();
+        std::fs::write(p.audio_dir().join("Voix_002_p2.wav"), b"x").unwrap();
+        // Existant (autre casse) et suite _p2 : on saute à 003.
+        assert_eq!(p.new_take_file("voix"), "voix_003.wav");
+        let taken: HashSet<String> = ["voix_003.wav".to_string()].into();
+        assert_eq!(p.new_take_file_avoiding("VOIX", &taken), "VOIX_004.wav");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
