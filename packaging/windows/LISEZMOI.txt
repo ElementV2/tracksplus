@@ -14,9 +14,11 @@ Démarrage
 
 Où sont mes fichiers ?
 ----------------------
-- Sessions et enregistrements : dossier Musique\TracksPlus
-  (WAV 24 bits ou 32 bits flottant, lisibles par tous les logiciels audio).
-- Réglages : %APPDATA%\TracksPlus
+- Sessions : dossier Musique\TracksPlus, un dossier par session, qui contient tout :
+  la session, son soundboard, les prises (Audio, WAV 24 bits ou 32 bits flottant,
+  lisibles par tous les logiciels audio), les sons du soundboard (Sons) et les
+  exports (Export).
+- Réglages de l'ordinateur (carte son, contrôleur MIDI) : %APPDATA%\TracksPlus
 Ces dossiers sont conservés si vous désinstallez l'application.
 
 En cas de crash ou de coupure de courant pendant une prise, relancez TracksPlus :

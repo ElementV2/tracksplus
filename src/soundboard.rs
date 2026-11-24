@@ -44,7 +44,7 @@ pub fn note_name(n: u8) -> String {
     format!("{}{}", N[(n % 12) as usize], (n as i32 / 12) - 1)
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Pad {
     pub name: String,
     pub path: PathBuf,
@@ -209,9 +209,117 @@ impl Default for Board {
     }
 }
 
+/// Fichier du soundboard dans le dossier d'une session.
+pub const BOARD_FILE: &str = "soundboard.json";
+/// Dossier des sons du soundboard dans une session (copies des fichiers déposés).
+pub const SOUNDS_DIR: &str = "Sons";
+
 impl Board {
+    /// Réglages du contrôleur, communs à toutes les sessions (ce sont ceux de l'ordinateur) :
+    /// `%APPDATA%\TracksPlus\soundboard.json`.
     pub fn default_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("TracksPlus").join("soundboard.json"))
+    }
+
+    /// Copie de l'ancien soundboard commun, faite une fois avant que les soundboards ne
+    /// passent dans les sessions (pour pouvoir l'importer).
+    pub fn legacy_backup_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| {
+            d.join("TracksPlus")
+                .join("soundboard (avant les sessions).json")
+        })
+    }
+
+    /// Réglages communs : ceux du fichier de l'ordinateur. Un ancien soundboard commun qui
+    /// contient des pads est d'abord mis de côté (une seule fois) pour rester importable.
+    pub fn load_devices() -> Self {
+        let b = Self::load_default();
+        if b.all_pads().next().is_some()
+            && let (Some(src), Some(dst)) = (Self::default_path(), Self::legacy_backup_path())
+            && !dst.exists()
+        {
+            let _ = std::fs::copy(src, dst);
+        }
+        let mut d = Board::default();
+        d.take_devices(&b);
+        d
+    }
+
+    /// Enregistre les réglages communs (sans les pads).
+    pub fn save_devices(&self) -> Result<()> {
+        let mut d = Board::default();
+        d.take_devices(self);
+        match Self::default_path() {
+            Some(p) => d.save(&p),
+            None => Ok(()),
+        }
+    }
+
+    /// Reprend les réglages de l'ordinateur (contrôleur, LED, disposition, fondu de « Tout
+    /// arrêter ») d'un autre soundboard.
+    pub fn take_devices(&mut self, from: &Board) {
+        self.midi_port = from.midi_port.clone();
+        self.led_mode = from.led_mode;
+        self.led_port = from.led_port.clone();
+        self.layout = from.layout;
+        self.panic_fade = from.panic_fade;
+        self.out_left = from.out_left;
+        self.out_device = from.out_device.clone();
+    }
+
+    /// Soundboard de la session `dir` (vide s'il n'y en a pas encore). Les chemins des sons
+    /// sont relatifs au dossier de la session dans le fichier : on les rend absolus.
+    pub fn load_session(dir: &Path) -> Result<Self> {
+        let path = dir.join(BOARD_FILE);
+        if !path.exists() {
+            return Ok(Board::default());
+        }
+        let mut b = Self::load(&path)?;
+        for page in &mut b.pages {
+            for pad in page.pads.iter_mut().flatten() {
+                if pad.path.is_relative() {
+                    pad.path = dir.join(&pad.path);
+                }
+            }
+        }
+        Ok(b)
+    }
+
+    /// Enregistre le soundboard dans la session `dir`, avec des chemins relatifs pour les
+    /// sons du dossier de la session (la session reste valable si on la déplace).
+    pub fn save_session(&self, dir: &Path) -> Result<()> {
+        let mut b = self.clone();
+        for page in &mut b.pages {
+            for pad in page.pads.iter_mut().flatten() {
+                if let Ok(rel) = pad.path.strip_prefix(dir) {
+                    pad.path = rel.to_path_buf();
+                }
+            }
+        }
+        b.save(&dir.join(BOARD_FILE))
+    }
+
+    /// Copie les sons utilisés dans le dossier `Sons` de la session `dir` (ceux qui n'y sont
+    /// pas déjà) et fait pointer les pads vers ces copies. Renvoie les sons introuvables.
+    pub fn adopt_sounds(&mut self, dir: &Path) -> Vec<PathBuf> {
+        let mut missing = Vec::new();
+        let mut done: std::collections::HashMap<PathBuf, PathBuf> = Default::default();
+        for page in &mut self.pages {
+            for pad in page.pads.iter_mut().flatten() {
+                if let Some(p) = done.get(&pad.path) {
+                    pad.path = p.clone();
+                    continue;
+                }
+                match copy_into_session(&pad.path, dir) {
+                    Ok(p) => {
+                        done.insert(pad.path.clone(), p.clone());
+                        pad.path = p;
+                    }
+                    Err(_) => missing.push(pad.path.clone()),
+                }
+            }
+        }
+        missing
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -236,6 +344,10 @@ impl Board {
         crate::project::write_synced(&tmp, serde_json::to_string_pretty(self)?.as_bytes())?;
         std::fs::rename(tmp, path)?;
         Ok(())
+    }
+
+    pub fn has_pads(&self) -> bool {
+        self.all_pads().next().is_some()
     }
 
     pub fn normalize(&mut self) {
@@ -289,12 +401,27 @@ pub enum LoadState {
     Failed(String),
 }
 
+/// Nombre de threads de décodage : assez pour charger vite un soundboard entier, sans
+/// saturer le processeur (ni la mémoire) en plein spectacle.
+const DECODE_WORKERS: usize = 2;
+
+/// Demande de décodage : chemin, fréquence cible, génération, fenêtre à rafraîchir.
+type DecodeJob = (PathBuf, u32, u64, Option<eframe::egui::Context>);
+/// Résultat : chemin, génération, son décodé ou erreur.
+type DecodeResult = (PathBuf, u64, Result<SampleData, String>);
+/// Génération attendue par chemin (une demande remplacée ou retirée est ignorée).
+type Pending = Arc<parking_lot::Mutex<HashMap<PathBuf, u64>>>;
+
 /// Cache des sons chargés, partagé par tous les pads.
 pub struct SampleCache {
     pub map: HashMap<PathBuf, LoadState>,
     sample_rate: u32,
-    tx: Sender<(PathBuf, u32, Result<SampleData, String>)>,
-    rx: Receiver<(PathBuf, u32, Result<SampleData, String>)>,
+    tx: Sender<DecodeResult>,
+    rx: Receiver<DecodeResult>,
+    /// File des décodages, démarrée à la première demande.
+    jobs: Option<Sender<DecodeJob>>,
+    pending: Pending,
+    next_gen: u64,
 }
 
 impl SampleCache {
@@ -305,6 +432,9 @@ impl SampleCache {
             sample_rate,
             tx,
             rx,
+            jobs: None,
+            pending: Default::default(),
+            next_gen: 0,
         }
     }
 
@@ -313,10 +443,39 @@ impl SampleCache {
             self.sample_rate = sr;
             let paths: Vec<_> = self.map.keys().cloned().collect();
             self.map.clear();
+            self.pending.lock().clear();
             for p in paths {
                 self.request(&p, None);
             }
         }
+    }
+
+    /// Threads de décodage (au plus `DECODE_WORKERS`), arrêtés avec le cache.
+    fn workers(&mut self) -> &Sender<DecodeJob> {
+        self.jobs.get_or_insert_with(|| {
+            let (jtx, jrx) = unbounded::<DecodeJob>();
+            for i in 0..DECODE_WORKERS {
+                let jrx = jrx.clone();
+                let tx = self.tx.clone();
+                let pending = self.pending.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("tracksplus-decode-{i}"))
+                    .spawn(move || {
+                        for (p, sr, generation, ctx) in jrx {
+                            // Demande remplacée ou retirée entre-temps : rien à décoder.
+                            if pending.lock().get(&p) != Some(&generation) {
+                                continue;
+                            }
+                            let r = decode_guarded(&p, sr);
+                            let _ = tx.send((p, generation, r));
+                            if let Some(c) = ctx {
+                                c.request_repaint();
+                            }
+                        }
+                    });
+            }
+            jtx
+        })
     }
 
     pub fn request(&mut self, path: &Path, ctx: Option<&eframe::egui::Context>) {
@@ -324,17 +483,22 @@ impl SampleCache {
             return;
         }
         self.map.insert(path.to_path_buf(), LoadState::Loading);
-        let tx = self.tx.clone();
-        let p = path.to_path_buf();
-        let sr = self.sample_rate;
-        let ctx = ctx.cloned();
-        std::thread::spawn(move || {
-            let r = load_sample(&p, sr).map_err(|e| format!("{e:#}"));
-            let _ = tx.send((p, sr, r));
-            if let Some(c) = ctx {
-                c.request_repaint();
-            }
-        });
+        self.next_gen += 1;
+        let generation = self.next_gen;
+        self.pending.lock().insert(path.to_path_buf(), generation);
+        let job = (
+            path.to_path_buf(),
+            self.sample_rate,
+            generation,
+            ctx.cloned(),
+        );
+        if self.workers().send(job).is_err() {
+            self.pending.lock().remove(path);
+            self.map.insert(
+                path.to_path_buf(),
+                LoadState::Failed("Chargement impossible".into()),
+            );
+        }
     }
 
     pub fn reload(&mut self, path: &Path) {
@@ -342,11 +506,22 @@ impl SampleCache {
         self.request(path, None);
     }
 
+    /// Oublie les sons qui ne sont plus utilisés par aucun pad. Les sons en cours de
+    /// lecture ne sont pas coupés : chaque voix garde son propre accès au son.
+    pub fn retain(&mut self, keep: &std::collections::HashSet<PathBuf>) {
+        self.map.retain(|p, _| keep.contains(p));
+        self.pending.lock().retain(|p, _| keep.contains(p));
+    }
+
     pub fn poll(&mut self) -> bool {
         let mut any = false;
-        while let Ok((p, sr, r)) = self.rx.try_recv() {
-            if sr != self.sample_rate {
-                continue;
+        while let Ok((p, generation, r)) = self.rx.try_recv() {
+            {
+                let mut pending = self.pending.lock();
+                if pending.get(&p) != Some(&generation) {
+                    continue;
+                }
+                pending.remove(&p);
             }
             any = true;
             self.map.insert(
@@ -365,6 +540,15 @@ impl SampleCache {
             Some(LoadState::Ready(s)) => Some(s),
             _ => None,
         }
+    }
+}
+
+/// Décodage protégé : un décodeur qui plante sur un fichier abîmé donne une erreur
+/// (le pad l'affiche) au lieu de laisser le pad « en chargement » pour toujours.
+fn decode_guarded(path: &Path, sr: u32) -> Result<SampleData, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_sample(path, sr))) {
+        Ok(r) => r.map_err(|e| format!("{e:#}")),
+        Err(_) => Err("Fichier illisible".into()),
     }
 }
 
@@ -408,7 +592,8 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
     // Les sons sont chargés en mémoire : au-delà de 30 min, on refuse plutôt que de
     // risquer de saturer la mémoire de la machine en plein spectacle.
     const MAX_SECONDS: u64 = 30 * 60;
-    if let Some(n) = track.codec_params.n_frames
+    let n_frames = track.codec_params.n_frames;
+    if let Some(n) = n_frames
         && n / src_sr.max(1) as u64 > MAX_SECONDS
     {
         return Err(anyhow!(
@@ -417,8 +602,12 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
         ));
     }
     let max_frames = MAX_SECONDS as usize * src_sr.max(1) as usize;
-    let mut left = Vec::new();
-    let mut right = Vec::new();
+    // Directement en stéréo entrelacé (format final) : pas de tampons intermédiaires
+    // quand la fréquence est déjà la bonne.
+    let mut data: Vec<f32> = Vec::new();
+    if let Some(n) = n_frames {
+        data.reserve_exact((n as usize).min(max_frames) * 2);
+    }
     let mut buf: Option<SampleBuffer<f32>> = None;
     loop {
         let packet = match format.next_packet() {
@@ -442,36 +631,39 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
             *b = SampleBuffer::new(decoded.capacity() as u64, spec);
         }
         b.copy_interleaved_ref(decoded);
-        if left.len() > max_frames {
+        if data.len() / 2 > max_frames {
             return Err(anyhow!("Son trop long : 30 min maximum pour un pad"));
         }
         for frame in b.samples().chunks(ch) {
-            left.push(frame[0]);
-            right.push(if ch > 1 { frame[1] } else { frame[0] });
+            data.push(frame[0]);
+            data.push(if ch > 1 { frame[1] } else { frame[0] });
         }
     }
-    if left.is_empty() {
+    // Décodeur et tampons libérés avant le rééchantillonnage.
+    drop(buf);
+    drop(decoder);
+    drop(format);
+    if data.is_empty() {
         return Err(anyhow!("Fichier vide"));
     }
 
     if src_sr != target_sr {
-        let (l, r) = resample_stereo(&left, &right, src_sr, target_sr)?;
-        left = l;
-        right = r;
+        // L'original est libéré dès que la version rééchantillonnée est prête.
+        data = resample_stereo(&data, src_sr, target_sr)?;
     }
-    let frames = left.len();
-    let mut data = Vec::with_capacity(frames * 2);
+    // Le son reste en mémoire tout le spectacle : pas de place perdue.
+    data.shrink_to_fit();
+    let frames = data.len() / 2;
     let mut peaks = Vec::with_capacity(frames / SAMPLE_PEAK + 1);
-    for (i, (l, r)) in left.iter().zip(&right).enumerate() {
-        data.push(*l);
-        data.push(*r);
-        let m = 0.5 * (l + r);
-        if i % SAMPLE_PEAK == 0 {
-            peaks.push([m, m]);
+    for block in data.chunks(SAMPLE_PEAK * 2) {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &[l, r] in block.as_chunks::<2>().0 {
+            lo = lo.min(l.min(r));
+            hi = hi.max(l.max(r));
         }
-        let p = peaks.last_mut().unwrap();
-        p[0] = p[0].min(l.min(*r));
-        p[1] = p[1].max(l.max(*r));
+        // Premier point du bloc toujours inclus (bloc d'une seule trame).
+        let m = 0.5 * (block[0] + block[1]);
+        peaks.push([lo.min(m), hi.max(m)]);
     }
     Ok(SampleData {
         sample_rate: target_sr,
@@ -481,45 +673,54 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
     })
 }
 
-fn resample_stereo(l: &[f32], r: &[f32], from: u32, to: u32) -> Result<(Vec<f32>, Vec<f32>)> {
+/// Rééchantillonne un son stéréo entrelacé (traité par blocs : seuls de petits tampons
+/// par canal sont alloués en plus de l'entrée et de la sortie).
+fn resample_stereo(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     const CHUNK: usize = 4096;
+    let frames = input.len() / 2;
     let mut rs = FftFixedIn::<f32>::new(from as usize, to as usize, CHUNK, 2, 2)?;
-    let expected = (l.len() as u64 * to as u64).div_ceil(from as u64) as usize;
+    let expected = (frames as u64 * to as u64).div_ceil(from as u64) as usize;
     let mut skip = rs.output_delay();
-    let mut ol = Vec::with_capacity(expected + CHUNK);
-    let mut or = Vec::with_capacity(expected + CHUNK);
-    fn push(b: Vec<Vec<f32>>, skip: &mut usize, ol: &mut Vec<f32>, or: &mut Vec<f32>) {
+    let mut out = Vec::with_capacity((expected + CHUNK) * 2);
+    fn push(b: Vec<Vec<f32>>, skip: &mut usize, out: &mut Vec<f32>) {
         let n = b[0].len();
         let s = (*skip).min(n);
         *skip -= s;
-        ol.extend_from_slice(&b[0][s..]);
-        or.extend_from_slice(&b[1][s..]);
+        for (l, r) in b[0][s..].iter().zip(&b[1][s..]) {
+            out.push(*l);
+            out.push(*r);
+        }
     }
+    let (mut l, mut r) = (Vec::with_capacity(CHUNK), Vec::with_capacity(CHUNK));
     let mut pos = 0;
-    while pos < l.len() {
-        let n = (l.len() - pos).min(CHUNK);
-        let input = [&l[pos..pos + n], &r[pos..pos + n]];
-        let out = if n == CHUNK {
-            rs.process(&input, None)?
+    while pos < frames {
+        let n = (frames - pos).min(CHUNK);
+        l.clear();
+        r.clear();
+        for f in input[pos * 2..(pos + n) * 2].as_chunks::<2>().0 {
+            l.push(f[0]);
+            r.push(f[1]);
+        }
+        let chunk = [&l[..], &r[..]];
+        let block = if n == CHUNK {
+            rs.process(&chunk, None)?
         } else {
-            rs.process_partial(Some(&input), None)?
+            rs.process_partial(Some(&chunk), None)?
         };
-        push(out, &mut skip, &mut ol, &mut or);
+        push(block, &mut skip, &mut out);
         pos += n;
     }
     let mut guard = 0;
-    while ol.len() < expected && guard < 32 {
+    while out.len() < expected * 2 && guard < 32 {
         push(
             rs.process_partial::<&[f32]>(None, None)?,
             &mut skip,
-            &mut ol,
-            &mut or,
+            &mut out,
         );
         guard += 1;
     }
-    ol.truncate(expected);
-    or.truncate(expected);
-    Ok((ol, or))
+    out.truncate(expected * 2);
+    Ok(out)
 }
 
 pub fn is_audio_file(p: &Path) -> bool {
@@ -528,9 +729,141 @@ pub fn is_audio_file(p: &Path) -> bool {
         .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// Copie `src` dans le dossier `Sons` de la session `dir` et renvoie le chemin de la copie.
+/// Un son déjà dans ce dossier est gardé tel quel ; un fichier du même nom et au contenu
+/// identique est réutilisé ; sinon le nom reçoit un suffixe « (2) », « (3) »…
+pub fn copy_into_session(src: &Path, dir: &Path) -> Result<PathBuf> {
+    let sounds = dir.join(SOUNDS_DIR);
+    if src.parent() == Some(sounds.as_path()) && src.exists() {
+        return Ok(src.to_path_buf());
+    }
+    let size = std::fs::metadata(src)
+        .with_context(|| format!("Son introuvable : {}", src.display()))?
+        .len();
+    std::fs::create_dir_all(&sounds)?;
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Son".into());
+    let ext = src
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1..1000 {
+        let name = if n == 1 {
+            format!("{stem}{ext}")
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let dst = sounds.join(name);
+        match std::fs::metadata(&dst) {
+            Ok(m) if m.len() == size && same_contents(src, &dst, size).unwrap_or(false) => {
+                return Ok(dst);
+            }
+            Ok(_) => continue,
+            Err(_) => {
+                crate::project::copy_synced(src, &dst)?;
+                return Ok(dst);
+            }
+        }
+    }
+    anyhow::bail!("Trop de sons nommés « {stem} » dans la session")
+}
+
+/// Au-delà, seuls le début et la fin des fichiers sont comparés.
+const FULL_COMPARE_MAX: u64 = 64 * 1024 * 1024;
+const EDGE_COMPARE: u64 = 1024 * 1024;
+
+/// Deux fichiers de taille `size` ont le même contenu (en entier jusqu'à 64 Mo, sinon le
+/// premier et le dernier Mo).
+fn same_contents(a: &Path, b: &Path, size: u64) -> std::io::Result<bool> {
+    compare_files(a, b, size, FULL_COMPARE_MAX, EDGE_COMPARE)
+}
+
+fn compare_files(a: &Path, b: &Path, size: u64, full_max: u64, edge: u64) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let ranges: Vec<(u64, u64)> = if size <= full_max || size < 2 * edge {
+        vec![(0, size)]
+    } else {
+        vec![(0, edge), (size - edge, edge)]
+    };
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    for (start, len) in ranges {
+        fa.seek(SeekFrom::Start(start))?;
+        fb.seek(SeekFrom::Start(start))?;
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(ba.len() as u64) as usize;
+            fa.read_exact(&mut ba[..n])?;
+            fb.read_exact(&mut bb[..n])?;
+            if ba[..n] != bb[..n] {
+                return Ok(false);
+            }
+            left -= n as u64;
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sounds_are_copied_into_the_session() {
+        let base = std::env::temp_dir().join(format!("tp-sbsess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ext = base.join("ailleurs");
+        std::fs::create_dir_all(&ext).unwrap();
+        let a = ext.join("kick.wav");
+        std::fs::write(&a, b"aaaa").unwrap();
+        let other = base.join("autre").join("kick.wav");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"bbbbbb").unwrap();
+        let dir = base.join("Session");
+        // Copie, réutilisation du même fichier, suffixe pour un homonyme différent.
+        let c1 = copy_into_session(&a, &dir).unwrap();
+        assert_eq!(c1, dir.join("Sons").join("kick.wav"));
+        assert_eq!(copy_into_session(&a, &dir).unwrap(), c1);
+        assert_eq!(copy_into_session(&c1, &dir).unwrap(), c1);
+        let c2 = copy_into_session(&other, &dir).unwrap();
+        assert_eq!(c2, dir.join("Sons").join("kick (2).wav"));
+        // Même nom et même taille, mais un autre son : jamais confondu.
+        let same_size = base.join("encore").join("kick.wav");
+        std::fs::create_dir_all(same_size.parent().unwrap()).unwrap();
+        std::fs::write(&same_size, b"aaab").unwrap();
+        let c3 = copy_into_session(&same_size, &dir).unwrap();
+        assert_eq!(c3, dir.join("Sons").join("kick (3).wav"));
+        assert_eq!(std::fs::read(&c3).unwrap(), b"aaab");
+        assert_eq!(copy_into_session(&same_size, &dir).unwrap(), c3);
+        assert_eq!(std::fs::read(&c1).unwrap(), b"aaaa");
+        // Enregistré en relatif, relu en absolu, et la session peut être déplacée.
+        let mut b = Board::default();
+        b.set(0, Some(Pad::new(c1.clone(), 0)));
+        b.save_session(&dir).unwrap();
+        let txt = std::fs::read_to_string(dir.join(BOARD_FILE)).unwrap();
+        assert!(!txt.contains("ailleurs") && !txt.contains(&*base.to_string_lossy()));
+        let moved = base.join("Session déplacée");
+        std::fs::rename(&dir, &moved).unwrap();
+        let r = Board::load_session(&moved).unwrap();
+        assert_eq!(r.pad(0).unwrap().path, moved.join("Sons").join("kick.wav"));
+        assert!(r.pad(0).unwrap().path.exists());
+        // Session sans soundboard : vide.
+        assert!(!Board::load_session(&base.join("vide")).unwrap().has_pads());
+        // Adoption d'un soundboard importé : sons copiés, absents signalés.
+        let mut imp = Board::default();
+        imp.set(0, Some(Pad::new(a.clone(), 0)));
+        imp.set(1, Some(Pad::new(base.join("absent.wav"), 0)));
+        let target = base.join("Cible");
+        let missing = imp.adopt_sounds(&target);
+        assert_eq!(missing, vec![base.join("absent.wav")]);
+        assert_eq!(
+            imp.pad(0).unwrap().path,
+            target.join("Sons").join("kick.wav")
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn old_layouts_become_automatic() {
@@ -572,6 +905,79 @@ mod tests {
         assert_eq!(p.start, 24000);
         assert_eq!(p.end, 48000);
         assert_eq!(p.fade_out, 24000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn large_files_compare_edges() {
+        let dir = std::env::temp_dir().join(format!("tp-cmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        let mut data = vec![7u8; 3 * 1024 * 1024];
+        std::fs::write(&a, &data).unwrap();
+        let size = data.len() as u64;
+        // Différence à la fin.
+        *data.last_mut().unwrap() = 8;
+        std::fs::write(&b, &data).unwrap();
+        assert!(!same_contents(&a, &b, size).unwrap());
+        assert!(!compare_files(&a, &b, size, 1024, 1024).unwrap());
+        *data.last_mut().unwrap() = 7;
+        // Différence au milieu : vue en comparaison complète, pas sur les seuls bords.
+        data[size as usize / 2] = 9;
+        std::fs::write(&b, &data).unwrap();
+        assert!(!same_contents(&a, &b, size).unwrap());
+        assert!(compare_files(&a, &b, size, 1024, 1024).unwrap());
+        data[size as usize / 2] = 7;
+        std::fs::write(&b, &data).unwrap();
+        assert!(same_contents(&a, &b, size).unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cache_decodes_in_pool_and_retains() {
+        let dir = std::env::temp_dir().join(format!("tp-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut paths = Vec::new();
+        for k in 0..5 {
+            let p = dir.join(format!("s{k}.wav"));
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            for i in 0..1000 {
+                w.write_sample(i as i16).unwrap();
+                w.write_sample(-(i as i16)).unwrap();
+            }
+            w.finalize().unwrap();
+            paths.push(p);
+        }
+        // Fichier abîmé : échec signalé, jamais « en chargement » pour toujours.
+        let bad = dir.join("abime.wav");
+        std::fs::write(&bad, b"RIFF....WAVEfmt n'importe quoi").unwrap();
+        paths.push(bad.clone());
+        let mut c = SampleCache::new(48000);
+        for p in &paths {
+            c.request(p, None);
+        }
+        let t0 = std::time::Instant::now();
+        while c.map.values().any(|s| matches!(s, LoadState::Loading)) {
+            c.poll();
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for p in &paths[..5] {
+            assert_eq!(c.get(p).unwrap().frames, 1000);
+        }
+        assert!(matches!(c.map.get(&bad), Some(LoadState::Failed(_))));
+        let keep: std::collections::HashSet<PathBuf> = [paths[0].clone()].into();
+        c.retain(&keep);
+        assert_eq!(c.map.len(), 1);
+        assert!(c.get(&paths[0]).is_some());
         std::fs::remove_dir_all(dir).ok();
     }
 

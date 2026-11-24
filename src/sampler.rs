@@ -108,7 +108,10 @@ pub struct Sampler {
     rx: Receiver<PadCmd>,
     garbage: Sender<Arc<SampleData>>,
     pub left: usize,
+    /// Gain général appliqué à la fin du dernier bloc…
     master: f32,
+    /// … et gain demandé : rampe linéaire de l'un à l'autre sur un bloc (pas de « zip »).
+    master_target: f32,
     sample_rate: usize,
 }
 
@@ -125,6 +128,7 @@ impl Sampler {
             garbage,
             left,
             master: 1.0,
+            master_target: 1.0,
             sample_rate: sample_rate as usize,
         }
     }
@@ -210,7 +214,7 @@ impl Sampler {
                 }
             }
             PadCmd::SetOutput { left } => self.left = left,
-            PadCmd::SetMaster { gain } => self.master = gain,
+            PadCmd::SetMaster { gain } => self.master_target = gain,
         }
     }
 
@@ -219,7 +223,14 @@ impl Sampler {
         while let Ok(cmd) = self.rx.try_recv() {
             self.handle(cmd);
         }
-        let master = self.master;
+        // Gain général : rampe linéaire sur le bloc vers la nouvelle valeur.
+        let m0 = self.master;
+        let dm = if frames > 0 {
+            (self.master_target - m0) / frames as f32
+        } else {
+            0.0
+        };
+        self.master = if frames > 0 { self.master_target } else { m0 };
         for v in &mut self.voices {
             let data = &v.sample.data;
             let p = v.p;
@@ -234,6 +245,11 @@ impl Sampler {
                         break;
                     }
                 }
+                let master = if dm == 0.0 {
+                    m0
+                } else {
+                    m0 + dm * (f + 1) as f32
+                };
                 let mut g = p.gain * master;
                 if v.first && p.fade_in > 0 {
                     let k = v.pos.saturating_sub(p.start);
@@ -309,6 +325,54 @@ mod tests {
         }
     }
 
+    /// Charge : 64 voix (le maximum) en même temps, avec fondus et boucles, pour plusieurs
+    /// tailles de buffer. Temps de calcul par bloc comparé au temps disponible.
+    /// `cargo test --release -- --ignored --nocapture charge_soundboard`
+    #[test]
+    #[ignore]
+    fn charge_soundboard_64_voix() {
+        let sr = 48000usize;
+        for block in [64usize, 256, 512, 1024] {
+            let (tx, rx) = bounded(1024);
+            let (gtx, _grx) = bounded(1024);
+            let mut s = Sampler::new(rx, gtx, 0, sr as u32);
+            let pos: Vec<AtomicU64> = (0..MAX_PADS).map(|_| AtomicU64::new(0)).collect();
+            let long = sample(sr * 60);
+            for slot in 0..MAX_VOICES as u16 {
+                let mut p = params(PadMode::Toggle, sr * 60);
+                p.fade_in = sr / 10;
+                p.fade_out = sr / 10;
+                p.looped = slot % 2 == 0;
+                tx.send(PadCmd::Press {
+                    slot,
+                    sample: long.clone(),
+                    params: p,
+                })
+                .unwrap();
+            }
+            let mut out = vec![0.0f32; block * 2];
+            let budget = block as f64 / sr as f64;
+            let (mut total, mut worst) = (0.0f64, 0.0f64);
+            let blocks = (sr * 20) / block; // 20 s de son
+            for _ in 0..blocks {
+                out.fill(0.0);
+                let t = std::time::Instant::now();
+                s.render(&mut out, block, &pos);
+                let d = t.elapsed().as_secs_f64();
+                total += d;
+                worst = worst.max(d);
+            }
+            assert_eq!(s.voices.len(), MAX_VOICES, "toutes les voix jouent");
+            let avg = total / blocks as f64;
+            println!(
+                "soundboard 64 voix · bloc {block:>4} : moyenne {:>5.2} % du temps dispo, pire {:>5.2} %",
+                avg / budget * 100.0,
+                worst / budget * 100.0
+            );
+            assert!(avg < budget * 0.25, "trop lent en moyenne");
+        }
+    }
+
     #[test]
     fn oneshot_plays_to_end_then_stops() {
         let (tx, rx) = bounded(16);
@@ -334,6 +398,39 @@ mod tests {
             grx.try_recv().is_ok(),
             "le son doit être rendu à l'interface"
         );
+    }
+
+    /// Changement du gain général : rampe sur un bloc, pas de marche.
+    #[test]
+    fn master_gain_ramps() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        tx.send(PadCmd::Press {
+            slot: 0,
+            sample: sample(48000),
+            params: params(PadMode::Toggle, 48000),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 128];
+        s.render(&mut out, 64, &pos);
+        assert_eq!(out[0], 0.5);
+        tx.send(PadCmd::SetMaster { gain: 0.0 }).unwrap();
+        out.fill(0.0);
+        s.render(&mut out, 64, &pos);
+        // Descente régulière de 0,5 vers 0 sur le bloc.
+        assert!(out[0] > 0.48 && out[0] < 0.5, "{}", out[0]);
+        assert!((out[2 * 31] - 0.25).abs() < 0.01, "{}", out[2 * 31]);
+        assert_eq!(out[2 * 63], 0.0);
+        let steps = out
+            .windows(4)
+            .step_by(2)
+            .all(|w| (w[0] - w[2]).abs() < 0.01);
+        assert!(steps, "pas de marche");
+        out.fill(0.0);
+        s.render(&mut out, 64, &pos);
+        assert!(out.iter().all(|&x| x == 0.0));
     }
 
     #[test]

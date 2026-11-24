@@ -26,6 +26,8 @@ pub struct Release {
     pub page: String,
     /// Installeur Windows : nom, adresse, taille en octets.
     pub installer: Option<(String, String, u64)>,
+    /// Empreinte SHA-256 de l'installeur (hexadécimal minuscule), si GitHub la fournit.
+    pub sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -35,7 +37,7 @@ pub enum State {
     Checking,
     UpToDate,
     Available(Release),
-    /// Téléchargement de l'installeur (fichier en cours d'écriture, taille attendue).
+    /// Téléchargement de l'installeur (fichier `.part` en cours d'écriture, taille attendue).
     Downloading {
         release: Release,
         file: PathBuf,
@@ -86,13 +88,8 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        if let Some(p) = Self::path() {
-            if let Some(d) = p.parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(p, s);
-            }
+        if let (Some(p), Ok(s)) = (Self::path(), serde_json::to_string_pretty(self)) {
+            let _ = crate::project::write_atomic(&p, s.as_bytes());
         }
     }
 }
@@ -149,34 +146,89 @@ impl Updater {
         let dir = std::env::temp_dir().join("TracksPlus-update");
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join(sanitize_file_name(&name));
+        // Écrit d'abord dans `<nom>.part` : l'installeur n'existe sous son vrai nom qu'une
+        // fois téléchargé en entier et vérifié.
+        let part = part_path(&file);
         let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&part);
         self.set(State::Downloading {
             release: release.clone(),
-            file: file.clone(),
+            file: part.clone(),
             size,
         });
         let me = self.clone();
         let ctx = ctx.clone();
+        let digest = release.sha256.clone();
         std::thread::spawn(move || {
-            let res =
-                curl(&["-sSfL", "--max-time", "600", "-o"], Some(&file), &url).and_then(|_| {
-                    let got = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-                    if size > 0 && got != size {
-                        Err(format!("téléchargement incomplet ({got} / {size} octets)"))
-                    } else {
-                        Ok(())
-                    }
+            let res = curl(&["-sSfL", "--max-time", "600", "-o"], Some(&part), &url)
+                .and_then(|_| verify_download(&part, size, digest.as_deref()))
+                .and_then(|_| {
+                    std::fs::rename(&part, &file)
+                        .map_err(|e| format!("impossible d'enregistrer l'installeur : {e}"))
                 });
             me.set(match res {
                 Ok(()) => State::Ready { release, file },
                 Err(e) => {
-                    let _ = std::fs::remove_file(&file);
+                    let _ = std::fs::remove_file(&part);
                     State::Failed(e)
                 }
             });
             ctx.request_repaint();
         });
     }
+}
+
+/// Fichier temporaire d'un téléchargement : `<fichier>.part`.
+fn part_path(file: &Path) -> PathBuf {
+    let mut n = file.file_name().unwrap_or_default().to_os_string();
+    n.push(".part");
+    file.with_file_name(n)
+}
+
+/// Vérifie un installeur téléchargé : empreinte SHA-256 si elle est connue, sinon taille.
+fn verify_download(file: &Path, size: u64, sha256: Option<&str>) -> Result<(), String> {
+    let got = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    if size > 0 && got != size {
+        return Err(format!("téléchargement incomplet ({got} / {size} octets)"));
+    }
+    match sha256 {
+        Some(want) => {
+            let have = sha256_file(file).map_err(|e| format!("installeur illisible : {e}"))?;
+            if have != want {
+                return Err("installeur corrompu (empreinte SHA-256 différente)".into());
+            }
+            Ok(())
+        }
+        None if size == 0 => Err("taille inconnue : installeur impossible à vérifier".into()),
+        None => Ok(()),
+    }
+}
+
+/// Empreinte SHA-256 d'un fichier (hexadécimal minuscule), lu par blocs.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Empreinte annoncée par GitHub (`"sha256:<hex>"`), en hexadécimal minuscule.
+fn parse_digest(d: &str) -> Option<String> {
+    let (algo, hex) = d.trim().split_once(':')?;
+    let hex = hex.trim().to_ascii_lowercase();
+    (algo.eq_ignore_ascii_case("sha256")
+        && hex.len() == 64
+        && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    .then_some(hex)
 }
 
 /// Avancement d'un téléchargement (0 à 1), d'après la taille du fichier sur le disque.
@@ -253,6 +305,9 @@ struct GhAsset {
     browser_download_url: String,
     #[serde(default)]
     size: u64,
+    /// Empreinte du fichier, « sha256:<hex> » (absente des anciennes releases).
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 fn latest_release() -> Result<Release, String> {
@@ -277,19 +332,20 @@ fn parse_release(json: &str) -> Result<Release, String> {
     if r.draft || r.prerelease {
         return Err("aucune version publiée".into());
     }
-    let installer = r
-        .assets
-        .iter()
-        .find(|a| {
-            let n = a.name.to_lowercase();
-            n.starts_with("tracksplus-setup") && n.ends_with(".exe")
-        })
-        .map(|a| (a.name.clone(), a.browser_download_url.clone(), a.size));
+    let asset = r.assets.iter().find(|a| {
+        let n = a.name.to_lowercase();
+        n.starts_with("tracksplus-setup") && n.ends_with(".exe")
+    });
+    let installer = asset.map(|a| (a.name.clone(), a.browser_download_url.clone(), a.size));
+    let sha256 = asset
+        .and_then(|a| a.digest.as_deref())
+        .and_then(parse_digest);
     Ok(Release {
         version: r.tag_name.trim_start_matches(['v', 'V']).to_string(),
         notes: r.body.unwrap_or_default(),
         page: r.html_url,
         installer,
+        sha256,
     })
 }
 
@@ -408,10 +464,63 @@ mod tests {
                 42
             ))
         );
+        assert_eq!(r.sha256, None, "pas d'empreinte dans cette release");
         let notes = plain_notes(&r.notes);
         assert_eq!(notes[0], (true, "Nouveautés".into()));
         assert_eq!(notes[1], (false, "•  Pads plus larges".into()));
         assert!(parse_release("pas du json").is_err());
+    }
+
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn digest_is_read_and_parsed() {
+        let json = format!(
+            r#"{{"tag_name":"v0.4.0","html_url":"https://x","assets":[
+            {{"name":"TracksPlus-Setup-0.4.0.exe","browser_download_url":"https://a/s.exe","size":3,
+              "digest":"sha256:{}"}}]}}"#,
+            ABC_SHA256.to_uppercase()
+        );
+        let r = parse_release(&json).unwrap();
+        assert_eq!(r.sha256.as_deref(), Some(ABC_SHA256));
+        assert_eq!(
+            parse_digest(&format!("sha256:{ABC_SHA256}")).as_deref(),
+            Some(ABC_SHA256)
+        );
+        assert_eq!(parse_digest("sha512:abcd"), None);
+        assert_eq!(parse_digest("sha256:xyz"), None);
+        assert_eq!(parse_digest(ABC_SHA256), None);
+    }
+
+    #[test]
+    fn download_is_verified() {
+        let dir = std::env::temp_dir().join(format!("tp-upd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("TracksPlus-Setup.exe");
+        assert_eq!(part_path(&f), dir.join("TracksPlus-Setup.exe.part"));
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(sha256_file(&f).unwrap(), ABC_SHA256);
+        assert!(verify_download(&f, 3, Some(ABC_SHA256)).is_ok());
+        assert!(verify_download(&f, 0, Some(ABC_SHA256)).is_ok());
+        assert!(verify_download(&f, 3, None).is_ok());
+        let bad = "0".repeat(64);
+        assert!(
+            verify_download(&f, 3, Some(&bad))
+                .unwrap_err()
+                .contains("SHA-256")
+        );
+        assert!(
+            verify_download(&f, 4, None)
+                .unwrap_err()
+                .contains("incomplet")
+        );
+        assert!(
+            verify_download(&f, 0, None)
+                .unwrap_err()
+                .contains("taille inconnue")
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

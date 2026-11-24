@@ -260,6 +260,8 @@ pub enum Icon {
     Headphones,
     /// Flèche vers le bas sur une ligne (mise à jour, téléchargement).
     Download,
+    /// Dossier (ouvrir une session).
+    Folder,
 }
 
 pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
@@ -299,6 +301,17 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
         Icon::Plus => {
             p.line_segment([c + vec2(-0.65, 0.0) * s, c + vec2(0.65, 0.0) * s], st);
             p.line_segment([c + vec2(0.0, -0.65) * s, c + vec2(0.0, 0.65) * s], st);
+        }
+        Icon::Folder => {
+            let pts = vec![
+                c + vec2(-0.8, -0.55) * s,
+                c + vec2(-0.25, -0.55) * s,
+                c + vec2(-0.05, -0.35) * s,
+                c + vec2(0.8, -0.35) * s,
+                c + vec2(0.8, 0.6) * s,
+                c + vec2(-0.8, 0.6) * s,
+            ];
+            p.add(Shape::closed_line(pts, st));
         }
         Icon::Download => {
             p.line_segment([c + vec2(0.0, -0.75) * s, c + vec2(0.0, 0.35) * s], st);
@@ -554,8 +567,40 @@ pub fn tool_button(
     resp
 }
 
+/// Style des boutons d'action des fenêtres (tous de la même taille).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ActionStyle {
+    /// Action principale : fond orange.
+    Primary,
+    /// Action secondaire (Annuler, Plus tard…) : fond gris.
+    Secondary,
+    /// Action destructrice (Supprimer, Quitter pendant une prise) : fond rouge.
+    Danger,
+}
+
 /// Bouton d'action principale (fond orange, texte sombre).
 pub fn primary_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: bool) -> Response {
+    action_button(ui, icon, label, enabled, ActionStyle::Primary)
+}
+
+/// Bouton d'action secondaire : même taille que le bouton principal.
+pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
+    action_button(ui, None, label, true, ActionStyle::Secondary)
+}
+
+/// Bouton d'action destructrice : même taille que le bouton principal.
+pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
+    action_button(ui, None, label, true, ActionStyle::Danger)
+}
+
+/// Bouton d'action des fenêtres : 26 px de haut, mêmes marges et police pour tous.
+pub fn action_button(
+    ui: &mut Ui,
+    icon: Option<Icon>,
+    label: &str,
+    enabled: bool,
+    style: ActionStyle,
+) -> Response {
     let font = t::semibold(11.5);
     let galley = ui
         .painter()
@@ -570,14 +615,23 @@ pub fn primary_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: boo
             Sense::hover()
         },
     );
+    let hovered = resp.hovered() && enabled;
+    let (base, text) = match style {
+        ActionStyle::Primary => (t::ACCENT, Color32::BLACK),
+        ActionStyle::Secondary => (t::SURFACE_3, t::TEXT),
+        ActionStyle::Danger => (t::REC, Color32::BLACK),
+    };
     let bg = if !enabled {
         t::SURFACE_3
-    } else if resp.hovered() {
-        t::mix(t::ACCENT, Color32::WHITE, 0.15)
+    } else if hovered {
+        match style {
+            ActionStyle::Secondary => t::SURFACE_4,
+            _ => t::mix(base, Color32::WHITE, 0.15),
+        }
     } else {
-        t::ACCENT
+        base
     };
-    let fg = if enabled { Color32::BLACK } else { t::TEXT_3 };
+    let fg = if enabled { text } else { t::TEXT_3 };
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(t::R), bg);
     let mut x = rect.left() + 11.0;

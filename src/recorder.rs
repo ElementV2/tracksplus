@@ -192,7 +192,14 @@ impl Recorder {
         v
     }
 
+    /// Le thread disque tourne encore. `false` pendant une prise : il s'est arrêté
+    /// anormalement (plus rien n'est écrit), l'interface doit le signaler.
+    pub fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     /// Termine les fichiers (à appeler après `Engine::stop_record`).
+    /// `Recorder` est `Send` : l'arrêt peut se faire depuis un thread d'arrière-plan.
     /// N'attend jamais indéfiniment : si le disque ne répond plus, on rend la main à
     /// l'interface (les fichiers seront réparés par la récupération).
     pub fn finish(mut self) -> Result<Vec<RecResult>, FinishError> {
@@ -596,6 +603,42 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Le thread disque est vivant pendant la prise, et l'arrêt peut se faire depuis un
+    /// autre thread (`Recorder: Send`).
+    #[test]
+    fn alive_then_finished_from_another_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Recorder>();
+        let dir = std::env::temp_dir().join(format!("tp-alive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut prod, cons) = rtrb::RingBuffer::new(1000);
+        let rec = Recorder::start(
+            vec![RecSpec {
+                track_id: 1,
+                file: "a.wav".into(),
+                path: dir.join("a.wav"),
+                peaks: Arc::new(RwLock::new(PeakData::default())),
+                cons,
+                channels: 1,
+            }],
+            48000,
+            RecFormat::Int24,
+        )
+        .unwrap();
+        assert!(rec.is_alive());
+        for _ in 0..100 {
+            prod.push(0.2).unwrap();
+        }
+        drop(prod);
+        let res = std::thread::spawn(move || rec.finish())
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(res[0].frames(), 100);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Un fichier impossible à créer est signalé tout de suite ; les autres pistes
     /// continuent normalement et l'arrêt se passe sans blocage.
     #[test]
@@ -658,13 +701,26 @@ mod load_test {
     #[test]
     #[ignore]
     fn realtime_64_tracks() {
-        let dir = std::env::temp_dir().join(format!("tp-load-{}", std::process::id()));
+        realtime_load(64, 1, 48000, 10, RecFormat::Int24);
+    }
+
+    /// Charge plus lourde : 64 pistes **stéréo** à 96 kHz en 32 bits flottant
+    /// (128 canaux, ≈ 49 Mo/s vers le disque), cadence réelle.
+    /// `cargo test --release -- --ignored --nocapture charge_enregistrement`
+    #[test]
+    #[ignore]
+    fn charge_enregistrement_64_stereo_96k() {
+        realtime_load(64, 2, 96000, 10, RecFormat::Float32);
+    }
+
+    fn realtime_load(tracks: u64, channels: usize, sr: usize, secs: usize, format: RecFormat) {
+        let dir =
+            std::env::temp_dir().join(format!("tp-load-{}-{tracks}-{sr}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let sr = 48000usize;
         let mut prods = Vec::new();
         let mut specs = Vec::new();
-        for i in 0..64 {
-            let (p, c) = rtrb::RingBuffer::new(sr * 4);
+        for i in 0..tracks {
+            let (p, c) = rtrb::RingBuffer::new(sr * 4 * channels);
             prods.push(p);
             specs.push(RecSpec {
                 track_id: i,
@@ -672,13 +728,13 @@ mod load_test {
                 path: dir.join(format!("t{i}.wav")),
                 peaks: Arc::new(RwLock::new(PeakData::default())),
                 cons: c,
-                channels: 1,
+                channels: channels as u16,
             });
         }
-        let rec = Recorder::start(specs, sr as u32, RecFormat::Int24).unwrap();
+        let rec = Recorder::start(specs, sr as u32, format).unwrap();
         let block = 256;
-        let secs = 10;
         let start = Instant::now();
+        let mut min_free = usize::MAX;
         let mut overruns = 0;
         let mut sent = 0usize;
         while sent < sr * secs {
@@ -687,18 +743,38 @@ mod load_test {
                 std::thread::sleep(w);
             }
             for p in &mut prods {
-                if p.slots() < block {
+                min_free = min_free.min(p.slots());
+                let n = block * channels;
+                if p.slots() < n {
                     overruns += 1;
                     continue;
                 }
-                let chunk = p.write_chunk_uninit(block).unwrap();
-                chunk.fill_from_iter((0..block).map(|k| ((sent + k) as f32 * 0.01).sin() * 0.5));
+                let chunk = p.write_chunk_uninit(n).unwrap();
+                chunk.fill_from_iter(
+                    (0..n).map(|k| ((sent * channels + k) as f32 * 0.01).sin() * 0.5),
+                );
             }
             sent += block;
         }
         drop(prods);
         let res = rec.finish().unwrap();
+        let mb: u64 = std::fs::read_dir(&dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+            / 1_000_000;
         std::fs::remove_dir_all(&dir).ok();
+        let cap = sr * 4 * channels;
+        println!(
+            "enregistrement {tracks} pistes × {channels} canal(aux) à {} kHz : {mb} Mo en {secs} s, \
+             tampon jamais rempli à plus de {:.1} %, pertes : {overruns}",
+            sr / 1000,
+            (cap - min_free) as f64 / cap as f64 * 100.0
+        );
         assert_eq!(overruns, 0);
         assert!(res.iter().all(|r| r.frames()
             == (sr * secs).div_ceil(block) as u64 * block as u64

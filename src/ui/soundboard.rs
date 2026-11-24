@@ -123,7 +123,7 @@ impl App {
         (v > 0).then(|| v - 1)
     }
 
-    fn assign_files(&mut self, start_slot: u16, files: Vec<PathBuf>) {
+    pub fn assign_files(&mut self, start_slot: u16, files: Vec<PathBuf>) {
         let mut slot = start_slot as usize;
         let page = start_slot as usize / crate::sampler::PADS_PER_PAGE;
         // Uniquement les cases visibles de la grille (pas de pad caché).
@@ -141,6 +141,15 @@ impl App {
             if slot >= page_end {
                 break;
             }
+            // Le son est copié dans le dossier « Sons » de la session : la session garde
+            // tout ce qu'il lui faut, même si l'original est déplacé ou supprimé.
+            let f = match crate::soundboard::copy_into_session(&f, &self.project.dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.notify(format!("{e:#}"), true);
+                    continue;
+                }
+            };
             let color = (slot % t::PALETTE.len()) as u8;
             let old = self.board.pad(slot as u16).cloned();
             if old.is_some() {
@@ -284,11 +293,17 @@ impl App {
                     }
                 }
             }
-            self.midi.shared.lock().map = map;
+            self.midi.set_map(map);
         }
         self.release_held_keys(ctx);
-        // LED du contrôleur : état de chaque pad associé à un contrôle MIDI.
-        if self.board.led_mode != LedMode::Off
+        // LED du contrôleur : état de chaque pad associé à un contrôle MIDI (30 fois par
+        // seconde au plus : largement assez pour l'œil, et peu de calcul).
+        let led_due = self.now - self.sb.led_at >= 1.0 / 30.0;
+        if led_due {
+            self.sb.led_at = self.now;
+        }
+        if !led_due {
+        } else if self.board.led_mode != LedMode::Off
             && let Some(g) = grid
         {
             // Grille du contrôleur : LED de la page affichée, et boutons de page.
@@ -382,6 +397,14 @@ impl App {
             }
             if key == Key::Escape && pressed {
                 self.stop_all_pads();
+                continue;
+            }
+            if key == Key::Delete && pressed {
+                if let Some(slot) = self.sb.selected
+                    && self.board.pad(slot).is_some()
+                {
+                    self.delete_pad(slot);
+                }
                 continue;
             }
             if pressed {
@@ -540,19 +563,11 @@ impl App {
                 ));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Annuler").clicked() {
+                    if w::secondary_button(ui, "Annuler").clicked() {
                         keep = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Supprimer").color(Color32::BLACK),
-                                )
-                                .fill(t::REC),
-                            )
-                            .clicked()
-                        {
+                        if w::danger_button(ui, "Supprimer").clicked() {
                             delete = true;
                         }
                     });
@@ -1237,9 +1252,7 @@ impl App {
                     ui.close();
                 }
                 if ui.button("Remplacer le son…").clicked() {
-                    if let Some(f) = pick_audio_files(false) {
-                        self.assign_files(slot, f);
-                    }
+                    self.open_browser(slot, false);
                     ui.close();
                 }
                 if ui.button("Écouter").clicked() {
@@ -1250,13 +1263,11 @@ impl App {
                     self.engine.pad(PadCmd::Stop { slot });
                     ui.close();
                 }
-                if ui.button("Supprimer le pad").clicked() {
-                    self.engine.pad(PadCmd::Stop { slot });
-                    self.board.set(slot, None);
-                    if self.sb.selected == Some(slot) {
-                        self.sb.selected = None;
-                    }
-                    self.board_modified();
+                if ui
+                    .add(egui::Button::new("Supprimer le pad").shortcut_text("Suppr"))
+                    .clicked()
+                {
+                    self.delete_pad(slot);
                     ui.close();
                 }
             });
@@ -1501,10 +1512,8 @@ impl App {
                 self.assign_files(s, dropped);
             }
         }
-        if let Some(s) = empty_clicked
-            && let Some(f) = pick_audio_files(true)
-        {
-            self.assign_files(s, f);
+        if let Some(s) = empty_clicked {
+            self.open_browser(s, true);
         }
     }
 
@@ -1533,14 +1542,12 @@ impl App {
             pos2(full.right() - col_b_w - 24.0, full.bottom()),
         );
         let col_b = Rect::from_min_max(pos2(full.right() - col_b_w, full.top()), full.max);
-        let before = format!("{pad:?}");
+        let before = pad.clone();
 
         // ---- forme d'onde
         let mut wui = ui.new_child(UiBuilder::new().max_rect(wave_rect));
         self.wave_editor(&mut wui, slot, &mut pad, sample.as_ref());
 
-        let mut delete = false;
-        let mut replace = false;
         let dur = sample
             .as_ref()
             .map_or(3600.0, |s| s.frames as f64 / s.sample_rate as f64);
@@ -1770,30 +1777,24 @@ impl App {
                 }
                 ui.end_row();
             });
-        ub.horizontal(|ui| {
-            if ui.button("Remplacer le son…").clicked() {
-                replace = true;
-            }
-            if ui.button("Supprimer le pad").clicked() {
-                delete = true;
-            }
-        });
-
         sanitize(&mut pad, sample.as_deref());
-        if delete {
-            self.engine.pad(PadCmd::Stop { slot });
-            self.board.set(slot, None);
-            self.sb.selected = None;
-            self.board_modified();
-            return;
-        }
-        if format!("{pad:?}") != before {
+        if pad != before {
             self.board.set(slot, Some(pad));
             self.board_modified();
         }
-        if replace && let Some(f) = pick_audio_files(false) {
-            self.assign_files(slot, f);
+    }
+
+    /// Supprime un pad (Suppr, ou clic droit → « Supprimer le pad »).
+    pub fn delete_pad(&mut self, slot: u16) {
+        self.engine.pad(PadCmd::Stop { slot });
+        self.board.set(slot, None);
+        if self.sb.selected == Some(slot) {
+            self.sb.selected = None;
         }
+        if self.sb.renaming.as_ref().is_some_and(|(s, _)| *s == slot) {
+            self.sb.renaming = None;
+        }
+        self.board_modified();
     }
 
     fn wave_editor(
@@ -2130,15 +2131,6 @@ fn sanitize(pad: &mut Pad, s: Option<&SampleData>) {
     let len = (end - pad.start).max(0.0);
     pad.fade_in = pad.fade_in.clamp(0.0, len);
     pad.fade_out = pad.fade_out.clamp(0.0, (len - pad.fade_in).max(0.0));
-}
-
-fn pick_audio_files(multiple: bool) -> Option<Vec<PathBuf>> {
-    let d = rfd::FileDialog::new().add_filter("Audio", &crate::soundboard::AUDIO_EXTENSIONS);
-    if multiple {
-        d.pick_files()
-    } else {
-        d.pick_file().map(|f| vec![f])
-    }
 }
 
 #[cfg(test)]

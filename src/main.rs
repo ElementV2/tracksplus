@@ -10,6 +10,7 @@ mod recorder;
 mod recovery;
 mod render;
 mod sampler;
+mod sessions;
 mod soundboard;
 mod ui;
 mod update;
@@ -83,12 +84,45 @@ fn focus_existing_window() {
 #[cfg(not(windows))]
 fn focus_existing_window() {}
 
+/// Au-delà de cette taille, crash.log est renommé en crash.old.log (l'ancien est remplacé).
+const CRASH_LOG_MAX: u64 = 1024 * 1024;
+
+/// Une même erreur (message + emplacement) n'est notée qu'une fois par seconde : une
+/// erreur répétée à chaque image ne remplit pas le disque.
+fn crash_log_allowed(
+    recent: &mut std::collections::HashMap<String, std::time::Instant>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    let window = std::time::Duration::from_secs(1);
+    recent.retain(|_, t| now.saturating_duration_since(*t) < window);
+    if recent.contains_key(key) {
+        return false;
+    }
+    recent.insert(key.to_string(), now);
+    true
+}
+
 /// Écrit les erreurs internes dans un journal (dossier de configuration) pour diagnostic.
 fn install_crash_log() {
     let default = std::panic::take_hook();
+    let last = std::sync::Mutex::new(std::collections::HashMap::new());
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(dir) = dirs::config_dir().map(|d| d.join("TracksPlus")) {
+        let key = format!(
+            "{}|{}",
+            info.location().map(|l| l.to_string()).unwrap_or_default(),
+            info.payload_as_str().unwrap_or("")
+        );
+        let allowed = match last.lock() {
+            Ok(mut l) => crash_log_allowed(&mut l, &key, std::time::Instant::now()),
+            Err(_) => false,
+        };
+        if allowed && let Some(dir) = dirs::config_dir().map(|d| d.join("TracksPlus")) {
             let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("crash.log");
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > CRASH_LOG_MAX) {
+                let _ = std::fs::rename(&path, dir.join("crash.old.log"));
+            }
             let bt = std::backtrace::Backtrace::force_capture();
             let line = format!(
                 "[{}] {info}\n{bt}\n\n",
@@ -98,7 +132,7 @@ fn install_crash_log() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(dir.join("crash.log"))
+                .open(&path)
             {
                 let _ = f.write_all(line.as_bytes());
             }
@@ -131,4 +165,24 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn crash_log_deduplicates_within_a_second() {
+        let mut recent = std::collections::HashMap::new();
+        let t = Instant::now();
+        let at = |ms| t + Duration::from_millis(ms);
+        assert!(crash_log_allowed(&mut recent, "a.rs:1|boom", at(0)));
+        assert!(!crash_log_allowed(&mut recent, "a.rs:1|boom", at(500)));
+        // Une autre erreur passe, sans relancer la première.
+        assert!(crash_log_allowed(&mut recent, "b.rs:2|autre", at(600)));
+        assert!(!crash_log_allowed(&mut recent, "a.rs:1|boom", at(700)));
+        assert!(crash_log_allowed(&mut recent, "a.rs:1|boom", at(1100)));
+        assert!(!crash_log_allowed(&mut recent, "b.rs:2|autre", at(1200)));
+    }
 }

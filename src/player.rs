@@ -7,9 +7,16 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const BLOCK: usize = 1024;
+/// Trames lues par piste à chaque passe : de gros blocs limitent les allers-retours de
+/// la tête de lecture quand beaucoup de fichiers sont sur le même disque.
+const BLOCK: usize = 4096;
+/// Réserve du tampon de lecture (secondes).
+const RING_SECS: usize = 3;
+/// Avance minimale avant de lancer la lecture (ms), et attente maximale pour l'obtenir.
+const PREFILL_MS: usize = 200;
+const PREFILL_WAIT: Duration = Duration::from_millis(400);
 
 pub struct Player {
     /// Piste audible (mute / solo), indexée comme `project.tracks` au démarrage.
@@ -63,7 +70,8 @@ impl Mixer {
 impl Player {
     /// Prépare la lecture à partir de `pos`. Le consommateur est à donner au moteur.
     pub fn start(project: &Project, pos: u64, audible: Vec<bool>) -> (Self, Consumer<f32>) {
-        let cap = (project.sample_rate as usize / 2).max(BLOCK * 4) * 2;
+        let sr = project.sample_rate as usize;
+        let cap = (sr * RING_SECS).max(BLOCK * 4) * 2;
         let audible: Arc<Vec<AtomicBool>> =
             Arc::new(audible.into_iter().map(AtomicBool::new).collect());
         let (mut prod, cons) = RingBuffer::new(cap);
@@ -78,12 +86,6 @@ impl Player {
             tbuf: vec![0.0; BLOCK * 2],
             mix: vec![0.0; BLOCK * 2],
         };
-        // Pré-remplissage pour éviter un trou au démarrage.
-        // Petit pré-remplissage sur le thread appelant (le reste se fait en arrière-plan),
-        // pour ne pas bloquer l'interface à chaque déplacement de la tête.
-        for _ in 0..2 {
-            mixer.fill(&mut prod);
-        }
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let handle = std::thread::Builder::new()
@@ -96,6 +98,13 @@ impl Player {
                 }
             })
             .expect("thread de lecture");
+        // Pré-remplissage (~200 ms) par le thread disque avant de rendre la main : pas de
+        // trou au démarrage, et une attente bornée pour ne pas figer l'interface.
+        let prefill = (sr * PREFILL_MS / 1000).min(cap / 2 - BLOCK) * 2;
+        let deadline = Instant::now() + PREFILL_WAIT;
+        while cons.slots() < prefill && Instant::now() < deadline && !handle.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         (
             Self {
                 audible,
@@ -110,7 +119,11 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
+        // Le thread s'arrête de lui-même dès qu'il voit le drapeau : on n'attend pas (un
+        // disque lent figerait l'interface au Stop).
+        if let Some(h) = self.handle.take()
+            && h.is_finished()
+        {
             let _ = h.join();
         }
     }

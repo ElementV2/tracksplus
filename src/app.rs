@@ -163,6 +163,25 @@ pub struct NewSessionDialog {
     pub keep_tracks: bool,
 }
 
+/// Fin de prise en cours en arrière-plan.
+pub struct Finishing {
+    rx: std::sync::mpsc::Receiver<Result<Vec<RecResult>, FinishError>>,
+    start: u64,
+    released: bool,
+}
+
+/// Résultat d'un « Enregistrer sous » : session copiée, soundboard adopté, sons introuvables.
+pub type SaveAsDone = (Project, Board, Vec<PathBuf>);
+
+/// Raccourci de choix des pistes à exporter (`Custom` = cochées à la main).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackChoice {
+    All,
+    None,
+    Timeline,
+    Custom,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RangeChoice {
     All,
@@ -213,6 +232,8 @@ pub struct SbState {
     pub layout_port: Option<String>,
     /// Fenêtre « Réglages du soundboard » ouverte.
     pub settings_open: bool,
+    /// Dernier envoi des LED du contrôleur.
+    pub led_at: f64,
     /// Pad renommé directement dans la grille (double-clic) : emplacement, nom en cours.
     pub renaming: Option<(u16, String)>,
 }
@@ -241,6 +262,25 @@ pub struct App {
     pub expanded_tracks: HashSet<u64>,
     /// Dialogue « Nouvelles pistes » ouvert.
     pub tracks_dlg: Option<NewTracksDialog>,
+    /// Fin de prise en cours dans un thread (écriture du reste et fermeture des fichiers) :
+    /// l'interface ne se fige pas au Stop.
+    pub finishing: Option<Finishing>,
+    /// « Enregistrer sous » en cours dans un thread (copie des fichiers).
+    pub save_as_job: Option<std::sync::mpsc::Receiver<Result<SaveAsDone, String>>>,
+    /// Le disque n'a pas répondu à la fin d'une prise : son thread d'écriture tourne peut-être
+    /// encore, on n'enregistre plus avant un redémarrage (récupération propre).
+    pub disk_stalled: bool,
+    /// Dernière alerte « sauvegarde impossible » (pour ne pas la répéter en boucle).
+    pub save_error_at: f64,
+    /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
+    pub rec_latency: u64,
+    /// Explorateur intégré (sons d'un pad, session à ouvrir).
+    pub browser: Option<crate::ui::browser::FileBrowser>,
+    /// Écran d'accueil (au lancement, ou depuis le menu).
+    pub welcome: Option<crate::ui::welcome::Welcome>,
+    /// Lancement : écran d'accueil en pleine page, aucune session affichée tant que
+    /// l'utilisateur n'a pas choisi.
+    pub start_screen: bool,
     /// Mises à jour : recherche / téléchargement, réglages, fenêtre ouverte.
     pub updater: crate::update::Updater,
     pub update_settings: crate::update::Settings,
@@ -289,7 +329,6 @@ pub struct App {
     pub awake: Option<keepawake::KeepAwake>,
     // Soundboard
     pub board: Board,
-    pub board_path: PathBuf,
     pub board_changed: Option<f64>,
     pub cache: SampleCache,
     pub midi: Midi,
@@ -314,7 +353,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         t::apply(&cc.egui_ctx);
         let mut prefs = AudioPrefs::load();
-        let board = Board::load_default();
+        // Réglages du contrôleur (communs) ; les pads viennent de la session ouverte.
+        let board = Board::load_devices();
         // Reprise : la sortie du soundboard était enregistrée avec le soundboard ; elle est
         // désormais dans les réglages audio, avec les autres sorties.
         if prefs.pad_output.is_none()
@@ -391,6 +431,14 @@ impl App {
 
             stop_armed_until: 0.0,
             confirm_close: false,
+            welcome: None,
+            finishing: None,
+            save_as_job: None,
+            disk_stalled: false,
+            save_error_at: f64::NEG_INFINITY,
+            rec_latency: 0,
+            browser: None,
+            start_screen: false,
             updater: Default::default(),
             update_settings: crate::update::Settings::load(),
             update_dlg: false,
@@ -399,7 +447,6 @@ impl App {
             rec_watch: (0, 0.0),
             last_autosave: 0.0,
             awake: None,
-            board_path: Board::default_path().unwrap_or_else(|| PathBuf::from("soundboard.json")),
             board,
             board_changed: None,
             cache,
@@ -429,7 +476,25 @@ impl App {
         }
         // Enregistrement interrompu lors de la dernière utilisation : on restaure.
         if let Some(path) = recovery::interrupted_session() {
-            app.load_session(&path);
+            // Protégé : une session illisible ne doit pas empêcher l'application de démarrer
+            // (sinon elle planterait à chaque lancement, le journal étant toujours là).
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                app.load_session(&path);
+            }))
+            .is_ok();
+            if !ok {
+                app.notify(
+                    format!(
+                        "Récupération de « {} » impossible : ouvrez-la à la main",
+                        path.display()
+                    ),
+                    true,
+                );
+            }
+        } else if err.is_none() && crate::sessions::StartupPrefs::load().show_welcome {
+            // Écran d'accueil : reprendre, créer, ouvrir ou choisir une session.
+            app.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&cc.egui_ctx));
+            app.start_screen = true;
         }
         if let Some(e) = err {
             let mut d = AudioDialog::new(&app.prefs);
@@ -464,7 +529,14 @@ impl App {
         self.sb.midi_dirty = true;
     }
 
+    /// Libère de la mémoire les sons qu'aucun pad n'utilise plus.
+    fn retain_sounds(&mut self) {
+        let keep: HashSet<PathBuf> = self.board.all_pads().map(|(_, p)| p.path.clone()).collect();
+        self.cache.retain(&keep);
+    }
+
     pub fn board_modified(&mut self) {
+        self.retain_sounds();
         self.board_changed = Some(self.now);
         self.sb.midi_dirty = true;
     }
@@ -472,7 +544,7 @@ impl App {
     // ---------------------------------------------------------------- transport
 
     pub fn is_stopped(&self) -> bool {
-        self.transport == Transport::Stopped
+        self.transport == Transport::Stopped && self.finishing.is_none()
     }
 
     pub fn is_recording(&self) -> bool {
@@ -526,6 +598,17 @@ impl App {
     }
 
     pub fn record(&mut self) {
+        if self.finishing.is_some() {
+            self.notify("Finalisation de la prise précédente en cours…", false);
+            return;
+        }
+        if self.disk_stalled {
+            self.notify(
+                "Le disque ne répondait plus à la fin de la dernière prise : relancez TracksPlus avant d'enregistrer à nouveau (les prises seront récupérées)",
+                true,
+            );
+            return;
+        }
         if !self.is_stopped() {
             if matches!(self.transport, Transport::Playing { .. }) {
                 self.stop();
@@ -631,7 +714,12 @@ impl App {
                 })
                 .collect(),
         };
-        let _ = self.project.save();
+        if let Err(e) = self.project.save() {
+            self.notify(
+                format!("Attention : session non sauvegardée avant la prise ({e:#})"),
+                true,
+            );
+        }
         recovery::remember_session(&self.project);
         if let Err(e) = recovery::write_journal(&self.project.dir, &journal) {
             self.notify(
@@ -658,11 +746,15 @@ impl App {
             self.notify(format!("{e:#}"), true);
             return;
         }
+        self.rec_latency = 0;
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
                 Player::start(&self.project, self.playhead, self.project.audible());
             self.engine.start_playback(cons);
             self.player = Some(player);
+            // Enregistrement sur des pistes existantes : la prise arrive en retard de la
+            // latence entrée + sortie de la carte. On la recale à la fin de la prise.
+            self.rec_latency = self.engine.round_trip_latency() as u64;
         }
         self.recorder = Some(recorder);
         // Pas de mise en veille pendant la prise (sans effet si le système refuse).
@@ -709,14 +801,45 @@ impl App {
                     .stop_record(std::time::Duration::from_millis(1500));
                 self.engine.stop_playback();
                 self.player = None;
-                // 2) Le thread disque écrit tout ce qui reste puis ferme les fichiers.
-                let finished = self.recorder.take().map(Recorder::finish);
+                // 2) Le thread disque écrit tout ce qui reste puis ferme les fichiers, dans
+                //    un thread : l'interface ne se fige pas, même si le disque est lent.
                 self.awake = None;
-                self.live_takes_to_clips(start, finished, released);
+                match self.recorder.take() {
+                    Some(rec) => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(rec.finish());
+                        });
+                        self.finishing = Some(Finishing {
+                            rx,
+                            start,
+                            released,
+                        });
+                    }
+                    None => self.live_takes_to_clips(start, None, released),
+                }
             }
         }
         self.transport = Transport::Stopped;
         self.engine.shared.counting.store(false, Ordering::Relaxed);
+    }
+
+    /// Fin de prise terminée en arrière-plan : on intègre les prises. `wait` : attendre
+    /// (fermeture de l'application).
+    fn poll_finishing(&mut self, wait: bool) {
+        let Some(f) = &self.finishing else {
+            return;
+        };
+        let res = if wait {
+            f.rx.recv_timeout(std::time::Duration::from_secs(15)).ok()
+        } else {
+            f.rx.try_recv().ok()
+        };
+        let Some(res) = res else {
+            return;
+        };
+        let f = self.finishing.take().expect("prise en finalisation");
+        self.live_takes_to_clips(f.start, Some(res), f.released);
     }
 
     /// Ajoute les prises terminées à la session, la sauvegarde et nettoie le journal.
@@ -731,6 +854,8 @@ impl App {
             Some(Err(FinishError::Timeout)) => {
                 // Le disque ne répond plus : surtout ne pas bloquer l'interface. Le journal est
                 // conservé ; les prises seront réparées et réintégrées à la prochaine ouverture.
+                // Le thread d'écriture tourne peut-être encore : pas de nouvelle prise d'ici là.
+                self.disk_stalled = true;
                 self.live.clear();
                 self.engine.shared.overruns.store(0, Ordering::Relaxed);
                 self.notify(
@@ -756,6 +881,8 @@ impl App {
         };
         let mut errors = Vec::new();
         let mut max_len = 0;
+        // Recalage des prises faites en écoutant d'autres pistes (latence aller-retour).
+        let lat = std::mem::take(&mut self.rec_latency);
         for r in results {
             if let Some(e) = &r.error {
                 errors.push(e.clone());
@@ -768,7 +895,7 @@ impl App {
             // Une prise longue peut être répartie sur plusieurs fichiers : une prise par
             // fichier, posées bout à bout.
             let mut pos = start;
-            for seg in &r.segments {
+            for (k, seg) in r.segments.iter().enumerate() {
                 if seg.frames == 0 {
                     let _ = std::fs::remove_file(self.project.audio_dir().join(&seg.file));
                     continue;
@@ -777,29 +904,37 @@ impl App {
                 if let Some(p) = &peaks {
                     // La forme d'onde en direct couvre toute la prise ; chaque fichier en a
                     // une à lui, calculée à part pour rester exacte.
+                    let path = self.project.audio_dir().join(&seg.file);
                     if r.segments.len() == 1 {
+                        // Fichier fermé : sa forme d'onde est mise en cache pour les
+                        // prochaines ouvertures de la session.
+                        render::store_peaks(&path, &p.read());
                         self.peaks.insert(id, p.clone());
                     } else {
                         let pk: Peaks = Arc::new(RwLock::new(PeakData::default()));
-                        let path = self.project.audio_dir().join(&seg.file);
-                        let pk2 = pk.clone();
-                        std::thread::spawn(move || render::compute_peaks(&path, &pk2));
+                        render::request_peaks(path, pk.clone());
                         self.peaks.insert(id, pk);
                     }
                 }
+                // Début du premier fichier sauté de la latence : la prise tombe en place.
+                let skip = if k == 0 {
+                    lat.min(seg.frames.saturating_sub(project::MIN_CLIP))
+                } else {
+                    0
+                };
                 if let Some(tr) = self.project.track_mut(r.track_id) {
                     tr.clips.push(Clip {
                         id,
                         file: seg.file.clone(),
                         start: pos,
-                        offset: 0,
-                        len: seg.frames,
+                        offset: skip,
+                        len: seg.frames - skip,
                         src_len: seg.frames,
                         fade_in: 0,
                         fade_out: 0,
                     });
                 }
-                pos += seg.frames;
+                pos += seg.frames - skip;
             }
             max_len = max_len.max(r.frames());
         }
@@ -815,10 +950,11 @@ impl App {
         // Décrochages du pilote pendant la prise (ils restent affichés en bas d'écran).
         let xruns = self.engine.shared.xruns.load(Ordering::Relaxed);
         if !errors.is_empty() {
-            self.notify(
-                format!("Erreur d'enregistrement : {}", errors.join(" ; ")),
-                true,
-            );
+            let mut msg = format!("Erreur d'enregistrement : {}", errors.join(" ; "));
+            if let Err(e) = &save {
+                msg += &format!(" · Session non sauvegardée : {e:#}");
+            }
+            self.notify(msg, true);
         } else if let Err(e) = save {
             self.notify(format!("Sauvegarde de la session impossible (les fichiers sont bien sur le disque) : {e:#}"), true);
         } else if overruns > 0 {
@@ -874,6 +1010,12 @@ impl App {
         if !self.is_recording() {
             self.rec_watch = (0, self.now);
             return alerts;
+        }
+        if self.recorder.as_ref().is_some_and(|r| !r.is_alive()) {
+            alerts.push(
+                "Écriture disque arrêtée (erreur interne) : arrêtez la prise, elle sera récupérée"
+                    .into(),
+            );
         }
         let frames = self.engine.shared.rec_frames.load(Ordering::Relaxed);
         if frames != self.rec_watch.0 {
@@ -1121,9 +1263,9 @@ impl App {
                     .entry(c.file.clone())
                     .or_insert_with(|| {
                         let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
-                        let path = self.project.clip_path(c);
-                        let p2 = p.clone();
-                        std::thread::spawn(move || render::compute_peaks(&path, &p2));
+                        // File d'attente (2 threads) et cache sur le disque : rouvrir une
+                        // session ne relit plus tout l'audio.
+                        render::request_peaks(self.project.clip_path(c), p.clone());
                         p
                     })
                     .clone();
@@ -1138,18 +1280,143 @@ impl App {
         self.project.has_audio() || self.project.file_path().exists()
     }
 
-    fn autosave(&mut self) {
-        if self.project.dirty && self.worth_saving() {
-            let _ = self.project.save();
+    pub fn autosave(&mut self) {
+        if self.project.dirty
+            && self.worth_saving()
+            && let Err(e) = self.project.save()
+        {
+            self.save_failed(e);
         }
         self.save_board_now();
     }
 
+    /// Sauvegarde automatique impossible (disque plein, clé retirée…) : on le dit, sans
+    /// répéter le message en boucle. La session reste marquée « modifiée ».
+    fn save_failed(&mut self, e: anyhow::Error) {
+        self.project.dirty = true;
+        if self.now - self.save_error_at > 30.0 {
+            self.save_error_at = self.now;
+            self.notify(format!("Sauvegarde de la session impossible : {e:#}"), true);
+        }
+    }
+
+    /// Enregistre le soundboard : réglages du contrôleur pour l'ordinateur, pads dans la
+    /// session (qui est créée sur le disque si c'est son premier contenu).
     pub fn save_board_now(&mut self) {
-        if self.board_changed.take().is_some()
-            && let Err(e) = self.board.save(&self.board_path.clone())
-        {
+        if self.board_changed.take().is_none() {
+            return;
+        }
+        if let Err(e) = self.board.save_devices() {
+            self.notify(
+                format!("Réglages du soundboard non sauvegardés : {e:#}"),
+                true,
+            );
+        }
+        if !self.board.has_pads() && !self.project.file_path().exists() {
+            return;
+        }
+        if !self.project.file_path().exists() {
+            if let Err(e) = self.project.save() {
+                self.notify(format!("{e:#}"), true);
+                return;
+            }
+            recovery::remember_session(&self.project);
+        }
+        if let Err(e) = self.board.save_session(&self.project.dir) {
             self.notify(format!("Soundboard non sauvegardé : {e:#}"), true);
+        }
+    }
+
+    /// Soundboard de la session qui vient d'être ouverte ou créée (les réglages du
+    /// contrôleur restent ceux de l'ordinateur).
+    fn load_session_board(&mut self) {
+        self.engine.pad(PadCmd::StopAll { fade: 0 });
+        let fresh = !self
+            .project
+            .dir
+            .join(crate::soundboard::BOARD_FILE)
+            .exists();
+        let mut b = match Board::load_session(&self.project.dir) {
+            Ok(b) => b,
+            Err(e) => {
+                self.notify(format!("Soundboard de la session illisible : {e:#}"), true);
+                Board::default()
+            }
+        };
+        b.take_devices(&self.board);
+        if fresh {
+            // Nouvelle session : même taille de grille que jusqu'ici.
+            b.cols = self.board.cols;
+            b.rows = self.board.rows;
+        }
+        self.set_board(b);
+    }
+
+    /// Remplace le soundboard affiché (sons à charger, MIDI, sortie).
+    fn set_board(&mut self, b: Board) {
+        self.engine.pad(PadCmd::StopAll { fade: 0 });
+        self.board = b;
+        self.retain_sounds();
+        self.board_changed = None;
+        self.sb.selected = None;
+        self.sb.page = 0;
+        self.sb.renaming = None;
+        self.sb.drag_pad = None;
+        self.sb.learn_key = None;
+        self.sb.learn_midi = None;
+        self.sb.held_keys.clear();
+        self.sb.midi_dirty = true;
+        let paths: Vec<PathBuf> = self.board.all_pads().map(|(_, p)| p.path.clone()).collect();
+        for p in paths {
+            self.cache.request(&p, None);
+        }
+        self.sync_engine_to_board();
+    }
+
+    /// Importe un soundboard (ancien soundboard commun, ou celui d'une autre session) dans
+    /// la session en cours : ses sons y sont copiés.
+    fn import_board(&mut self) {
+        let start = Board::legacy_backup_path()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(project::default_sessions_root);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Importer un soundboard")
+            .add_filter("Soundboard", &["json"])
+            .set_directory(start)
+            .pick_file()
+        else {
+            return;
+        };
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut b = match Board::load(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.notify(format!("{e:#}"), true);
+                return;
+            }
+        };
+        for page in &mut b.pages {
+            for pad in page.pads.iter_mut().flatten() {
+                if pad.path.is_relative() {
+                    pad.path = dir.join(&pad.path);
+                }
+            }
+        }
+        let missing = b.adopt_sounds(&self.project.dir);
+        b.take_devices(&self.board);
+        self.set_board(b);
+        self.board_changed = Some(self.now);
+        self.save_board_now();
+        if missing.is_empty() {
+            self.notify("Soundboard importé dans la session", false);
+        } else {
+            self.notify(
+                format!(
+                    "Soundboard importé · {} son(s) introuvable(s), pads à refaire",
+                    missing.len()
+                ),
+                true,
+            );
         }
     }
 
@@ -1164,18 +1431,10 @@ impl App {
         self.selected_tracks.clear();
     }
 
+    /// « Ouvrir une session… » : explorateur intégré (la session choisie s'ouvre).
     pub fn open_session(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Ouvrir une session")
-            .add_filter("Session TracksPlus", &[PROJECT_EXT])
-            .set_directory(project::default_sessions_root())
-            .pick_file()
-        else {
-            return;
-        };
-        self.stop();
-        self.autosave();
-        self.load_session(&path);
+        self.close_dialogs();
+        self.open_session_browser();
     }
 
     /// Charge une session (et récupère les prises d'un enregistrement interrompu).
@@ -1183,7 +1442,9 @@ impl App {
         match Project::load(path) {
             Ok(mut p) => {
                 let recovered = recovery::recover(&mut p);
+                self.start_screen = false;
                 self.project = p;
+                self.load_session_board();
                 self.reset_view_for_session();
                 self.load_peaks();
                 recovery::remember_session(&self.project);
@@ -1222,10 +1483,13 @@ impl App {
 
     pub fn save(&mut self) {
         match self.project.save() {
-            Ok(()) => self.notify(
-                format!("Enregistré · {}", self.project.dir.display()),
-                false,
-            ),
+            Ok(()) => {
+                crate::sessions::remember(&self.project.file_path());
+                self.notify(
+                    format!("Enregistré · {}", self.project.dir.display()),
+                    false,
+                )
+            }
             Err(e) => self.notify(format!("{e:#}"), true),
         }
     }
@@ -1240,13 +1504,77 @@ impl App {
         };
         let name = self.project.name.clone();
         let dir = parent.join(project::sanitize(&name));
-        match self.project.save_as(dir, name) {
-            Ok(()) => self.notify(
-                format!("Session enregistrée · {}", self.project.dir.display()),
-                false,
-            ),
-            Err(e) => self.notify(format!("{e:#}"), true),
+        // Copie des prises et des sons dans un thread (fenêtre de progression) : l'interface
+        // ne se fige pas, même avec des Go d'audio.
+        let mut p = self.project.clone();
+        let mut b = self.board.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = p
+                .save_as(dir, name)
+                .map(|()| {
+                    let missing = b.adopt_sounds(&p.dir);
+                    (p, b, missing)
+                })
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        self.save_as_job = Some(rx);
+    }
+
+    /// « Enregistrer sous » terminé : la copie devient la session ouverte.
+    fn poll_save_as(&mut self) {
+        let Some(rx) = &self.save_as_job else {
+            return;
+        };
+        let Ok(res) = rx.try_recv() else {
+            return;
+        };
+        self.save_as_job = None;
+        match res {
+            Ok((p, b, missing)) => {
+                self.project = p;
+                if !missing.is_empty() {
+                    self.notify(
+                        format!("{} son(s) du soundboard introuvable(s)", missing.len()),
+                        true,
+                    );
+                }
+                self.set_board(b);
+                self.board_changed = Some(self.now);
+                self.save_board_now();
+                recovery::remember_session(&self.project);
+                self.notify(
+                    format!("Session enregistrée · {}", self.project.dir.display()),
+                    false,
+                );
+            }
+            Err(e) => self.notify(e, true),
         }
+    }
+
+    fn save_as_dialog(&mut self, ctx: &egui::Context) {
+        if self.save_as_job.is_none() {
+            return;
+        }
+        egui::Modal::new(egui::Id::unique("save_as_job"))
+            .frame(t::window_frame())
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(16.0).color(t::ACCENT));
+                    ui.label(
+                        egui::RichText::new("Enregistrement de la session…")
+                            .font(t::semibold(14.0)),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Copie des prises et des sons dans le nouveau dossier.")
+                        .color(t::TEXT_3),
+                );
+            });
+        ctx.request_repaint();
     }
 
     fn create_session(&mut self, d: NewSessionDialog) {
@@ -1273,9 +1601,12 @@ impl App {
             self.notify(format!("{e:#}"), true);
             return;
         }
+        self.start_screen = false;
         self.project = p;
+        self.load_session_board();
         self.peaks.clear();
         self.reset_view_for_session();
+        recovery::remember_session(&self.project);
         self.notify(format!("Nouvelle session « {} »", self.project.name), false);
     }
 
@@ -1461,6 +1792,11 @@ impl App {
         self.export_dlg = None;
         self.new_dlg = None;
         self.update_dlg = false;
+        self.browser = None;
+        // Échap sur l'accueil du lancement : on continue avec une session vide.
+        if self.welcome.take().is_some() {
+            self.start_screen = false;
+        }
     }
 
     pub fn dialog_open(&self) -> bool {
@@ -1471,6 +1807,9 @@ impl App {
             || self.new_dlg.is_some()
             || self.export_job.is_some()
             || self.update_dlg
+            || self.welcome.is_some()
+            || self.browser.is_some()
+            || self.save_as_job.is_some()
     }
 
     pub fn zoom_to_fit(&mut self) {
@@ -1561,6 +1900,31 @@ impl App {
         sh.monitor_on.store(any, Ordering::Relaxed);
     }
 
+    /// Quelque chose bouge à l'écran : transport, prise, vumètres, pads, messages…
+    fn needs_animation(&self) -> bool {
+        const QUIET: f32 = 1e-4; // ≈ -80 dB
+        let meters = self
+            .in_meters
+            .iter()
+            .chain(self.master_play.iter())
+            .chain(self.master_pad.iter())
+            .any(|m| m.level > QUIET || m.hold > QUIET);
+        let pads = self
+            .engine
+            .shared
+            .pad_pos
+            .iter()
+            .any(|p| p.load(Ordering::Relaxed) != 0);
+        !self.is_stopped()
+            || meters
+            || pads
+            || self.toast.is_some()
+            || self.updater.busy()
+            || self.export_job.is_some()
+            || self.save_as_job.is_some()
+            || self.sb.drag_pad.is_some()
+    }
+
     fn update_meters(&mut self) {
         self.sync_monitoring();
         // Temps réellement écoulé depuis l'image précédente (et non la durée « prévue »
@@ -1592,11 +1956,15 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let tt = format!(
-            "{}{} — TracksPlus",
-            self.project.name,
-            if self.project.dirty { " •" } else { "" }
-        );
+        let tt = if self.start_screen {
+            "TracksPlus".to_string()
+        } else {
+            format!(
+                "{}{} — TracksPlus",
+                self.project.name,
+                if self.project.dirty { " •" } else { "" }
+            )
+        };
         if tt != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(tt.clone()));
             self.title = tt;
@@ -1879,6 +2247,12 @@ impl App {
             self.open_session();
         }
         if ui
+            .add_enabled(stopped, egui::Button::new("Sessions récentes…"))
+            .clicked()
+        {
+            self.open_welcome();
+        }
+        if ui
             .add(egui::Button::new("Enregistrer").shortcut_text("Ctrl+S"))
             .clicked()
         {
@@ -1941,41 +2315,13 @@ impl App {
                 .font(t::semibold(10.5))
                 .color(t::TEXT_3),
         );
-        if ui.button("Ouvrir un soundboard…").clicked()
-            && let Some(p) = rfd::FileDialog::new()
-                .add_filter("Soundboard", &["json"])
-                .pick_file()
+        if ui
+            .button("Importer un soundboard…")
+            .on_hover_text("Reprend les pads d'un autre soundboard (ancien soundboard, autre session) ; ses sons sont copiés dans cette session")
+            .clicked()
         {
-            match Board::load(&p) {
-                Ok(b) => {
-                    self.engine.pad(PadCmd::StopAll { fade: 0 });
-                    self.board = b;
-                    self.board_path = p;
-                    self.sb.selected = None;
-                    self.sb.page = 0;
-                    let paths: Vec<PathBuf> =
-                        self.board.all_pads().map(|(_, p)| p.path.clone()).collect();
-                    for p in paths {
-                        self.cache.request(&p, None);
-                    }
-                    let port = self.board.midi_port.clone();
-                    self.midi.connect(port.as_deref());
-                    let led_port = self.board.led_port.clone();
-                    self.midi.connect_leds(led_port.as_deref());
-                    self.sync_engine_to_board();
-                }
-                Err(e) => self.notify(format!("{e:#}"), true),
-            }
-        }
-        if ui.button("Enregistrer le soundboard sous…").clicked()
-            && let Some(p) = rfd::FileDialog::new()
-                .add_filter("Soundboard", &["json"])
-                .set_file_name("soundboard.json")
-                .save_file()
-        {
-            self.board_path = p;
-            self.board_changed = Some(self.now);
-            self.save_board_now();
+            ui.close();
+            self.import_board();
         }
         ui.separator();
         if ui.button("Réglages audio…").clicked() {
@@ -2357,7 +2703,7 @@ impl App {
                 }
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Actualiser").clicked() {
+                    if w::secondary_button(ui, "Actualiser").clicked() {
                         dlg.refresh();
                         recheck = true;
                     }
@@ -2506,7 +2852,7 @@ impl App {
                 }
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Annuler").clicked() {
+                    if w::secondary_button(ui, "Annuler").clicked() {
                         close = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2552,7 +2898,7 @@ impl App {
                             egui::RichText::new(format!("{:.0} %", p * 100.0)).color(t::TEXT_2),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Annuler").clicked() {
+                            if w::secondary_button(ui, "Annuler").clicked() {
                                 cancel = true;
                             }
                         });
@@ -2610,21 +2956,36 @@ impl App {
                             .map(|(i, t)| (t.id, t.name.clone(), i))
                             .collect();
                         ui.horizontal(|ui| {
-                            if ui.small_button("Toutes").clicked() {
-                                d.tracks = with_audio.iter().map(|x| x.0).collect();
+                            // Même sélecteur que le reste de l'app : le choix qui correspond
+                            // aux pistes cochées est en surbrillance (aucun si choix à la main).
+                            let all: HashSet<u64> = with_audio.iter().map(|x| x.0).collect();
+                            let timeline: HashSet<u64> = all
+                                .iter()
+                                .copied()
+                                .filter(|id| self.selected_tracks.contains(id))
+                                .collect();
+                            let mut choice = if d.tracks == all {
+                                TrackChoice::All
+                            } else if d.tracks.is_empty() {
+                                TrackChoice::None
+                            } else if !timeline.is_empty() && d.tracks == timeline {
+                                TrackChoice::Timeline
+                            } else {
+                                TrackChoice::Custom
+                            };
+                            let mut options =
+                                vec![(TrackChoice::All, "Toutes"), (TrackChoice::None, "Aucune")];
+                            if !timeline.is_empty() {
+                                options.push((TrackChoice::Timeline, "Sélection de la timeline"));
                             }
-                            if ui.small_button("Aucune").clicked() {
-                                d.tracks.clear();
+                            if w::segmented(ui, "exp_choice", &mut choice, &options) {
+                                d.tracks = match choice {
+                                    TrackChoice::All => all,
+                                    TrackChoice::Timeline => timeline,
+                                    TrackChoice::None | TrackChoice::Custom => HashSet::new(),
+                                };
                             }
-                            if !self.selected_tracks.is_empty()
-                                && ui.small_button("Sélection de la timeline").clicked()
-                            {
-                                d.tracks = with_audio
-                                    .iter()
-                                    .map(|x| x.0)
-                                    .filter(|id| self.selected_tracks.contains(id))
-                                    .collect();
-                            }
+                            ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} / {} sélectionnée(s)",
@@ -2899,6 +3260,8 @@ impl eframe::App for App {
                 self.sb.midi_dirty = true;
             }
             self.update_playhead();
+            self.poll_finishing(false);
+            self.poll_save_as();
             self.soundboard_background(ctx);
             self.update_background(ctx);
         }));
@@ -2924,13 +3287,21 @@ impl eframe::App for App {
                 true,
             );
         }
-        // 60 images/s en permanence : vumètres en temps réel, même à l'arrêt.
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // Hors du garde-fou : le message d'erreur et la confirmation de fermeture doivent
+        // s'afficher même si le reste de l'interface a planté.
+        self.toast_ui(&ctx);
+        self.confirm_close_dialog(&ctx);
+        // 60 images/s quand quelque chose bouge (son, transport, animation), 10 sinon
+        // (`logic` repasse toutes les 100 ms) : pas de calcul inutile à l'arrêt.
+        if self.needs_animation() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 
     fn on_exit(&mut self) {
         self.midi.leds_off(self.board.led_mode);
         self.stop();
+        self.poll_finishing(true);
         self.autosave();
         self.board_changed = Some(0.0);
         self.save_board_now();
@@ -2956,13 +3327,32 @@ impl App {
             self.confirm_close = true;
         }
         // Sauvegarde automatique des modifications (montage, pistes…).
-        if !self.is_recording()
+        if self.now - self.last_autosave > 30.0
+            && !self.is_recording()
             && self.project.dirty
             && self.worth_saving()
-            && self.now - self.last_autosave > 30.0
         {
             self.last_autosave = self.now;
-            let _ = self.project.save();
+            if let Err(e) = self.project.save() {
+                self.save_failed(e);
+            }
+        }
+
+        // Accueil du lancement : page entière, rien d'autre tant qu'aucun choix n'est fait.
+        if self.start_screen {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(t::BG))
+                .show(ui, |ui| self.welcome_page(ui));
+            self.new_session_dialog(&ctx);
+            self.browser_dialog(&ctx);
+            self.audio_dialog(&ctx);
+            self.update_dialog(&ctx);
+            self.save_as_dialog(&ctx);
+            // Fenêtre « Nouvelle session » annulée : retour à l'accueil.
+            if self.start_screen && self.welcome.is_none() && !self.dialog_open() {
+                self.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&ctx));
+            }
+            return;
         }
 
         egui::Panel::top("top")
@@ -3013,9 +3403,9 @@ impl App {
         self.new_session_dialog(&ctx);
         self.new_tracks_dialog(&ctx);
         self.update_dialog(&ctx);
-        self.toast_ui(&ctx);
-
-        self.confirm_close_dialog(&ctx);
+        self.welcome_dialog(&ctx);
+        self.browser_dialog(&ctx);
+        self.save_as_dialog(&ctx);
     }
 
     fn confirm_close_dialog(&mut self, ctx: &egui::Context) {
@@ -3039,7 +3429,7 @@ impl App {
                     keep = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Arrêter, sauvegarder et quitter").clicked() {
+                    if w::danger_button(ui, "Arrêter, sauvegarder et quitter").clicked() {
                         quit = true;
                     }
                 });

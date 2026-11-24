@@ -174,11 +174,16 @@ pub fn recover(project: &mut Project) -> Result<usize> {
 /// Mémorise la dernière session utilisée (pour la rouvrir après un crash).
 pub fn remember_session(project: &Project) {
     if let Some(p) = state_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(p, project.file_path().to_string_lossy().as_bytes());
+        let _ = crate::project::write_atomic(&p, project.file_path().to_string_lossy().as_bytes());
     }
+    crate::sessions::remember(&project.file_path());
+}
+
+/// Dernière session utilisée, si elle existe encore.
+pub fn last_session() -> Option<PathBuf> {
+    let p = std::fs::read_to_string(state_path()?).ok()?;
+    let path = PathBuf::from(p.trim());
+    path.exists().then_some(path)
 }
 
 /// Session à restaurer : la dernière utilisée, si un enregistrement y a été interrompu.

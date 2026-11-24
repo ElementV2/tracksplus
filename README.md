@@ -9,6 +9,44 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 | --- | --- |
 | ![Multipiste](docs/multipiste.png) | ![Soundboard](docs/soundboard.png) |
 
+## Au lancement
+
+Un **écran d'accueil** en pleine page (aucune session n'est ouverte derrière tant qu'on n'a
+pas choisi) propose de **reprendre la dernière session**, d'en créer une nouvelle,
+d'en ouvrir une, ou de choisir dans la **liste des sessions** (celles du dossier
+`Musique\TracksPlus` et les sessions récentes ouvertes ailleurs), avec leur date, leur nombre
+de pistes et de prises et leur durée, et une recherche par nom. « Continuer avec une session
+vide » (ou Échap) ferme l'écran. « Ouvrir une session… » utilise le même explorateur
+intégré : les dossiers de session y apparaissent directement comme des sessions. Désactivable (« Afficher au lancement ») ; toujours
+accessible par le menu ☰ → « Sessions récentes… ». Après un crash pendant une prise, la
+session interrompue est rouverte directement, sans passer par cet écran.
+
+## Une session = un dossier
+
+Tout ce qui appartient à une session est rangé dans son dossier (par défaut
+`Musique\TracksPlus\<session>`) : on peut le copier, le déplacer ou l'archiver d'un bloc.
+
+```
+<session>\
+├── <session>.tracksplus   pistes, prises, montage, repères
+├── soundboard.json        pages et pads du soundboard de la session
+├── Audio\                 prises enregistrées (WAV, jamais modifiées)
+│   └── .peaks\            formes d'onde en cache (réouverture rapide, recalculées au besoin)
+├── Sons\                  sons du soundboard (copiés à leur ajout)
+└── Export\                fichiers exportés
+```
+
+- **Chaque session a son soundboard.** Un son glissé dans un pad est **copié** dans `Sons\` :
+  la session reste complète même si l'original est déplacé ou supprimé (un son déjà copié
+  n'est pas dupliqué). Les chemins sont relatifs au dossier de la session.
+- **Communs à toutes les sessions** (réglages de l'ordinateur, dans `%APPDATA%\TracksPlus`) :
+  carte son et sorties, contrôleur MIDI, LED et disposition du soundboard, mises à jour.
+- « Enregistrer sous… » copie aussi le soundboard et ses sons, en arrière-plan (fenêtre de
+  progression), et refuse d'écraser une session existante du même nom. Menu ☰ → « Importer un
+  soundboard… » reprend les pads d'un autre soundboard (celui d'une autre session, ou
+  l'ancien soundboard commun mis de côté dans `%APPDATA%\TracksPlus\soundboard (avant les
+  sessions).json`) en copiant ses sons dans la session.
+
 ## Onglet Multipiste
 
 - **Carte son** : pilote (ASIO / WASAPI, CoreAudio, ALSA / JACK), entrée, fréquence, buffer, et
@@ -63,7 +101,10 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 - **Pads** en grille, jusqu'à 8 pages. Sans contrôleur reconnu, la grille se choisit dans
   les réglages (4×2 à 8×8) ; avec un contrôleur reconnu, elle prend sa taille (voir
   « Disposition automatique »). Glissez-déposez des fichiers (WAV, AIFF, MP3, AAC/M4A, FLAC,
-  OGG) sur une case, ou cliquez sur une case vide. Déclenchement à l'appui (pas au
+  OGG) sur une case, ou cliquez sur une case vide : l'**explorateur de sons intégré**
+  s'ouvre (raccourcis Sons de la session, Musique, Bureau, Documents, Téléchargements,
+  disques ; chemin cliquable ; recherche ; plusieurs sons avec Ctrl / Maj ; double-clic pour
+  ajouter ; il se rouvre dans le dernier dossier utilisé). Déclenchement à l'appui (pas au
   relâchement) pour la réactivité.
 - **Pads plus larges que hauts** : titre sur plusieurs lignes, et durée en gros, alignée sur
   le titre, au format `mm:ss.cc` (deux chiffres partout ; temps restant pendant la lecture).
@@ -118,12 +159,14 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   correspondante, réglable dans le menu « LED ».
 - **À la souris** : un clic sélectionne le pad (réglages dans l'éditeur), un glissé le range
   sur une autre case (échange si elle est occupée) ou sur un onglet de page pour l'y envoyer.
+  **Suppr** supprime le pad sélectionné ; clic droit : Renommer, Remplacer le son…, Écouter,
+  Arrêter, Supprimer le pad.
   **Ctrl + clic joue le pad** (pour tester sans contrôleur, selon son mode). Les sons se
   jouent aussi au clavier, au contrôleur MIDI, ou avec « Écouter » dans l'éditeur (repart
   toujours du début).
 - **Sortie dédiée** (ex. sorties 3–4 de la Dante), volume général, vumètre stéréo des pads,
-  **Tout arrêter** avec fondu (Échap). Le soundboard est sauvegardé automatiquement et peut
-  être enregistré / rechargé comme fichier.
+  **Tout arrêter** avec fondu (Échap). Le soundboard est enregistré automatiquement dans la
+  session (voir « Une session = un dossier »).
 
 ## Fiabilité en live
 
@@ -149,6 +192,17 @@ Conçu pour ne jamais perdre une prise :
 - **Alertes en direct** (bandeau rouge) : plus de signal de la carte (horloge Dante, câble),
   erreur disque, disque presque plein, saturation disque, erreur du pilote.
 - **Pas de mise en veille** de l'ordinateur pendant une prise.
+- **Stop sans attente** : la fin d'écriture des fichiers se fait en arrière-plan ; si le disque
+  ne répond plus, l'application le signale et n'enregistre plus avant un redémarrage (les
+  prises sont récupérées). Un arrêt du thread d'écriture pendant une prise est signalé.
+- **Prises recalées** : en enregistrant sur des pistes existantes, la latence entrée + sortie
+  mesurée sur la carte est compensée.
+- **Fichiers toujours complets** : session, soundboard et réglages sont écrits dans un fichier
+  temporaire forcé sur le disque puis renommé ; une coupure ne laisse jamais de fichier
+  tronqué. Une sauvegarde impossible (disque plein, clé retirée) est signalée.
+- **Export** : refusé avec un message clair si un fichier dépasserait 4 Go (limite du WAV).
+- **Mises à jour vérifiées** : l'installeur téléchargé est contrôlé (empreinte SHA-256 publiée
+  par GitHub) avant d'être lancé, après une sauvegarde complète.
 - **Une seule instance** : relancer TracksPlus déjà ouvert affiche un message et ramène la
   fenêtre existante (deux instances se disputeraient la carte son).
 - **Décrochages** signalés par le pilote audio : comptés seulement pendant une prise ou une
@@ -185,7 +239,7 @@ Conçu pour ne jamais perdre une prise :
 | Origine / Entrée | Début (ou début de la sélection) | |
 | F | Tout afficher | |
 | S | Couper à la tête de lecture | |
-| Suppr | Supprimer la sélection | |
+| Suppr | Supprimer la sélection | Supprimer le pad sélectionné |
 | Ctrl + Z / Ctrl + Maj + Z | Annuler / Rétablir | |
 | Échap | Effacer les sélections | Tout arrêter (pendant un renommage : l'annuler) |
 | Ctrl + clic | Ajouter une prise à la sélection | Jouer le pad |
@@ -233,10 +287,12 @@ de Steinberg, utilisé sous sa licence GPLv3 ; `vendor/asio-sys` est une copie d
 | --- | --- |
 | `src/audio.rs` | Périphériques, flux cpal, callbacks temps réel (sans allocation ni verrou), vumètres |
 | `src/sampler.rs` | Moteur des pads (voix, fondus, modes) exécuté dans le callback de sortie |
-| `src/soundboard.rs` | Modèle du soundboard, décodage (symphonia) et rééchantillonnage des sons |
+| `src/soundboard.rs` | Modèle du soundboard (enregistré dans la session, sons copiés dans `Sons`), décodage (symphonia) et rééchantillonnage des sons |
 | `src/midi.rs` | Contrôleurs MIDI : dispositions des modèles reconnus, LED, déclenchement direct vers le moteur audio |
 | `src/recorder.rs` / `src/player.rs` | Threads disque : enregistrement et lecture multipiste |
 | `src/render.rs` / `src/export.rs` | Lecture des prises, formes d'onde, export |
 | `src/project.rs` | Session, pistes, prises, repères |
 | `src/update.rs` | Mises à jour : dernière release GitHub, téléchargement et lancement de l'installeur |
+| `src/sessions.rs` | Sessions connues (dossier des sessions + récentes), pour l'écran d'accueil |
+| `src/ui/browser.rs` | Explorateur intégré (sons des pads, sessions à ouvrir) |
 | `src/app.rs`, `src/ui/*` | Interface (egui) : thème, widgets, onglets |

@@ -1,6 +1,6 @@
 //! Modèle de session : pistes, prises (clips) et sauvegarde JSON.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,7 @@ pub struct Clip {
     /// Nom du fichier dans le dossier `Audio/` de la session.
     pub file: String,
     /// Position sur la timeline (en échantillons).
+    #[serde(default)]
     pub start: u64,
     /// Décalage dans le fichier (en échantillons).
     #[serde(default)]
@@ -95,13 +96,16 @@ pub fn s_curve(x: f32) -> f32 {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Track {
     pub id: u64,
+    #[serde(default)]
     pub name: String,
     /// Canal d'entrée de la carte son (0-based). `None` = pas d'entrée.
     /// Piste stéréo : premier canal de la paire (`input`, `input + 1`).
+    #[serde(default)]
     pub input: Option<u16>,
     /// Piste stéréo : enregistre une paire d'entrées dans un seul WAV stéréo.
     #[serde(default)]
     pub stereo: bool,
+    #[serde(default)]
     pub armed: bool,
     #[serde(default)]
     pub mute: bool,
@@ -115,6 +119,7 @@ pub struct Track {
     #[serde(default)]
     pub color: Option<u8>,
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
+    #[serde(default)]
     pub clips: Vec<Clip>,
 }
 
@@ -151,18 +156,25 @@ impl Track {
 pub struct Marker {
     pub id: u64,
     pub pos: u64,
+    #[serde(default)]
     pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Project {
+    /// Nom (remplacé au chargement par celui du fichier).
+    #[serde(default)]
     pub name: String,
+    #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
     #[serde(default)]
     pub rec_format: RecFormat,
+    #[serde(default)]
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub markers: Vec<Marker>,
+    /// Recalculé au chargement s'il est incohérent.
+    #[serde(default)]
     pub next_id: u64,
     /// Dossier de la session (non sérialisé).
     #[serde(skip)]
@@ -170,6 +182,13 @@ pub struct Project {
     /// Modifié depuis la dernière sauvegarde.
     #[serde(skip)]
     pub dirty: bool,
+}
+
+/// Fréquence par défaut (fichier sans fréquence ou fréquence nulle).
+pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
+
+fn default_sample_rate() -> u32 {
+    DEFAULT_SAMPLE_RATE
 }
 
 impl Project {
@@ -384,36 +403,93 @@ impl Project {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or(p.name);
+        p.validate();
         p.dirty = false;
         Ok(p)
     }
 
+    /// Corrige un fichier incohérent (ancien, partiel ou modifié à la main) : fréquence
+    /// nulle, identifiant suivant déjà utilisé, fondus plus longs que la prise.
+    pub fn validate(&mut self) {
+        if self.sample_rate == 0 {
+            self.sample_rate = DEFAULT_SAMPLE_RATE;
+        }
+        let max_id = self
+            .tracks
+            .iter()
+            .flat_map(|t| std::iter::once(t.id).chain(t.clips.iter().map(|c| c.id)))
+            .chain(self.markers.iter().map(|m| m.id))
+            .max()
+            .unwrap_or(0);
+        self.next_id = self.next_id.max(max_id + 1);
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            if t.name.trim().is_empty() {
+                t.name = format!("Piste {}", i + 1);
+            }
+            for c in &mut t.clips {
+                c.clamp_fades();
+            }
+        }
+    }
+
     /// "Enregistrer sous" : copie les fichiers audio dans le nouveau dossier.
+    /// Utilisable sur une copie de la session depuis un autre thread.
     pub fn save_as(&mut self, new_dir: PathBuf, new_name: String) -> Result<()> {
         // On prépare tout sur une copie : la session courante n'est modifiée qu'une fois
         // la copie des fichiers et la sauvegarde réussies.
         let mut next = self.clone();
         next.dir = new_dir;
         next.name = new_name;
+        let target = next.file_path();
+        if target.exists() && target != self.file_path() {
+            bail!(
+                "Une session « {} » existe déjà dans ce dossier ({})",
+                next.name,
+                next.dir.display()
+            );
+        }
         next.ensure_dirs()?;
         let old_audio = self.audio_dir();
         let new_audio = next.audio_dir();
         if old_audio != new_audio {
-            let mut files: Vec<&str> = self
+            let mut files: Vec<String> = self
                 .tracks
                 .iter()
-                .flat_map(|t| t.clips.iter().map(|c| c.file.as_str()))
+                .flat_map(|t| t.clips.iter().map(|c| c.file.clone()))
                 .collect();
             files.sort();
             files.dedup();
+            // Noms déjà pris dans le dossier cible (sans tenir compte de la casse).
+            let mut taken: HashSet<String> = std::fs::read_dir(&new_audio)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut renamed: std::collections::HashMap<String, String> = Default::default();
             for f in files {
-                let src = old_audio.join(f);
-                let dst = new_audio.join(f);
-                if src.exists() && !dst.exists() {
-                    let tmp = dst.with_extension("copie");
-                    std::fs::copy(&src, &tmp)
-                        .with_context(|| format!("Copie de {}", src.display()))?;
-                    std::fs::rename(&tmp, &dst)?;
+                let src = old_audio.join(&f);
+                if !src.exists() {
+                    continue;
+                }
+                // Un fichier du même nom existe déjà dans la cible : jamais réutilisé tel
+                // quel (ce n'est peut-être pas le même son), copie sous un nouveau nom.
+                let name = if taken.contains(&f.to_lowercase()) {
+                    let n = unique_name(&f, &taken);
+                    renamed.insert(f.clone(), n.clone());
+                    n
+                } else {
+                    f.clone()
+                };
+                taken.insert(name.to_lowercase());
+                copy_synced(&src, &new_audio.join(&name))?;
+            }
+            if !renamed.is_empty() {
+                for c in next.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+                    if let Some(n) = renamed.get(&c.file) {
+                        c.file = n.clone();
+                    }
                 }
             }
         }
@@ -479,6 +555,61 @@ pub fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// Écriture atomique : fichier temporaire voisin forcé sur le disque, puis renommé. Une
+/// coupure en pleine écriture laisse l'ancien fichier intact, jamais un fichier tronqué.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(d).with_context(|| format!("Création de {}", d.display()))?;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    write_synced(&tmp, bytes).with_context(|| format!("Écriture de {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("Écriture de {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Copie `src` vers `dst` via un fichier temporaire forcé sur le disque, puis renommé.
+pub fn copy_synced(src: &Path, dst: &Path) -> Result<()> {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(".copie");
+    let tmp = dst.with_file_name(name);
+    let res = (|| -> Result<()> {
+        std::fs::copy(src, &tmp).with_context(|| format!("Copie de {}", src.display()))?;
+        // Accès en écriture : exigé par Windows pour forcer l'écriture sur le disque.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)?
+            .sync_all()?;
+        std::fs::rename(&tmp, dst)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Premier nom libre « nom (2).wav », « nom (3).wav »… (`taken` en minuscules).
+fn unique_name(file: &str, taken: &HashSet<String>) -> String {
+    let p = Path::new(file);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    (2..)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|n| !taken.contains(&n.to_lowercase()))
+        .unwrap_or_default()
+}
+
 pub fn sanitize(s: &str) -> String {
     let out: String = s
         .chars()
@@ -505,6 +636,54 @@ pub fn default_sessions_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Charge : session de 64 pistes × 500 prises (32 000 prises) : temps d'enregistrement
+    /// et de réouverture du fichier de session.
+    /// `cargo test --release -- --ignored --nocapture charge_session`
+    #[test]
+    #[ignore]
+    fn charge_session_32000_prises() {
+        let dir = std::env::temp_dir().join(format!("tp-charge-session-{}", std::process::id()));
+        let mut p = Project::new("Charge".into(), dir.clone(), 48000);
+        for t in 0..64u16 {
+            let id = p.add_track(None, Some(t));
+            for k in 0..500u64 {
+                p.track_mut(id).unwrap().clips.push(Clip {
+                    id: 1000 + t as u64 * 1000 + k,
+                    file: format!("Piste {t}_{k:03}.wav"),
+                    start: k * 48000 * 10,
+                    offset: 0,
+                    len: 48000 * 9,
+                    src_len: 48000 * 9,
+                    fade_in: 480,
+                    fade_out: 480,
+                });
+            }
+        }
+        let t = std::time::Instant::now();
+        p.save().unwrap();
+        let save = t.elapsed();
+        let size = std::fs::metadata(p.file_path()).unwrap().len();
+        let t = std::time::Instant::now();
+        let q = Project::load(&p.file_path()).unwrap();
+        let load = t.elapsed();
+        let t = std::time::Instant::now();
+        let end = q.end();
+        let end_t = t.elapsed();
+        println!(
+            "session 64 pistes × 500 prises : fichier {:.1} Mo, enregistrement {:?}, ouverture {:?}, calcul de la fin {:?}",
+            size as f64 / 1e6,
+            save,
+            load,
+            end_t
+        );
+        assert_eq!(
+            q.tracks.iter().map(|t| t.clips.len()).sum::<usize>(),
+            32_000
+        );
+        assert!(end > 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn roundtrip() {
@@ -620,6 +799,114 @@ mod tests {
         assert_eq!(p.new_take_file("voix"), "voix_003.wav");
         let taken: HashSet<String> = ["voix_003.wav".to_string()].into();
         assert_eq!(p.new_take_file_avoiding("VOIX", &taken), "VOIX_004.wav");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn audio_clip(id: u64, file: &str) -> Clip {
+        Clip {
+            id,
+            file: file.into(),
+            start: 0,
+            offset: 0,
+            len: 4,
+            src_len: 4,
+            fade_in: 0,
+            fade_out: 0,
+        }
+    }
+
+    #[test]
+    fn save_as_never_reuses_or_overwrites() {
+        let base = std::env::temp_dir().join(format!("tp-saveas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut p = Project::new("Concert".into(), base.join("A"), 48000);
+        p.ensure_dirs().unwrap();
+        let t = p.add_track(None, Some(0));
+        std::fs::write(p.audio_dir().join("Voix_001.wav"), b"nouveau").unwrap();
+        std::fs::write(p.audio_dir().join("Voix_002.wav"), b"autre").unwrap();
+        p.track_mut(t)
+            .unwrap()
+            .clips
+            .push(audio_clip(50, "Voix_001.wav"));
+        p.track_mut(t)
+            .unwrap()
+            .clips
+            .push(audio_clip(51, "Voix_001.wav"));
+        p.track_mut(t)
+            .unwrap()
+            .clips
+            .push(audio_clip(52, "Voix_002.wav"));
+        p.save().unwrap();
+
+        // Cible : un ancien fichier du même nom (autre son) déjà présent.
+        let target = base.join("B");
+        std::fs::create_dir_all(target.join(AUDIO_DIR)).unwrap();
+        std::fs::write(target.join(AUDIO_DIR).join("voix_001.wav"), b"ancien").unwrap();
+        let mut q = p.clone();
+        q.save_as(target.clone(), "Copie".into()).unwrap();
+        assert_eq!(q.dir, target);
+        let files: Vec<&str> = q.tracks[0].clips.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(
+            files,
+            ["Voix_001 (2).wav", "Voix_001 (2).wav", "Voix_002.wav"]
+        );
+        let read = |f: &str| std::fs::read(target.join(AUDIO_DIR).join(f)).unwrap();
+        assert_eq!(read("Voix_001 (2).wav"), b"nouveau");
+        assert_eq!(read("voix_001.wav"), b"ancien", "fichier existant intact");
+        assert_eq!(read("Voix_002.wav"), b"autre");
+        // La session relue pointe vers les bons fichiers.
+        let r = Project::load(&q.file_path()).unwrap();
+        assert_eq!(r.tracks[0].clips[0].file, "Voix_001 (2).wav");
+
+        // Une session du même nom existe déjà dans le dossier : refus, rien ne change.
+        let mut again = p.clone();
+        let e = again.save_as(target.clone(), "Copie".into()).unwrap_err();
+        assert!(format!("{e:#}").contains("existe déjà"), "{e:#}");
+        assert_eq!(again.dir, base.join("A"));
+        // Réenregistrer au même endroit reste possible.
+        q.save_as(target.clone(), "Copie".into()).unwrap();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn load_repairs_incoherent_files() {
+        let dir = std::env::temp_dir().join(format!("tp-validate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Vieux.tracksplus");
+        // Fichier partiel : pas de nom, fréquence nulle, next_id déjà utilisé, fondu trop long.
+        let json = r#"{"sample_rate":0,"next_id":3,"tracks":[{"id":7,"clips":[
+            {"id":12,"file":"a.wav","len":100,"fade_in":500}]}]}"#;
+        std::fs::write(&path, json).unwrap();
+        let mut p = Project::load(&path).unwrap();
+        assert_eq!(p.name, "Vieux");
+        assert_eq!(p.sample_rate, DEFAULT_SAMPLE_RATE);
+        assert_eq!(p.next_id, 13);
+        assert_eq!(p.tracks[0].name, "Piste 1");
+        assert!(p.tracks[0].input.is_none() && !p.tracks[0].armed);
+        let c = &p.tracks[0].clips[0];
+        assert_eq!((c.start, c.fade_in, c.fade_out), (0, 100, 0));
+        assert!(p.alloc_id() > 12);
+        // Fichier minimal.
+        std::fs::write(&path, "{}").unwrap();
+        let p = Project::load(&path).unwrap();
+        assert_eq!((p.sample_rate, p.next_id, p.tracks.len()), (48000, 1, 0));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_replaces_whole_file() {
+        let dir = std::env::temp_dir().join(format!("tp-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sous").join("prefs.json");
+        write_atomic(&path, b"premier contenu long").unwrap();
+        write_atomic(&path, b"court").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"court");
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(left.len(), 1, "aucun fichier temporaire laissé");
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -130,6 +130,20 @@ fn run(
     if units == 0 {
         bail!("Choisissez au moins « Pistes séparées » ou « Mix stéréo »");
     }
+    // Un WAV ne dépasse pas 4 Go : on refuse avant d'écrire plutôt que de produire un
+    // fichier illisible.
+    let mut widest = 0usize;
+    if s.stems {
+        widest = with_audio
+            .iter()
+            .map(|&i| project.tracks[i].channels())
+            .max()
+            .unwrap_or(0);
+    }
+    if s.mix {
+        widest = widest.max(2);
+    }
+    check_wav_size(len, project.sample_rate, s.sample_rate, widest, s.depth)?;
     let mut done_units = 0usize;
     let mut out = Vec::new();
 
@@ -165,6 +179,40 @@ fn run(
     }
     progress.store(1000, Ordering::Relaxed);
     Ok(out)
+}
+
+/// Taille maximale des données d'un WAV (champ 32 bits, marge pour l'en-tête).
+const MAX_WAV_DATA: u64 = u32::MAX as u64 - 1024;
+
+/// Octets de données d'un fichier exporté : `len` trames à `sr_in` converties en `sr_out`.
+fn wav_data_bytes(len: u64, sr_in: u32, sr_out: u32, channels: usize, depth: BitDepth) -> u64 {
+    let frames = (len as u128 * sr_out as u128).div_ceil(sr_in.max(1) as u128);
+    let bytes_per_sample = match depth {
+        BitDepth::I16 => 2,
+        BitDepth::I24 => 3,
+        BitDepth::I32 | BitDepth::F32 => 4,
+    };
+    (frames * channels as u128 * bytes_per_sample).min(u64::MAX as u128) as u64
+}
+
+/// Refuse un export dont un fichier dépasserait la limite de 4 Go du format WAV.
+fn check_wav_size(
+    len: u64,
+    sr_in: u32,
+    sr_out: u32,
+    channels: usize,
+    depth: BitDepth,
+) -> Result<()> {
+    let bytes = wav_data_bytes(len, sr_in, sr_out, channels, depth);
+    if bytes > MAX_WAV_DATA {
+        bail!(
+            "Export impossible : un fichier ferait {:.1} Go, au-delà de la limite de 4 Go du \
+             format WAV. Choisissez moins de bits, une fréquence plus basse, des pistes \
+             séparées plutôt que le mix stéréo, ou une plage plus courte.",
+            bytes as f64 / 1e9
+        );
+    }
+    Ok(())
 }
 
 /// Quantifie et écrit les échantillons (avec dither TPDF optionnel en 16 bits).
@@ -387,6 +435,31 @@ mod tests {
         let m = hound::WavReader::open(&files[1]).unwrap();
         assert_eq!(m.spec().channels, 2);
         std::fs::remove_dir_all(&p.dir).ok();
+    }
+
+    #[test]
+    fn wav_size_limit_is_checked() {
+        // 1 h stéréo 48 kHz 24 bits ≈ 1,04 Go : accepté.
+        let hour = 3600 * 48000;
+        assert_eq!(
+            wav_data_bytes(hour, 48000, 48000, 2, BitDepth::I24),
+            hour * 2 * 3
+        );
+        assert!(check_wav_size(hour, 48000, 48000, 2, BitDepth::I24).is_ok());
+        // 4 h stéréo 48 kHz 32 bits ≈ 5,5 Go : refusé, avec des pistes à suivre.
+        let e = check_wav_size(4 * hour, 48000, 48000, 2, BitDepth::F32).unwrap_err();
+        assert!(e.to_string().contains("4 Go"), "{e}");
+        // En 16 bits mono, ça passe.
+        assert!(check_wav_size(4 * hour, 48000, 48000, 1, BitDepth::I16).is_ok());
+        // Rééchantillonnage vers 96 kHz : la taille double.
+        assert_eq!(
+            wav_data_bytes(hour, 48000, 96000, 1, BitDepth::I16),
+            hour * 2 * 2
+        );
+        // Juste à la limite.
+        let max_frames = MAX_WAV_DATA / 4;
+        assert!(check_wav_size(max_frames, 48000, 48000, 1, BitDepth::F32).is_ok());
+        assert!(check_wav_size(max_frames + 1, 48000, 48000, 1, BitDepth::F32).is_err());
     }
 
     #[test]

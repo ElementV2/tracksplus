@@ -86,7 +86,8 @@ impl AudioPrefs {
                 let _ = std::fs::create_dir_all(d);
             }
             if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(p, s);
+                // Écriture protégée : une coupure ne laisse jamais un fichier tronqué.
+                let _ = crate::project::write_atomic(&p, s.as_bytes());
             }
         }
     }
@@ -229,6 +230,10 @@ pub struct Shared {
     pub monitor_on: AtomicBool,
     /// Position de lecture de chaque pad (+1, 0 = arrêté).
     pub pad_pos: Vec<AtomicU64>,
+    /// Latence capture → callback d'entrée, d'après le pilote (trames, 0 = inconnue).
+    pub in_latency: AtomicU32,
+    /// Latence callback de sortie → restitution, d'après le pilote (trames, 0 = inconnue).
+    pub out_latency: AtomicU32,
 }
 
 impl Shared {
@@ -252,7 +257,17 @@ impl Shared {
                 .collect(),
             monitor_on: AtomicBool::new(false),
             pad_pos: (0..MAX_PADS).map(|_| AtomicU64::new(0)).collect(),
+            in_latency: AtomicU32::new(0),
+            out_latency: AtomicU32::new(0),
         }
+    }
+
+    /// Latence aller-retour signalée par le pilote (entrée + sortie, en trames ;
+    /// 0 = inconnue). Ne comprend pas la latence propre des convertisseurs.
+    pub fn round_trip_latency(&self) -> u32 {
+        self.in_latency
+            .load(Ordering::Relaxed)
+            .saturating_add(self.out_latency.load(Ordering::Relaxed))
     }
 
     pub fn take_peak(a: &AtomicU32) -> f32 {
@@ -272,10 +287,16 @@ impl Shared {
             if self.counting.load(Ordering::Relaxed) {
                 self.xruns.fetch_add(1, Ordering::Relaxed);
             }
-        } else {
-            *self.last_error.lock() = Some(err.to_string());
+        } else if let Some(mut e) = self.last_error.try_lock() {
+            // Jamais d'attente côté flux audio : message abandonné si l'interface lit.
+            *e = Some(err.to_string());
         }
     }
+}
+
+/// Durée → trames à la fréquence `sr` (saturé, sans allocation).
+fn to_frames(d: std::time::Duration, sr: u32) -> u32 {
+    (d.as_secs_f64() * sr as f64).min(u32::MAX as f64) as u32
 }
 
 /// Une entrée à enregistrer : canal (ou paire stéréo) de la carte → ring buffer vers le
@@ -477,6 +498,7 @@ impl Engine {
                 garbage: in_garbage_tx,
                 shared: shared.clone(),
                 monitor: mon_prod.take(),
+                sample_rate,
             };
             let stream = match fmt {
                 SampleFormat::F32 => build_input::<f32>(dev, cfg, st),
@@ -569,6 +591,7 @@ impl Engine {
                     Sampler::new(main_pads, sgt, (pad.left as usize).min(last), sample_rate),
                 )
                 .with_monitor(main_mon, mon_left)
+                .main_output(sample_rate)
             });
             match res {
                 Ok((s, channels)) => {
@@ -737,6 +760,11 @@ impl Engine {
             let _ = tx.try_send(cmd);
         }
     }
+
+    /// Latence aller-retour du pilote (trames, 0 = inconnue) : voir `Shared`.
+    pub fn round_trip_latency(&self) -> u32 {
+        self.shared.round_trip_latency()
+    }
 }
 
 /// Choisit le format d'échantillon et le nombre de canaux maximal pour une fréquence.
@@ -771,6 +799,7 @@ struct InState {
     shared: Arc<Shared>,
     /// Vers la sortie de monitoring (mix stéréo entrelacé des canaux écoutés).
     monitor: Option<Producer<f32>>,
+    sample_rate: u32,
 }
 
 impl InState {
@@ -789,7 +818,13 @@ where
     let err_shared = st.shared.clone();
     let stream = dev.build_input_stream::<T, _, _>(
         cfg,
-        move |data: &[T], _| {
+        move |data: &[T], info: &cpal::InputCallbackInfo| {
+            // Latence capture → callback (compensation des prises en re-recording).
+            let ts = info.timestamp();
+            st.shared.in_latency.store(
+                to_frames(ts.callback.duration_since(ts.capture), st.sample_rate),
+                Ordering::Relaxed,
+            );
             while let Ok(cmd) = st.rx.try_recv() {
                 // Aucune libération mémoire ici : l'ancienne liste part vers l'interface,
                 // qui relâche les producteurs (le thread disque voit alors la fin de prise).
@@ -912,8 +947,9 @@ fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize, usize) -
 }
 
 const MAX_BLOCK: usize = 4096;
-/// Capacité du tampon de monitoring (trames stéréo).
-const MON_RING: usize = 16384;
+/// Capacité du tampon de monitoring (trames stéréo) : large, pour que la cible et le
+/// seuil de rattrapage restent atteignables même avec de très gros buffers.
+const MON_RING: usize = 65536;
 
 struct OutState {
     channels: usize,
@@ -929,6 +965,32 @@ struct OutState {
     /// Monitoring direct des entrées joué par ce flux.
     monitor: Option<MonitorOut>,
     mon: Vec<f32>,
+    /// Lecture interrompue par un trou : fondu d'entrée à la reprise.
+    play_fade_in: bool,
+    /// Flux d'écoute principal : c'est lui qui mesure la latence de sortie.
+    main: bool,
+    sample_rate: u32,
+}
+
+/// Fondu de sortie sur les `fade` dernières trames de `buf[..n]` (stéréo entrelacé).
+fn fade_tail(buf: &mut [f32], n: usize, fade: usize) {
+    let k = fade.min(n);
+    for i in 0..k {
+        let g = (k - i) as f32 / (k + 1) as f32;
+        let f = n - k + i;
+        buf[f * 2] *= g;
+        buf[f * 2 + 1] *= g;
+    }
+}
+
+/// Fondu d'entrée sur les `fade` premières trames de `buf[..n]` (stéréo entrelacé).
+fn fade_head(buf: &mut [f32], n: usize, fade: usize) {
+    let k = fade.min(n);
+    for i in 0..k {
+        let g = (i + 1) as f32 / (k + 1) as f32;
+        buf[i * 2] *= g;
+        buf[i * 2 + 1] *= g;
+    }
 }
 
 /// Réception du monitoring dans un flux de sortie.
@@ -972,12 +1034,15 @@ impl MonitorOut {
         if frames == 0 {
             return;
         }
+        let cap = self.cons.buffer().capacity() / 2;
         let blk = frames.max(in_block).max(32);
-        let target = 2 * blk + 64;
+        // Cible bornée au quart du tampon : toujours atteignable (sinon jamais amorcé).
+        let target = (2 * blk + 64).min(cap / 4);
         let mut avail = self.cons.slots() / 2;
         // Énorme avance (après un blocage du système) : retour à la cible d'un coup,
-        // avec un fondu d'entrée. Rare.
-        if avail > target * 4 + frames {
+        // avec un fondu d'entrée. Rare. Seuil toujours sous la capacité du tampon.
+        let snap = (target * 4 + frames).min((target + cap) / 2);
+        if avail > snap {
             let skip = avail - target;
             if let Ok(c) = self.cons.read_chunk(skip * 2) {
                 c.commit_all();
@@ -1003,13 +1068,7 @@ impl MonitorOut {
                 out[a.len()..a.len() + b.len()].copy_from_slice(b);
                 chunk.commit_all();
             }
-            let n = MON_FADE.min(avail);
-            for k in 0..n {
-                let g = (n - k) as f32 / (n + 1) as f32;
-                let f = avail - n + k;
-                out[f * 2] *= g;
-                out[f * 2 + 1] *= g;
-            }
+            fade_tail(out, avail, MON_FADE);
             self.primed = false;
             return;
         }
@@ -1049,12 +1108,7 @@ impl MonitorOut {
         }
         if self.fade_in {
             self.fade_in = false;
-            let n = MON_FADE.min(frames);
-            for k in 0..n {
-                let g = (k + 1) as f32 / (n + 1) as f32;
-                out[k * 2] *= g;
-                out[k * 2 + 1] *= g;
-            }
+            fade_head(out, frames, MON_FADE);
         }
     }
 }
@@ -1081,7 +1135,17 @@ impl OutState {
             pads: vec![0.0; MAX_BLOCK * 2],
             monitor: None,
             mon: vec![0.0; MAX_BLOCK * 2],
+            play_fade_in: false,
+            main: false,
+            sample_rate: 0,
         }
+    }
+
+    /// Flux d'écoute principal (mesure de la latence de sortie à `sample_rate`).
+    fn main_output(mut self, sample_rate: u32) -> Self {
+        self.main = true;
+        self.sample_rate = sample_rate;
+        self
     }
 
     /// Ce flux joue aussi le monitoring, sur la paire `left`, `left + 1`.
@@ -1116,6 +1180,16 @@ impl OutState {
                 play[..a.len()].copy_from_slice(a);
                 play[a.len()..a.len() + b.len()].copy_from_slice(b);
                 chunk.commit_all();
+            }
+            // Trou de lecture (ou imminent : le prochain bloc ne tiendra pas) : fondus
+            // courts de part et d'autre, pas de marche brutale donc pas de clic.
+            if n > 0 && self.play_fade_in {
+                self.play_fade_in = false;
+                fade_head(play, n, MON_FADE);
+            }
+            if n < frames || cons.slots() / 2 < frames {
+                fade_tail(play, n, MON_FADE);
+                self.play_fade_in = true;
             }
             sh.out_frames.fetch_add(n as u64, Ordering::Relaxed);
         }
@@ -1188,12 +1262,21 @@ where
     let err_shared = st.shared.clone();
     let stream = dev.build_output_stream::<T, _, _>(
         cfg,
-        move |data: &mut [T], _| {
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            if st.main {
+                // Latence callback → restitution (compensation des prises en re-recording).
+                let ts = info.timestamp();
+                st.shared.out_latency.store(
+                    to_frames(ts.playback.duration_since(ts.callback), st.sample_rate),
+                    Ordering::Relaxed,
+                );
+            }
             while let Ok(cmd) = st.rx.try_recv() {
                 match cmd {
                     OutCmd::Play(c) => {
                         st.release();
                         st.cons = Some(c);
+                        st.play_fade_in = false;
                         // Remis à zéro ici, au moment exact où la nouvelle lecture commence.
                         st.shared.out_frames.store(0, Ordering::Relaxed);
                     }
@@ -1211,8 +1294,9 @@ where
                 let n = (total - done).min(MAX_BLOCK);
                 st.process(n);
                 let out = &mut data[done * ch..(done + n) * ch];
-                for (d, s) in out.iter_mut().zip(&st.mix[..n * ch]) {
-                    *d = T::from_sample(*s);
+                for (d, &s) in out.iter_mut().zip(&st.mix[..n * ch]) {
+                    // Jamais de NaN / infini vers la carte (sécurité des enceintes).
+                    *d = T::from_sample(if s.is_finite() { s } else { 0.0 });
                 }
                 done += n;
             }
@@ -1340,6 +1424,96 @@ mod tests {
             let jumps = played.windows(2).filter(|w| w[1] - w[0] > 3e-5).count();
             assert!(jumps == 0, "dérive {drift} : {jumps} sauts");
         }
+    }
+
+    /// Gros buffers (2048 et 8192 trames) : le monitoring s'amorce, et après un blocage
+    /// (rafale qui remplit le tampon) la latence revient vite près de la cible.
+    #[test]
+    fn monitor_big_blocks_prime_and_recover() {
+        for block in [2048usize, 8192] {
+            let (prod, cons) = rtrb::RingBuffer::new(MON_RING * 2);
+            let mut mon = MonitorOut::new(cons, 0);
+            let mut prod = prod;
+            let out_frames = block.min(MAX_BLOCK);
+            let calls = block / out_frames;
+            let mut out = vec![0.0f32; out_frames * 2];
+            let push = |prod: &mut Producer<f32>| {
+                let n = block.min(prod.slots() / 2);
+                if let Ok(c) = prod.write_chunk_uninit(n * 2) {
+                    c.fill_from_iter(std::iter::repeat_n(0.5f32, n * 2));
+                }
+                n
+            };
+            let target = (2 * block + 64).min(MON_RING / 4);
+            let mut heard = false;
+            for _ in 0..20 {
+                push(&mut prod);
+                for _ in 0..calls {
+                    mon.render(&mut out, out_frames, block);
+                    heard |= out.iter().any(|&x| x != 0.0);
+                }
+            }
+            assert!(heard && mon.primed, "bloc {block} : jamais amorcé");
+            // Blocage de la sortie : l'entrée continue jusqu'à remplir le tampon.
+            while push(&mut prod) > 0 {}
+            assert!(mon.cons.slots() / 2 > target * 2);
+            for _ in 0..2 {
+                push(&mut prod);
+                for _ in 0..calls {
+                    mon.render(&mut out, out_frames, block);
+                }
+            }
+            let lat = mon.cons.slots() / 2;
+            assert!(
+                lat <= target + block,
+                "bloc {block} : latence {lat} trames, cible {target}"
+            );
+            assert!(out.iter().all(|&x| x != 0.0), "bloc {block} : trou");
+        }
+    }
+
+    /// Trou de lecture : fondu de sortie avant le trou, fondu d'entrée à la reprise.
+    #[test]
+    fn playback_underrun_fades() {
+        let (mut st, _p) = monitor_state(2, 0);
+        st.monitor = None;
+        let (mut prod, cons) = rtrb::RingBuffer::new(4096);
+        st.cons = Some(cons);
+        let feed = |prod: &mut Producer<f32>, frames: usize| {
+            for _ in 0..frames * 2 {
+                prod.push(0.5).unwrap();
+            }
+        };
+        feed(&mut prod, 128);
+        st.process(128);
+        assert_eq!(st.mix[0], 0.5);
+        assert!(st.mix[127 * 2] < 0.02, "fin de bloc avant le trou : fondu");
+        st.process(128);
+        assert!(st.mix[..256].iter().all(|&x| x == 0.0));
+        feed(&mut prod, 256);
+        st.process(128);
+        assert!(st.mix[0] < 0.02, "reprise : fondu d'entrée");
+        assert_eq!(st.mix[100 * 2], 0.5);
+    }
+
+    /// Une erreur du pilote ne bloque jamais le flux, même si l'interface tient le verrou.
+    #[test]
+    fn on_error_never_blocks() {
+        let sh = Shared::new();
+        let guard = sh.last_error.lock();
+        sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into());
+        drop(guard);
+        sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into());
+        assert!(sh.last_error.lock().is_some());
+    }
+
+    #[test]
+    fn latency_frames() {
+        assert_eq!(to_frames(std::time::Duration::from_millis(10), 48000), 480);
+        let sh = Shared::new();
+        sh.in_latency.store(100, Ordering::Relaxed);
+        sh.out_latency.store(200, Ordering::Relaxed);
+        assert_eq!(sh.round_trip_latency(), 300);
     }
 
     /// Les décrochages du pilote ne comptent que pendant une prise ou une lecture.

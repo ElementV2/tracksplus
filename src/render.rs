@@ -5,8 +5,12 @@ use hound::{SampleFormat, WavReader};
 use parking_lot::RwLock;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+/// Tampon de lecture des fichiers WAV : large, pour lire chaque fichier par gros
+/// morceaux (beaucoup de pistes sur un même disque = moins d'allers-retours).
+const WAV_BUF: usize = 512 * 1024;
 
 /// Nombre d'échantillons résumés par un point de forme d'onde.
 pub const PEAK_BLOCK: usize = 1024;
@@ -89,8 +93,16 @@ impl PeakAccum {
     }
 }
 
-/// Calcule la forme d'onde d'un fichier existant (thread de fond).
-pub fn compute_peaks(path: &PathBuf, dst: &Peaks) {
+/// Calcule la forme d'onde d'un fichier existant (thread de fond). Lue depuis le cache
+/// `.peaks/` voisin s'il est à jour ; sinon calculée, puis mise en cache.
+pub fn compute_peaks(path: &Path, dst: &Peaks) {
+    let before = Stamp::of(path);
+    if let Some(l0) = before.and_then(|st| load_cache(path, st)) {
+        for c in l0.chunks(65536) {
+            dst.write().extend(c);
+        }
+        return;
+    }
     let Ok(mut src) = WavSource::open(path) else {
         return;
     };
@@ -98,6 +110,7 @@ pub fn compute_peaks(path: &PathBuf, dst: &Peaks) {
     let mut acc = PeakAccum::default();
     let mut buf = vec![0f32; 65536 * ch];
     let mut local = Vec::new();
+    let mut all = Vec::new();
     loop {
         let n = src.read_frames(&mut buf, ch);
         if n == 0 {
@@ -110,10 +123,152 @@ pub fn compute_peaks(path: &PathBuf, dst: &Peaks) {
             acc.end_frame(&mut local);
         }
         dst.write().extend(&local);
+        all.extend_from_slice(&local);
         local.clear();
     }
     acc.flush(&mut local);
     dst.write().extend(&local);
+    all.extend_from_slice(&local);
+    drop(src);
+    // Fichier modifié pendant le calcul : pas de cache (il serait faux).
+    if let Some(st) = before
+        && Stamp::of(path) == Some(st)
+    {
+        write_cache(path, st, &all);
+    }
+}
+
+/// Demande le calcul de la forme d'onde de `path` dans `dst`, par un petit groupe de
+/// threads partagé (deux fichiers à la fois au plus : le disque n'est pas saturé).
+pub fn request_peaks(path: PathBuf, dst: Peaks) {
+    static POOL: OnceLock<crossbeam_channel::Sender<(PathBuf, Peaks)>> = OnceLock::new();
+    let tx = POOL.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<(PathBuf, Peaks)>();
+        for i in 0..2 {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("tracksplus-peaks-{i}"))
+                .spawn(move || {
+                    while let Ok((path, dst)) = rx.recv() {
+                        compute_peaks(&path, &dst);
+                    }
+                });
+        }
+        tx
+    });
+    let _ = tx.send((path, dst));
+}
+
+/// Met en cache la forme d'onde d'un fichier terminé (par exemple calculée en direct
+/// pendant l'enregistrement). À appeler une fois le fichier WAV fermé. Erreurs ignorées.
+pub fn store_peaks(path: &Path, data: &PeakData) {
+    if let Some(st) = Stamp::of(path) {
+        write_cache(path, st, &data.l0);
+    }
+}
+
+/// Identité d'un fichier source : taille et date de modification.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    len: u64,
+    secs: u64,
+    nanos: u32,
+}
+
+impl Stamp {
+    fn of(path: &Path) -> Option<Self> {
+        let m = std::fs::metadata(path).ok()?;
+        let t = m
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(Self {
+            len: m.len(),
+            secs: t.as_secs(),
+            nanos: t.subsec_nanos(),
+        })
+    }
+}
+
+const CACHE_MAGIC: &[u8; 4] = b"TPPK";
+const CACHE_VERSION: u32 = 1;
+/// magic, version, PEAK_BLOCK, taille, secondes, nanosecondes, nombre de points.
+const CACHE_HEADER: usize = 4 + 4 + 4 + 8 + 8 + 4 + 8;
+
+/// `<dossier>/.peaks/<fichier>.peaks`
+fn cache_path(path: &Path) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".peaks");
+    Some(path.parent()?.join(".peaks").join(name))
+}
+
+/// Points (niveau fin) du cache, s'il correspond exactement au fichier source.
+fn load_cache(path: &Path, st: Stamp) -> Option<Vec<[i16; 2]>> {
+    let b = std::fs::read(cache_path(path)?).ok()?;
+    let h = b.get(..CACHE_HEADER)?;
+    let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
+    if &h[..4] != CACHE_MAGIC
+        || u32_at(4) != CACHE_VERSION
+        || u32_at(8) as usize != PEAK_BLOCK
+        || u64_at(12) != st.len
+        || u64_at(20) != st.secs
+        || u32_at(28) != st.nanos
+    {
+        return None;
+    }
+    let n = usize::try_from(u64_at(32)).ok()?;
+    let body = &b[CACHE_HEADER..];
+    if body.len() != n.checked_mul(4)? {
+        return None;
+    }
+    Some(
+        body.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| {
+                [
+                    i16::from_le_bytes([c[0], c[1]]),
+                    i16::from_le_bytes([c[2], c[3]]),
+                ]
+            })
+            .collect(),
+    )
+}
+
+/// Écrit le cache (fichier temporaire puis renommage : jamais de cache à moitié écrit).
+fn write_cache(path: &Path, st: Stamp, l0: &[[i16; 2]]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(dst) = cache_path(path) else {
+        return;
+    };
+    let Some(dir) = dst.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut b = Vec::with_capacity(CACHE_HEADER + l0.len() * 4);
+    b.extend_from_slice(CACHE_MAGIC);
+    b.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+    b.extend_from_slice(&(PEAK_BLOCK as u32).to_le_bytes());
+    b.extend_from_slice(&st.len.to_le_bytes());
+    b.extend_from_slice(&st.secs.to_le_bytes());
+    b.extend_from_slice(&st.nanos.to_le_bytes());
+    b.extend_from_slice(&(l0.len() as u64).to_le_bytes());
+    for p in l0 {
+        b.extend_from_slice(&p[0].to_le_bytes());
+        b.extend_from_slice(&p[1].to_le_bytes());
+    }
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = dst.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}-{seq}.tmp", std::process::id()));
+    let tmp = dir.join(tmp_name);
+    if std::fs::write(&tmp, &b).is_err() || std::fs::rename(&tmp, &dst).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Lecteur WAV séquentiel (mono ou multicanal) avec repositionnement.
@@ -128,8 +283,9 @@ pub struct WavSource {
 }
 
 impl WavSource {
-    pub fn open(path: &PathBuf) -> hound::Result<Self> {
-        let reader = WavReader::open(path)?;
+    pub fn open(path: &Path) -> hound::Result<Self> {
+        let file = File::open(path)?;
+        let reader = WavReader::new(BufReader::with_capacity(WAV_BUF, file))?;
         let spec = reader.spec();
         let frames = reader.duration() as u64;
         Ok(Self {
@@ -370,6 +526,74 @@ mod tests {
             "moitié du fondu enchaîné A→B"
         );
         assert!((out[1500] - 0.5).abs() < 1e-6);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn write_wav(path: &Path, frames: usize, v: f32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..frames {
+            w.write_sample(if i % 2 == 0 { v } else { -v }).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn peaks_of(path: &Path) -> PeakData {
+        let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
+        compute_peaks(path, &p);
+        std::mem::take(&mut *p.write())
+    }
+
+    /// Cache des formes d'onde : écrit au premier calcul, relu ensuite, ignoré dès que
+    /// le fichier source change.
+    #[test]
+    fn peaks_cache_roundtrip_and_invalidation() {
+        let dir = std::env::temp_dir().join(format!("tp-peaks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let audio = dir.join("Audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        let wav = audio.join("x.wav");
+        write_wav(&wav, 5000, 0.5);
+        let a = peaks_of(&wav);
+        assert_eq!(a.l0.len(), 5);
+        let cache = audio.join(".peaks").join("x.wav.peaks");
+        assert!(cache.exists(), "cache écrit");
+        let st = Stamp::of(&wav).unwrap();
+        assert_eq!(load_cache(&wav, st).unwrap(), a.l0);
+
+        // Le cache est bien utilisé : des données posées par store_peaks sont relues.
+        let mut fake = PeakData::default();
+        fake.extend(&[[-7, 7]; 20]);
+        store_peaks(&wav, &fake);
+        let b = peaks_of(&wav);
+        assert_eq!(b.l0, fake.l0);
+        assert_eq!(b.l1, fake.l1, "niveau grossier reconstruit");
+
+        // Fichier modifié : cache rejeté, forme d'onde recalculée puis remise en cache.
+        write_wav(&wav, 9000, 0.25);
+        assert!(load_cache(&wav, Stamp::of(&wav).unwrap()).is_none());
+        let c = peaks_of(&wav);
+        assert_eq!(c.l0.len(), 9);
+        assert_eq!(c.l0[0], to_peak(-0.25, 0.25));
+        assert_eq!(load_cache(&wav, Stamp::of(&wav).unwrap()).unwrap(), c.l0);
+
+        // Cache corrompu : ignoré.
+        std::fs::write(&cache, b"TPPK").unwrap();
+        assert_eq!(peaks_of(&wav).l0, c.l0);
+
+        // Groupe de threads : le résultat finit par arriver.
+        let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
+        request_peaks(wav.clone(), p.clone());
+        let t = std::time::Instant::now();
+        while p.read().l0.len() < 9 && t.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(p.read().l0, c.l0);
         std::fs::remove_dir_all(dir).ok();
     }
 

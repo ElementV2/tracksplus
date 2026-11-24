@@ -25,6 +25,10 @@ impl App {
                 self.notify("Mise à jour reportée : une prise est en cours", true);
                 return;
             }
+            // Tout est sauvegardé avant que l'installeur ne ferme l'application.
+            self.autosave();
+            self.board_changed = Some(self.now);
+            self.save_board_now();
             match update::launch_installer(&file) {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => self.updater.set(State::Failed(e)),
@@ -197,10 +201,10 @@ impl App {
                         ui.label(egui::RichText::new(format!("{msg}.")).color(t::TEXT_2));
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Réessayer").clicked() {
+                            if w::secondary_button(ui, "Réessayer").clicked() {
                                 self.updater.check(ui.ctx());
                             }
-                            if ui.button("Voir les versions sur GitHub").clicked() {
+                            if w::secondary_button(ui, "Voir les versions sur GitHub").clicked() {
                                 update::open_url(&update::releases_page());
                             }
                         });
@@ -235,10 +239,10 @@ impl App {
                             {
                                 update::open_url(&r.page);
                             }
-                            if ui.button("Plus tard").clicked() {
+                            if w::secondary_button(ui, "Plus tard").clicked() {
                                 close = true;
                             }
-                            if ui.button("Ignorer cette version").clicked() {
+                            if w::secondary_button(ui, "Ignorer cette version").clicked() {
                                 self.update_settings.skipped = Some(r.version.clone());
                                 self.update_settings.save();
                                 close = true;

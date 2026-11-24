@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub const ALL_PORTS: &str = "Tous les ports MIDI";
@@ -685,6 +685,13 @@ impl Midi {
         self.led_sent.clear();
     }
 
+    /// Remplace la table contrôle → pad. L'ancienne table (et ses sons) est libérée
+    /// après avoir relâché le verrou : le thread MIDI n'attend jamais une libération.
+    pub fn set_map(&self, map: HashMap<MidiKey, (u16, Arc<SampleData>, PadParams)>) {
+        let old = std::mem::replace(&mut self.shared.lock().map, map);
+        drop(old);
+    }
+
     pub fn led_ports(&self) -> Vec<String> {
         self.outs.iter().map(|(n, _)| n.clone()).collect()
     }
@@ -694,6 +701,8 @@ impl Midi {
         if self.outs.is_empty() {
             return;
         }
+        // Contrôles présents, en ensemble : tout reste en O(n).
+        let present: HashSet<MidiKey> = states.iter().map(|(k, _)| *k).collect();
         let mut msgs: Vec<(MidiKey, [u8; 3])> = Vec::new();
         // Le modèle est déduit du nom de la première sortie (un contrôleur à la fois).
         if let Some((name, _)) = self.outs.first() {
@@ -704,17 +713,12 @@ impl Midi {
                 }
             }
             // Contrôles qui ne sont plus associés à un pad : on les éteint.
-            for (k, _) in self
-                .led_sent
-                .iter()
-                .filter(|(k, _)| !states.iter().any(|(s, _)| s == *k))
-            {
+            for k in self.led_sent.keys().filter(|k| !present.contains(*k)) {
                 if let Some(msg) = led_message(m, *k, LedState::Off) {
                     msgs.push((*k, msg));
                 }
             }
         }
-        let present: Vec<MidiKey> = states.iter().map(|(k, _)| *k).collect();
         for (k, msg) in msgs {
             if self.led_sent.get(&k) == Some(&msg) {
                 continue;
@@ -792,21 +796,28 @@ impl Midi {
                     let Some(e) = parse(msg) else {
                         return;
                     };
-                    let sh = shared.lock();
-                    if let (Some(tx), Some((slot, sample, params))) = (&sh.tx, sh.map.get(&e.key)) {
-                        let cmd = if e.press {
-                            PadCmd::Press {
-                                slot: *slot,
-                                sample: sample.clone(),
-                                params: *params,
-                            }
-                        } else {
-                            PadCmd::Release { slot: *slot }
-                        };
-                        let _ = tx.try_send(cmd);
-                    }
+                    // Verrou tenu le moins longtemps possible : recherche du pad et envoi
+                    // non bloquant de sa commande, puis le reste une fois relâché.
+                    let ctx = {
+                        let sh = shared.lock();
+                        if let (Some(tx), Some((slot, sample, params))) =
+                            (&sh.tx, sh.map.get(&e.key))
+                        {
+                            let cmd = if e.press {
+                                PadCmd::Press {
+                                    slot: *slot,
+                                    sample: sample.clone(),
+                                    params: *params,
+                                }
+                            } else {
+                                PadCmd::Release { slot: *slot }
+                            };
+                            let _ = tx.try_send(cmd);
+                        }
+                        sh.ctx.clone()
+                    };
                     let _ = ev.send(e);
-                    if let Some(c) = &sh.ctx {
+                    if let Some(c) = ctx {
                         c.request_repaint();
                     }
                 },
