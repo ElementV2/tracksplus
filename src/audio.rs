@@ -196,9 +196,13 @@ impl Shared {
     }
 }
 
-/// Une entrée à enregistrer : canal de la carte → ring buffer vers le disque.
+/// Une entrée à enregistrer : canal (ou paire stéréo) de la carte → ring buffer vers le
+/// disque. En stéréo, les échantillons sont entrelacés (G, D, G, D…).
 pub struct RecTarget {
-    pub channel: usize,
+    /// Canaux de la carte (le second n'est utilisé qu'en stéréo).
+    pub channels: [usize; 2],
+    /// 1 = mono, 2 = stéréo.
+    pub width: usize,
     pub prod: Producer<f32>,
     /// Trames perdues (tampon plein) pas encore compensées par du silence.
     pub pending: usize,
@@ -207,7 +211,18 @@ pub struct RecTarget {
 impl RecTarget {
     pub fn new(channel: usize, prod: Producer<f32>) -> Self {
         Self {
-            channel,
+            channels: [channel, channel],
+            width: 1,
+            prod,
+            pending: 0,
+        }
+    }
+
+    /// Paire stéréo `left`, `left + 1`.
+    pub fn stereo(left: usize, prod: Producer<f32>) -> Self {
+        Self {
+            channels: [left, left + 1],
+            width: 2,
             prod,
             pending: 0,
         }
@@ -596,8 +611,9 @@ where
 
             if !st.targets.is_empty() {
                 for t in &mut st.targets {
-                    let c = t.channel;
-                    let lost = feed_target(t, frames, |f| {
+                    let cs = t.channels;
+                    let lost = feed_target(t, frames, |f, k| {
+                        let c = cs[k];
                         if c < ch {
                             data[f * ch + c].to_sample::<f32>()
                         } else {
@@ -620,23 +636,26 @@ where
 /// Écrit un bloc d'une entrée dans son tampon disque, sans jamais décaler la piste :
 /// si des trames ont dû être perdues (disque en retard), autant de silence est inséré
 /// à leur place dès que le tampon a de nouveau de la place. Retourne `true` en cas de perte.
-fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize) -> f32) -> bool {
+/// `sample(trame, k)` donne l'échantillon du k-ième canal de la cible. Tout se compte en
+/// trames entières : une piste stéréo ne se désentrelace jamais.
+fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize, usize) -> f32) -> bool {
+    let w = t.width.max(1);
     if t.pending > 0 {
-        let z = t.pending.min(t.prod.slots());
-        if let Ok(chunk) = t.prod.write_chunk_uninit(z) {
-            chunk.fill_from_iter(std::iter::repeat_n(0.0f32, z));
+        let z = t.pending.min(t.prod.slots() / w);
+        if let Ok(chunk) = t.prod.write_chunk_uninit(z * w) {
+            chunk.fill_from_iter(std::iter::repeat_n(0.0f32, z * w));
         }
         t.pending -= z;
     }
     let n = if t.pending > 0 {
         0
     } else {
-        frames.min(t.prod.slots())
+        frames.min(t.prod.slots() / w)
     };
     if n > 0
-        && let Ok(chunk) = t.prod.write_chunk_uninit(n)
+        && let Ok(chunk) = t.prod.write_chunk_uninit(n * w)
     {
-        chunk.fill_from_iter((0..n).map(&sample));
+        chunk.fill_from_iter((0..n * w).map(|i| sample(i / w, i % w)));
     }
     if n < frames {
         t.pending += frames - n;
@@ -768,15 +787,15 @@ mod tests {
     fn overrun_keeps_alignment() {
         let (prod, mut cons) = rtrb::RingBuffer::new(100);
         let mut t = RecTarget::new(0, prod);
-        assert!(!feed_target(&mut t, 80, |_| 1.0));
+        assert!(!feed_target(&mut t, 80, |_, _| 1.0));
         // Seules 20 trames tiennent : 30 sont perdues.
-        assert!(feed_target(&mut t, 50, |_| 2.0));
+        assert!(feed_target(&mut t, 50, |_, _| 2.0));
         assert_eq!(t.pending, 30);
         let mut got: Vec<f32> = Vec::new();
         while let Ok(x) = cons.pop() {
             got.push(x);
         }
-        assert!(!feed_target(&mut t, 40, |_| 3.0));
+        assert!(!feed_target(&mut t, 40, |_, _| 3.0));
         while let Ok(x) = cons.pop() {
             got.push(x);
         }
@@ -786,5 +805,32 @@ mod tests {
         assert!(got[80..100].iter().all(|&x| x == 2.0));
         assert!(got[100..130].iter().all(|&x| x == 0.0));
         assert!(got[130..].iter().all(|&x| x == 3.0));
+    }
+
+    /// Stéréo : entrelacement G/D, et la compensation de perte reste en trames entières
+    /// (jamais de canaux inversés après une saturation, même avec un tampon impair).
+    #[test]
+    fn stereo_overrun_keeps_channels() {
+        let (prod, mut cons) = rtrb::RingBuffer::new(101);
+        let mut t = RecTarget::stereo(2, prod);
+        assert_eq!(t.channels, [2, 3]);
+        let lr = |_: usize, k: usize| if k == 0 { -1.0 } else { 1.0 };
+        assert!(!feed_target(&mut t, 30, lr));
+        // 41 places : 20 trames entières seulement, 30 perdues.
+        assert!(feed_target(&mut t, 50, lr));
+        assert_eq!(t.pending, 30);
+        let mut got: Vec<f32> = Vec::new();
+        while let Ok(x) = cons.pop() {
+            got.push(x);
+        }
+        assert!(!feed_target(&mut t, 10, lr));
+        while let Ok(x) = cons.pop() {
+            got.push(x);
+        }
+        assert_eq!(got.len(), (30 + 50 + 10) * 2);
+        let frames: Vec<&[f32; 2]> = got.as_chunks::<2>().0.iter().collect();
+        assert!(frames[..50].iter().all(|f| **f == [-1.0, 1.0]));
+        assert!(frames[50..80].iter().all(|f| **f == [0.0, 0.0]));
+        assert!(frames[80..].iter().all(|f| **f == [-1.0, 1.0]));
     }
 }

@@ -138,8 +138,10 @@ fn run(
             let num = i + 1;
             let name = format!("{:02} - {}.wav", num, sanitize(&project.tracks[i].name));
             let path = s.dir.join(name);
-            let renderers = vec![TrackRenderer::new(project, i)];
-            export_one(project, renderers, 1, start, len, s, &path, |f| {
+            let r = TrackRenderer::new(project, i);
+            // Piste stéréo : fichier stéréo ; piste mono : fichier mono.
+            let ch = r.channels();
+            export_one(project, vec![r], ch, start, len, s, &path, |f| {
                 let p = (done_units as f64 + f) / units as f64;
                 progress.store((p * 1000.0) as u32, Ordering::Relaxed);
                 !cancel.load(Ordering::Relaxed)
@@ -241,7 +243,7 @@ fn export_one(
     let mut skip = resampler.as_ref().map_or(0, |r| r.output_delay());
     let mut written = 0u64;
 
-    let mut tbuf = vec![0f32; CHUNK];
+    let mut tbuf = vec![0f32; CHUNK * 2];
     let mut input: Vec<Vec<f32>> = vec![vec![0f32; CHUNK]; channels];
     let mut pos = 0u64;
 
@@ -272,10 +274,18 @@ fn export_one(
             ch.resize(n, 0.0);
         }
         for r in &mut renderers {
-            r.render(offset + pos, &mut tbuf[..n]);
-            for ch in &mut input {
-                for (d, x) in ch.iter_mut().zip(&tbuf[..n]) {
-                    *d += *x;
+            let rc = r.channels();
+            let buf = &mut tbuf[..n * rc];
+            r.render(offset + pos, buf);
+            for (j, ch) in input.iter_mut().enumerate() {
+                for (f, d) in ch.iter_mut().enumerate() {
+                    *d += match (rc, channels) {
+                        // Mono : même signal sur chaque canal de sortie (au centre).
+                        (1, _) => buf[f],
+                        // Stéréo vers mono : moyenne des deux canaux.
+                        (_, 1) => 0.5 * (buf[f * 2] + buf[f * 2 + 1]),
+                        _ => buf[f * 2 + j.min(1)],
+                    };
                 }
             }
         }
@@ -461,6 +471,79 @@ mod range_tests {
         assert_eq!(r.duration(), 3000);
         let first: f32 = r.samples::<f32>().next().unwrap().unwrap();
         assert!((first - 0.2).abs() < 1e-4);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Piste stéréo : stem stéréo ; le mix additionne stéréo et mono (au centre).
+    #[test]
+    fn export_stereo_stem_and_mix() {
+        let dir = std::env::temp_dir().join(format!("tp-export-st-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("St".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let spec = |channels| WavSpec {
+            channels,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = WavWriter::create(p.audio_dir().join("st.wav"), spec(2)).unwrap();
+        for _ in 0..1000 {
+            w.write_sample(0.4f32).unwrap();
+            w.write_sample(-0.4f32).unwrap();
+        }
+        w.finalize().unwrap();
+        let mut w = WavWriter::create(p.audio_dir().join("mo.wav"), spec(1)).unwrap();
+        for _ in 0..1000 {
+            w.write_sample(0.1f32).unwrap();
+        }
+        w.finalize().unwrap();
+        let st = p.add_track_ch(Some("Synthé".into()), Some(0), true);
+        let mo = p.add_track(Some("Voix".into()), Some(2));
+        for (id, file) in [(st, "st.wav"), (mo, "mo.wav")] {
+            p.track_mut(id).unwrap().clips.push(Clip {
+                id: id + 100,
+                file: file.into(),
+                start: 0,
+                offset: 0,
+                len: 1000,
+                src_len: 1000,
+                fade_in: 0,
+                fade_out: 0,
+            });
+        }
+        let s = ExportSettings {
+            sample_rate: 48000,
+            depth: BitDepth::F32,
+            stems: true,
+            mix: true,
+            dither: false,
+            dir: dir.join("Export"),
+            tracks: Vec::new(),
+            range: None,
+        };
+        let files = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert_eq!(files.len(), 3);
+        let read = |f: &PathBuf| {
+            let mut r = hound::WavReader::open(f).unwrap();
+            let ch = r.spec().channels;
+            let v: Vec<f32> = r.samples::<f32>().map(|x| x.unwrap()).collect();
+            (ch, v)
+        };
+        let (ch, v) = read(&files[0]);
+        assert_eq!(ch, 2, "stem stéréo");
+        assert_eq!(v.len(), 2000);
+        assert_eq!(&v[..2], &[0.4, -0.4]);
+        let (ch, v) = read(&files[1]);
+        assert_eq!(ch, 1, "stem mono");
+        assert_eq!(v[0], 0.1);
+        let (ch, v) = read(&files[2]);
+        assert_eq!(ch, 2);
+        assert!(
+            (v[0] - 0.5).abs() < 1e-6 && (v[1] + 0.3).abs() < 1e-6,
+            "{:?}",
+            &v[..2]
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

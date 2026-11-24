@@ -1,4 +1,4 @@
-//! Thread disque : vide les ring buffers d'entrée dans des fichiers WAV mono.
+//! Thread disque : vide les ring buffers d'entrée dans des fichiers WAV (mono ou stéréo).
 //!
 //! Sécurité « live » :
 //! - en-têtes WAV mis à jour toutes les 2 s et données forcées sur le disque (fsync)
@@ -35,7 +35,9 @@ pub struct RecSpec {
     pub file: String,
     pub path: PathBuf,
     pub peaks: Peaks,
+    /// Échantillons entrelacés de `channels` canaux (1 = mono, 2 = stéréo).
     pub cons: Consumer<f32>,
+    pub channels: u16,
 }
 
 /// Un fichier d'une prise (une prise longue peut en compter plusieurs).
@@ -94,6 +96,9 @@ struct LaneState {
     file: String,
     peaks: Peaks,
     dir: PathBuf,
+    wav: WavSpec,
+    /// Canal suivant à écrire dans la trame en cours.
+    k: usize,
     cur: Option<SegWriter>,
     done: Vec<Segment>,
     acc: PeakAccum,
@@ -142,9 +147,9 @@ impl LaneState {
         }
     }
 
-    fn open_next(&mut self, wav: WavSpec, errors: &Errors) {
+    fn open_next(&mut self, errors: &Errors) {
         let name = segment_name(&self.file, self.done.len() + 1);
-        match open_segment(&self.dir.join(&name), wav) {
+        match open_segment(&self.dir.join(&name), self.wav) {
             Ok(w) => self.cur = Some(w),
             Err(e) => self.fail(errors, format!("{name} : {e}")),
         }
@@ -168,25 +173,11 @@ impl Recorder {
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        let wav = match format {
-            RecFormat::Int24 => WavSpec {
-                channels: 1,
-                sample_rate,
-                bits_per_sample: 24,
-                sample_format: hound::SampleFormat::Int,
-            },
-            RecFormat::Float32 => WavSpec {
-                channels: 1,
-                sample_rate,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-            },
-        };
         let errors: Errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let errors2 = errors.clone();
         let handle = std::thread::Builder::new()
             .name("tracksplus-disk-writer".into())
-            .spawn(move || run(specs, wav, format, max_bytes, stop2, errors2))?;
+            .spawn(move || run(specs, sample_rate, format, max_bytes, stop2, errors2))?;
         Ok(Self {
             stop,
             errors,
@@ -240,16 +231,28 @@ pub enum FinishError {
 /// Délai maximal d'attente de la fin d'écriture à l'arrêt.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Format WAV d'une prise.
+fn wav_spec(format: RecFormat, sample_rate: u32, channels: u16) -> WavSpec {
+    let (bits_per_sample, sample_format) = match format {
+        RecFormat::Int24 => (24, hound::SampleFormat::Int),
+        RecFormat::Float32 => (32, hound::SampleFormat::Float),
+    };
+    WavSpec {
+        channels: channels.max(1),
+        sample_rate,
+        bits_per_sample,
+        sample_format,
+    }
+}
+
 fn run(
     specs: Vec<RecSpec>,
-    wav: WavSpec,
+    sample_rate: u32,
     format: RecFormat,
     max_bytes: u64,
     stop: Arc<AtomicBool>,
     errors: Errors,
 ) -> Vec<RecResult> {
-    let bytes_per_frame = (wav.bits_per_sample / 8) as u64;
-    let max_frames = (max_bytes.saturating_sub(1024) / bytes_per_frame).max(1);
     let mut lanes: Vec<Lane> = specs
         .into_iter()
         .map(|spec| {
@@ -258,17 +261,20 @@ fn run(
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
+            let wav = wav_spec(format, sample_rate, spec.channels);
             let mut st = LaneState {
                 track_id: spec.track_id,
                 file: spec.file,
                 peaks: spec.peaks,
                 dir,
+                wav,
+                k: 0,
                 cur: None,
                 done: Vec::new(),
                 acc: PeakAccum::default(),
                 error: None,
             };
-            st.open_next(wav, &errors);
+            st.open_next(&errors);
             Lane {
                 cons: spec.cons,
                 st,
@@ -303,13 +309,24 @@ fn run(
                 continue;
             };
             let st = &mut lane.st;
+            let width = st.wav.channels as usize;
+            let bytes_per_frame = (st.wav.bits_per_sample / 8) as u64 * width as u64;
+            let max_frames = (max_bytes.saturating_sub(1024) / bytes_per_frame).max(1);
             let (a, b) = chunk.as_slices();
             for &s in a.iter().chain(b) {
-                st.acc.push(s, &mut peaks_tmp);
-                if st.cur.as_ref().is_some_and(|c| c.frames >= max_frames) {
-                    // Fichier plein : on passe au suivant sans interrompre la prise.
+                // Position dans la trame, indépendante de l'état du fichier : même après
+                // une erreur d'écriture, les canaux restent dans le bon ordre.
+                let k = st.k;
+                st.k = (k + 1) % width;
+                st.acc.add(s);
+                if k + 1 == width {
+                    st.acc.end_frame(&mut peaks_tmp);
+                }
+                if k == 0 && st.cur.as_ref().is_some_and(|c| c.frames >= max_frames) {
+                    // Fichier plein : on passe au suivant (sur une trame entière) sans
+                    // interrompre la prise.
                     st.close_current(&errors, &sync_tx);
-                    st.open_next(wav, &errors);
+                    st.open_next(&errors);
                 }
                 let Some(seg) = st.cur.as_mut() else {
                     continue;
@@ -321,7 +338,11 @@ fn run(
                     RecFormat::Float32 => seg.w.write_sample(if s.is_finite() { s } else { 0.0 }),
                 };
                 match r {
-                    Ok(()) => seg.frames += 1,
+                    Ok(()) => {
+                        if k + 1 == width {
+                            seg.frames += 1;
+                        }
+                    }
                     Err(e) => {
                         let msg = format!("{} : {e}", st.file);
                         st.fail(&errors, msg);
@@ -427,6 +448,7 @@ mod tests {
                     path: p.audio_dir().join(&file),
                     peaks: peaks.clone(),
                     cons,
+                    channels: 1,
                 }],
                 48000,
                 format,
@@ -492,6 +514,7 @@ mod tests {
                 path: dir.join("T_001.wav"),
                 peaks,
                 cons,
+                channels: 1,
             }],
             48000,
             RecFormat::Int24,
@@ -517,6 +540,62 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Stéréo : un WAV 2 canaux, G/D jamais inversés, y compris quand la prise passe
+    /// au fichier suivant ; la forme d'onde est comptée en trames.
+    #[test]
+    fn stereo_take_rolls_over_on_frames() {
+        let dir = std::env::temp_dir().join(format!("tp-stereo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut prod, cons) = rtrb::RingBuffer::new(100_000);
+        let peaks = Arc::new(RwLock::new(PeakData::default()));
+        // 30 000 octets ≈ 4 826 trames stéréo 24 bits par fichier.
+        let rec = Recorder::start_with_limit(
+            vec![RecSpec {
+                track_id: 1,
+                file: "S_001.wav".into(),
+                path: dir.join("S_001.wav"),
+                peaks: peaks.clone(),
+                cons,
+                channels: 2,
+            }],
+            48000,
+            RecFormat::Int24,
+            30_000,
+        )
+        .unwrap();
+        let frames = 12_000usize;
+        for i in 0..frames {
+            let v = (i % 100) as f32 / 1000.0;
+            prod.push(v).unwrap();
+            prod.push(-v).unwrap();
+        }
+        drop(prod);
+        let res = rec.finish().unwrap();
+        assert!(res[0].error.is_none());
+        assert_eq!(res[0].frames(), frames as u64);
+        assert_eq!(res[0].segments.len(), 3);
+        assert_eq!(
+            peaks.read().l0.len(),
+            frames.div_ceil(crate::render::PEAK_BLOCK)
+        );
+        let mut n = 0usize;
+        for sg in &res[0].segments {
+            let mut r = hound::WavReader::open(dir.join(&sg.file)).unwrap();
+            assert_eq!(r.spec().channels, 2);
+            assert_eq!(r.duration() as u64, sg.frames);
+            let s: Vec<i32> = r.samples::<i32>().map(|x| x.unwrap()).collect();
+            for f in s.as_chunks::<2>().0 {
+                assert_eq!(f[0], -f[1], "trame {n} : canaux inversés");
+                let want = ((n % 100) as f32 / 1000.0 * 8_388_607.0).round() as i32;
+                assert_eq!(f[0], want, "trame {n}");
+                n += 1;
+            }
+        }
+        assert_eq!(n, frames);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Un fichier impossible à créer est signalé tout de suite ; les autres pistes
     /// continuent normalement et l'arrêt se passe sans blocage.
     #[test]
@@ -534,6 +613,7 @@ mod tests {
                     path: dir.join("ok.wav"),
                     peaks: Arc::new(RwLock::new(PeakData::default())),
                     cons: c_ok,
+                    channels: 1,
                 },
                 RecSpec {
                     track_id: 2,
@@ -541,6 +621,7 @@ mod tests {
                     path: dir.join("absent/bad.wav"),
                     peaks: Arc::new(RwLock::new(PeakData::default())),
                     cons: c_bad,
+                    channels: 1,
                 },
             ],
             48000,
@@ -591,6 +672,7 @@ mod load_test {
                 path: dir.join(format!("t{i}.wav")),
                 peaks: Arc::new(RwLock::new(PeakData::default())),
                 cons: c,
+                channels: 1,
             });
         }
         let rec = Recorder::start(specs, sr as u32, RecFormat::Int24).unwrap();

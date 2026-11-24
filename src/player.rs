@@ -37,14 +37,23 @@ impl Mixer {
             if !self.audible[*i].load(Ordering::Relaxed) {
                 continue;
             }
-            t.render(self.pos, &mut self.tbuf);
-            for (m, s) in self.mix.iter_mut().zip(&self.tbuf) {
-                *m += *s;
+            let ch = t.channels();
+            let buf = &mut self.tbuf[..BLOCK * ch];
+            t.render(self.pos, buf);
+            if ch == 2 {
+                for (m, s) in self.mix.iter_mut().zip(buf.iter()) {
+                    *m += *s;
+                }
+            } else {
+                // Piste mono : au centre (même niveau à gauche et à droite).
+                for (m, s) in self.mix.as_chunks_mut::<2>().0.iter_mut().zip(buf.iter()) {
+                    m[0] += *s;
+                    m[1] += *s;
+                }
             }
         }
         if let Ok(chunk) = prod.write_chunk_uninit(BLOCK * 2) {
-            let mix = &self.mix;
-            chunk.fill_from_iter(mix.iter().flat_map(|&s| [s, s]));
+            chunk.fill_from_iter(self.mix.iter().copied());
         }
         self.pos += BLOCK as u64;
         true
@@ -66,8 +75,8 @@ impl Player {
             tracks,
             audible: audible.clone(),
             pos,
-            tbuf: vec![0.0; BLOCK],
-            mix: vec![0.0; BLOCK],
+            tbuf: vec![0.0; BLOCK * 2],
+            mix: vec![0.0; BLOCK * 2],
         };
         // Pré-remplissage pour éviter un trou au démarrage.
         // Petit pré-remplissage sur le thread appelant (le reste se fait en arrière-plan),

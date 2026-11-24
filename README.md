@@ -13,8 +13,10 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 
 - **Carte son** : pilote (ASIO / WASAPI, CoreAudio, ALSA / JACK), entrée, sortie, fréquence,
   buffer. Configuration mémorisée : on retrouve sa carte Dante au lancement.
-- **Pistes** : une piste = une entrée mono. Sélecteur d'entrée en grille (1 à 64+, entrées déjà
-  utilisées signalées). « 1 piste / entrée » crée d'un coup les pistes d'un profil Dante.
+- **Pistes** : « Ajouter une piste » → **Mono** ou **Stéréo**, puis l'entrée (un clic crée la
+  piste). Mono = une entrée ; stéréo = une paire fixe (1-2, 3-4…) enregistrée dans un seul WAV
+  stéréo. Sélecteur en grille (1 à 64+, entrées déjà utilisées signalées), réglable ensuite
+  depuis l'étiquette « IN » de la piste (mono / stéréo et entrée).
   Armement, **M**ute / **S**olo pour l'écoute, renommage direct.
 - **Vumètres pro** : crête façon IEC 60268-18 (échelle dB non linéaire, plus précise près de 0),
   zones vert / jaune (−12 dB) / rouge (−3 dB), maintien de crête, valeur crête max en dB et
@@ -42,7 +44,7 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 - **Repères** (touche M, même pendant l'enregistrement) : renommer, supprimer, sélectionner
   jusqu'au repère suivant, flèches ← / → pour sauter de repère en repère.
 - **Export** : pistes **choisies une à une** (ou la sélection de la timeline), toute la
-  session ou **seulement la plage sélectionnée**, pistes séparées et/ou mix stéréo,
+  session ou **seulement la plage sélectionnée**, pistes séparées (stéréo pour les pistes stéréo) et/ou mix stéréo,
   44.1 / 48 / 88.2 / 96 kHz, 16 bits (dither TPDF) / 24 bits / 32 bits entier / 32 bits flottant.
 
 ## Onglet Soundboard
@@ -121,7 +123,7 @@ Conçu pour ne jamais perdre une prise :
 
 1. Réglages carte son (pastille en haut à droite) → pilote **ASIO** (Windows) ou **CoreAudio**
    (macOS) → **Dante Virtual Soundcard**. Fréquence identique à Dante Controller.
-2. Multipiste : « 1 piste / entrée », renommez, armez, ⏺.
+2. Multipiste : « Ajouter une piste » (mono ou stéréo) pour chaque entrée, renommez, armez, ⏺.
 3. Soundboard : choisissez la paire de sorties Dante dédiée aux pads.
 
 ## Compiler

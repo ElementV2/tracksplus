@@ -47,26 +47,36 @@ pub fn to_peak(min: f32, max: f32) -> [i16; 2] {
 }
 
 /// Accumulateur de forme d'onde utilisé pendant l'enregistrement.
+/// Compte en trames : en stéréo, la forme d'onde couvre les deux canaux.
 #[derive(Default)]
 pub struct PeakAccum {
     min: f32,
     max: f32,
+    /// Au moins un échantillon depuis le dernier point émis.
+    started: bool,
     n: usize,
 }
 
 impl PeakAccum {
-    pub fn push(&mut self, s: f32, out: &mut Vec<[i16; 2]>) {
-        if self.n == 0 {
-            self.min = s;
-            self.max = s;
-        } else {
+    /// Ajoute un échantillon de la trame en cours (sans la terminer).
+    pub fn add(&mut self, s: f32) {
+        if self.started {
             self.min = self.min.min(s);
             self.max = self.max.max(s);
+        } else {
+            self.min = s;
+            self.max = s;
+            self.started = true;
         }
+    }
+
+    /// Termine la trame en cours.
+    pub fn end_frame(&mut self, out: &mut Vec<[i16; 2]>) {
         self.n += 1;
         if self.n == PEAK_BLOCK {
             out.push(to_peak(self.min, self.max));
             self.n = 0;
+            self.started = false;
         }
     }
 
@@ -74,6 +84,7 @@ impl PeakAccum {
         if self.n > 0 {
             out.push(to_peak(self.min, self.max));
             self.n = 0;
+            self.started = false;
         }
     }
 }
@@ -83,16 +94,20 @@ pub fn compute_peaks(path: &PathBuf, dst: &Peaks) {
     let Ok(mut src) = WavSource::open(path) else {
         return;
     };
+    let ch = src.channels().min(2);
     let mut acc = PeakAccum::default();
-    let mut buf = vec![0f32; 65536];
+    let mut buf = vec![0f32; 65536 * ch];
     let mut local = Vec::new();
     loop {
-        let n = src.read(&mut buf);
+        let n = src.read_frames(&mut buf, ch);
         if n == 0 {
             break;
         }
-        for &s in &buf[..n] {
-            acc.push(s, &mut local);
+        for f in buf[..n * ch].chunks_exact(ch) {
+            for &s in f {
+                acc.add(s);
+            }
+            acc.end_frame(&mut local);
         }
         dst.write().extend(&local);
         local.clear();
@@ -101,7 +116,7 @@ pub fn compute_peaks(path: &PathBuf, dst: &Peaks) {
     dst.write().extend(&local);
 }
 
-/// Lecteur WAV mono séquentiel avec repositionnement.
+/// Lecteur WAV séquentiel (mono ou multicanal) avec repositionnement.
 pub struct WavSource {
     reader: WavReader<BufReader<File>>,
     float: bool,
@@ -139,25 +154,54 @@ impl WavSource {
         }
     }
 
-    /// Lit jusqu'à `out.len()` trames (premier canal). Retourne le nombre lu.
-    pub fn read(&mut self, out: &mut [f32]) -> usize {
-        let want = out.len().min((self.frames - self.pos) as usize);
-        let total = want * self.channels;
-        let mut n = 0;
-        if self.float {
-            for (i, s) in self.reader.samples::<f32>().take(total).enumerate() {
-                if i % self.channels == 0 {
-                    out[n] = s.unwrap_or(0.0);
-                    n += 1;
-                }
-            }
+    /// Nombre de canaux du fichier.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Lit jusqu'à `out.len() / out_ch` trames, entrelacées sur `out_ch` canaux (1 ou 2).
+    /// Le fichier est adapté : mono → stéréo par duplication, stéréo → mono par moyenne
+    /// des deux premiers canaux. Retourne le nombre de trames lues.
+    pub fn read_frames(&mut self, out: &mut [f32], out_ch: usize) -> usize {
+        let out_ch = out_ch.clamp(1, 2);
+        let fc = self.channels;
+        let want = (out.len() / out_ch).min((self.frames - self.pos) as usize);
+        let total = want * fc;
+        let float = self.float;
+        let scale = self.scale;
+        // Échantillons du fichier, convertis en f32 (une erreur de lecture = silence).
+        let samples: Box<dyn Iterator<Item = f32> + '_> = if float {
+            Box::new(
+                self.reader
+                    .samples::<f32>()
+                    .take(total)
+                    .map(|s| s.unwrap_or(0.0)),
+            )
         } else {
-            let scale = self.scale;
-            for (i, s) in self.reader.samples::<i32>().take(total).enumerate() {
-                if i % self.channels == 0 {
-                    out[n] = s.unwrap_or(0) as f32 * scale;
-                    n += 1;
+            Box::new(
+                self.reader
+                    .samples::<i32>()
+                    .take(total)
+                    .map(move |s| s.unwrap_or(0) as f32 * scale),
+            )
+        };
+        let mut n = 0;
+        let mut l = 0f32;
+        for (i, s) in samples.enumerate() {
+            let k = i % fc;
+            match (fc, out_ch) {
+                (1, 1) => out[n] = s,
+                (1, _) => {
+                    out[n * 2] = s;
+                    out[n * 2 + 1] = s;
                 }
+                (_, 1) if k == 0 => l = s,
+                (_, 1) if k == 1 => out[n] = 0.5 * (l + s),
+                (_, _) if k < 2 => out[n * 2 + k] = s,
+                _ => {}
+            }
+            if k == fc - 1 {
+                n += 1;
             }
         }
         self.pos += n as u64;
@@ -172,15 +216,18 @@ struct ClipSource {
     failed: bool,
 }
 
-/// Rend le signal d'une piste (mono) à n'importe quelle position de la timeline.
+/// Rend le signal d'une piste (mono, ou stéréo entrelacé) à n'importe quelle position
+/// de la timeline.
 pub struct TrackRenderer {
     clips: Vec<ClipSource>,
     tmp: Vec<f32>,
+    channels: usize,
 }
 
 impl TrackRenderer {
     pub fn new(project: &Project, track_idx: usize) -> Self {
-        let clips = project.tracks[track_idx]
+        let track = &project.tracks[track_idx];
+        let clips = track
             .clips
             .iter()
             .map(|c| ClipSource {
@@ -193,6 +240,7 @@ impl TrackRenderer {
         Self {
             clips,
             tmp: Vec::new(),
+            channels: track.channels(),
         }
     }
 
@@ -200,11 +248,17 @@ impl TrackRenderer {
         self.clips.is_empty()
     }
 
-    /// Écrit dans `out` le signal de la piste pour `[pos, pos + out.len())`.
-    /// Les prises les plus récentes recouvrent les plus anciennes.
+    /// Canaux rendus par `render` (1 = mono, 2 = stéréo entrelacé).
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Écrit dans `out` le signal de la piste pour `[pos, pos + out.len() / channels)`,
+    /// entrelacé sur `channels()` canaux. Les prises récentes recouvrent les anciennes.
     pub fn render(&mut self, pos: u64, out: &mut [f32]) {
         out.fill(0.0);
-        let end = pos + out.len() as u64;
+        let ch = self.channels;
+        let end = pos + (out.len() / ch) as u64;
         // Fichiers ouverts uniquement autour de la position de lecture : ouverture un peu
         // en avance (pas de trou au début d'une prise), fermeture une fois la prise passée.
         // Le nombre de fichiers ouverts reste ainsi borné, même avec des centaines de prises.
@@ -240,18 +294,21 @@ impl TrackRenderer {
             let n = (to - from) as usize;
             let dst_off = (from - pos) as usize;
             src.seek(c.offset + (from - c.start));
-            self.tmp.resize(n, 0.0);
-            let got = src.read(&mut self.tmp[..n]);
-            self.tmp[got..n].fill(0.0);
+            self.tmp.resize(n * ch, 0.0);
+            let got = src.read_frames(&mut self.tmp[..n * ch], ch);
+            self.tmp[got * ch..n * ch].fill(0.0);
+            let dst = &mut out[dst_off * ch..(dst_off + n) * ch];
             if c.fade_in == 0 && c.fade_out == 0 {
-                out[dst_off..dst_off + n].copy_from_slice(&self.tmp[..n]);
+                dst.copy_from_slice(&self.tmp[..n * ch]);
             } else {
                 // Fondu : la prise recouvre ce qui est dessous en proportion de son gain,
                 // ce qui fait un fondu enchaîné naturel entre prises qui se chevauchent.
                 for k in 0..n {
                     let g = c.fade_gain(from + k as u64);
-                    let o = &mut out[dst_off + k];
-                    *o = *o * (1.0 - g) + self.tmp[k] * g;
+                    for j in 0..ch {
+                        let o = &mut dst[k * ch + j];
+                        *o = *o * (1.0 - g) + self.tmp[k * ch + j] * g;
+                    }
                 }
             }
         }
@@ -313,6 +370,68 @@ mod tests {
             "moitié du fondu enchaîné A→B"
         );
         assert!((out[1500] - 0.5).abs() < 1e-6);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Pistes stéréo : fichier stéréo lu tel quel, fichier mono dupliqué sur G/D, et
+    /// fichier stéréo posé sur une piste mono ramené à la moyenne des deux canaux.
+    #[test]
+    fn stereo_tracks_adapt_files() {
+        let dir = std::env::temp_dir().join(format!("tp-render-st-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("S".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let spec = |channels| hound::WavSpec {
+            channels,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(p.audio_dir().join("st.wav"), spec(2)).unwrap();
+        for _ in 0..1000 {
+            w.write_sample(0.8f32).unwrap();
+            w.write_sample(-0.2f32).unwrap();
+        }
+        w.finalize().unwrap();
+        let mut w = hound::WavWriter::create(p.audio_dir().join("mo.wav"), spec(1)).unwrap();
+        for _ in 0..1000 {
+            w.write_sample(0.5f32).unwrap();
+        }
+        w.finalize().unwrap();
+        let clip = |id, file: &str, start| Clip {
+            id,
+            file: file.into(),
+            start,
+            offset: 0,
+            len: 1000,
+            src_len: 1000,
+            fade_in: 0,
+            fade_out: 0,
+        };
+        let st = p.add_track_ch(None, Some(0), true);
+        p.track_mut(st).unwrap().clips.push(clip(1, "st.wav", 0));
+        p.track_mut(st).unwrap().clips.push(clip(2, "mo.wav", 2000));
+        let mo = p.add_track(None, Some(2));
+        p.track_mut(mo).unwrap().clips.push(clip(3, "st.wav", 0));
+
+        let mut r = TrackRenderer::new(&p, 0);
+        assert_eq!(r.channels(), 2);
+        let mut out = vec![9.0f32; 3000 * 2];
+        r.render(0, &mut out);
+        assert_eq!(&out[..2], &[0.8, -0.2]);
+        assert_eq!(&out[1998..2000], &[0.8, -0.2]);
+        assert_eq!(&out[2000..2002], &[0.0, 0.0]);
+        assert_eq!(&out[4000..4002], &[0.5, 0.5], "mono dupliqué");
+        // Lecture à partir du milieu : toujours aligné sur des trames entières.
+        let mut out = vec![0.0f32; 10];
+        r.render(500, &mut out);
+        assert!(out.as_chunks::<2>().0.iter().all(|f| *f == [0.8, -0.2]));
+
+        let mut r = TrackRenderer::new(&p, 1);
+        assert_eq!(r.channels(), 1);
+        let mut out = vec![0.0f32; 1000];
+        r.render(0, &mut out);
+        assert!(out.iter().all(|&x| (x - 0.3).abs() < 1e-6), "moyenne G/D");
         std::fs::remove_dir_all(dir).ok();
     }
 }

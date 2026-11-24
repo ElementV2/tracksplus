@@ -87,6 +87,17 @@ impl MeterState {
         self.clip = false;
         self.hold = 0.0;
     }
+
+    /// Vumètre combiné de plusieurs canaux (affichage numérique d'une piste stéréo).
+    pub fn merge(self, o: MeterState) -> MeterState {
+        MeterState {
+            level: self.level.max(o.level),
+            hold: self.hold.max(o.hold),
+            hold_until: self.hold_until.max(o.hold_until),
+            max: self.max.max(o.max),
+            clip: self.clip || o.clip,
+        }
+    }
 }
 
 fn zone_color(db: f32) -> Color32 {

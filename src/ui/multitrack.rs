@@ -366,21 +366,36 @@ impl App {
         {
             self.open_export();
         }
+        // Ajouter une piste : mono ou stéréo, puis l'entrée (un clic = piste créée).
         let in_ch = self.engine.status.in_channels;
-        if w::tool_button(
+        let resp = w::tool_button(
             &mut child,
-            None,
-            &format!("Une piste par entrée ({in_ch})"),
+            Some(Icon::Plus),
+            "Ajouter une piste",
             false,
-            stopped && in_ch > 0,
-        )
-        .on_hover_text("Crée une piste pour chaque entrée non utilisée (idéal pour Dante)")
-        .clicked()
-        {
-            self.add_track_per_input();
-        }
-        if w::tool_button(&mut child, Some(Icon::Plus), "Piste", false, stopped).clicked() {
-            self.add_track();
+            stopped,
+        );
+        let mut stereo = self.add_stereo;
+        let mut add: Option<Option<u16>> = None;
+        egui::Popup::menu(&resp)
+            .width(picker_width(stereo))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                w::segmented(
+                    ui,
+                    "addmode",
+                    &mut stereo,
+                    &[(false, "Mono"), (true, "Stéréo")],
+                );
+                ui.add_space(6.0);
+                add = input_picker(ui, None, stereo, in_ch, &self.project.tracks, None);
+                if add.is_some() {
+                    ui.close();
+                }
+            });
+        self.add_stereo = stereo;
+        if let Some(input) = add {
+            self.add_track_on(input, stereo);
         }
     }
 
@@ -1120,12 +1135,22 @@ impl App {
                     }
                 });
                 let input = track.input;
+                let stereo = track.stereo;
+                let label = track.input_label();
+                let chans: Vec<u16> = track.inputs().collect();
+                let ms: Vec<MeterState> = chans
+                    .iter()
+                    .map(|&i| {
+                        if (i as usize) < audio::MAX_INPUTS && i < in_ch {
+                            self.in_meters[i as usize]
+                        } else {
+                            MeterState::default()
+                        }
+                    })
+                    .collect();
                 let mut new_input: Option<Option<u16>> = None;
+                let mut new_stereo: Option<bool> = None;
                 hdr.horizontal(|ui| {
-                    let label = match input {
-                        Some(i) => format!("IN {}", i + 1),
-                        None => "IN —".into(),
-                    };
                     let (r, resp) = ui.allocate_exact_size(
                         vec2(48.0, 18.0),
                         if stopped {
@@ -1144,35 +1169,80 @@ impl App {
                         t::medium(10.0),
                         if input.is_some() { t::TEXT } else { t::TEXT_3 },
                     );
-                    let resp = resp.on_hover_text("Choisir l'entrée de la carte");
-                    egui::Popup::menu(&resp).width(8.0 * 34.0).show(|ui| {
-                        new_input = input_picker(ui, input, in_ch, &self.project.tracks, tid);
-                    });
-                    let m = input
-                        .filter(|&i| (i as usize) < audio::MAX_INPUTS && i < in_ch)
-                        .map(|i| self.in_meters[i as usize])
-                        .unwrap_or_default();
+                    let resp = resp.on_hover_text("Mono / stéréo et entrée de la carte");
+                    egui::Popup::menu(&resp)
+                        .width(picker_width(stereo))
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            let mut s = stereo;
+                            if w::segmented(
+                                ui,
+                                "trackmode",
+                                &mut s,
+                                &[(false, "Mono"), (true, "Stéréo")],
+                            ) {
+                                new_stereo = Some(s);
+                            }
+                            ui.add_space(6.0);
+                            // En changeant de mode, l'entrée est d'abord recalée (paire paire).
+                            let cur = input.map(|i| if s { i & !1 } else { i });
+                            new_input =
+                                input_picker(ui, cur, s, in_ch, &self.project.tracks, Some(tid));
+                            if new_input.is_some() {
+                                ui.close();
+                            }
+                        });
                     let (mr, _) = ui.allocate_exact_size(vec2(162.0, 18.0), Sense::hover());
-                    w::meter_h(
-                        ui.painter(),
-                        Rect::from_center_size(mr.center(), vec2(mr.width(), 6.0)),
-                        &m,
-                    );
+                    if ms.len() == 2 {
+                        // Stéréo : gauche en haut, droite en bas.
+                        for (k, m) in ms.iter().enumerate() {
+                            let y = mr.center().y - 1.6 + k as f32 * 3.2;
+                            w::meter_h(
+                                ui.painter(),
+                                Rect::from_center_size(
+                                    pos2(mr.center().x, y),
+                                    vec2(mr.width(), 2.6),
+                                ),
+                                m,
+                            );
+                        }
+                    } else {
+                        w::meter_h(
+                            ui.painter(),
+                            Rect::from_center_size(mr.center(), vec2(mr.width(), 6.0)),
+                            &ms.first().copied().unwrap_or_default(),
+                        );
+                    }
+                    let merged = ms
+                        .iter()
+                        .copied()
+                        .reduce(MeterState::merge)
+                        .unwrap_or_default();
                     let (pr, presp) = ui.allocate_exact_size(vec2(36.0, 16.0), Sense::click());
-                    w::peak_readout(ui.painter(), pr, &m);
+                    w::peak_readout(ui.painter(), pr, &merged);
                     if presp
                         .on_hover_text("Crête max — clic : remise à zéro")
                         .clicked()
-                        && let Some(i) = input
-                        && let Some(mm) = self.in_meters.get_mut(i as usize)
                     {
-                        mm.reset();
+                        for &i in &chans {
+                            if let Some(mm) = self.in_meters.get_mut(i as usize) {
+                                mm.reset();
+                            }
+                        }
                     }
                 });
-                if let Some(ni) = new_input {
+                if new_stereo.is_some() || new_input.is_some() {
                     let track = &mut self.project.tracks[idx];
-                    track.input = ni;
-                    if ni.is_none() {
+                    if let Some(s) = new_stereo {
+                        track.stereo = s;
+                        if s {
+                            track.input = track.input.map(|i| i & !1);
+                        }
+                    }
+                    if let Some(ni) = new_input {
+                        track.input = ni;
+                    }
+                    if track.input.is_none() {
                         track.armed = false;
                     }
                     self.project.dirty = true;
@@ -1425,16 +1495,7 @@ impl App {
                     }
                 });
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                if w::tool_button(ui, Some(Icon::Plus), "Ajouter une piste", false, stopped)
-                    .clicked()
-                {
-                    self.add_track();
-                }
-            });
-            ui.add_space(40.0);
+            ui.add_space(50.0);
         });
         self.view.scroll_y = out.state.clamped_offset().y;
         self.view.viewport_h = out.inner_rect.height();
@@ -1550,14 +1611,28 @@ impl App {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 1.0;
                     let col_w = 44.0;
-                    let tracks: Vec<(u64, String, Option<u16>, bool, usize)> = self
+                    let tracks: Vec<(u64, String, Vec<u16>, bool, usize, String)> = self
                         .project
                         .tracks
                         .iter()
                         .enumerate()
-                        .map(|(i, tr)| (tr.id, tr.name.clone(), tr.input, tr.armed, i))
+                        .map(|(i, tr)| {
+                            let label = match tr.input {
+                                Some(i) if tr.stereo => format!("entrées {}-{}", i + 1, i + 2),
+                                Some(i) => format!("entrée {}", i + 1),
+                                None => "pas d'entrée".into(),
+                            };
+                            (
+                                tr.id,
+                                tr.name.clone(),
+                                tr.inputs().collect(),
+                                tr.armed,
+                                i,
+                                label,
+                            )
+                        })
                         .collect();
-                    for (id, name, input, armed, idx) in tracks {
+                    for (id, name, chans, armed, idx, label) in tracks {
                         let (r, resp) =
                             ui.allocate_exact_size(vec2(col_w, area.height()), Sense::click());
                         let p = ui.painter();
@@ -1565,20 +1640,40 @@ impl App {
                         if sel || resp.hovered() {
                             p.rect_filled(r, 0.0, if sel { t::SURFACE_3 } else { t::SURFACE_2 });
                         }
-                        let m = input
-                            .filter(|&i| (i as usize) < audio::MAX_INPUTS && i < in_ch)
-                            .map(|i| self.in_meters[i as usize])
+                        let ms: Vec<MeterState> = chans
+                            .iter()
+                            .map(|&i| {
+                                if (i as usize) < audio::MAX_INPUTS && i < in_ch {
+                                    self.in_meters[i as usize]
+                                } else {
+                                    MeterState::default()
+                                }
+                            })
+                            .collect();
+                        let merged = ms
+                            .iter()
+                            .copied()
+                            .reduce(MeterState::merge)
                             .unwrap_or_default();
                         let pr = Rect::from_center_size(
                             pos2(r.center().x, r.top() + 10.0),
                             vec2(38.0, 15.0),
                         );
-                        w::peak_readout(p, pr, &m);
-                        let mr = Rect::from_min_max(
-                            pos2(r.center().x - 4.0, top),
-                            pos2(r.center().x + 4.0, bottom),
-                        );
-                        w::meter_v(p, mr, &m);
+                        w::peak_readout(p, pr, &merged);
+                        if ms.len() == 2 {
+                            // Stéréo : deux barres côte à côte (gauche, droite).
+                            for (k, m) in ms.iter().enumerate() {
+                                let x = r.center().x - 4.0 + k as f32 * 4.5;
+                                let mr = Rect::from_min_max(pos2(x, top), pos2(x + 3.5, bottom));
+                                w::meter_v(p, mr, m);
+                            }
+                        } else {
+                            let mr = Rect::from_min_max(
+                                pos2(r.center().x - 4.0, top),
+                                pos2(r.center().x + 4.0, bottom),
+                            );
+                            w::meter_v(p, mr, &merged);
+                        }
                         p.rect_filled(
                             Rect::from_min_size(
                                 pos2(r.left() + 6.0, bottom + 6.0),
@@ -1601,21 +1696,15 @@ impl App {
                             t::regular(9.0),
                             t::TEXT_3,
                         );
-                        let resp = resp.on_hover_text(format!(
-                            "{name} — {}",
-                            input.map_or("pas d'entrée".to_string(), |i| format!(
-                                "entrée {}",
-                                i + 1
-                            ))
-                        ));
+                        let resp = resp.on_hover_text(format!("{name} — {label}"));
                         if resp.clicked()
                             && let Some(pp) = resp.interact_pointer_pos()
                         {
                             if pr.contains(pp) {
-                                if let Some(i) = input
-                                    && let Some(mm) = self.in_meters.get_mut(i as usize)
-                                {
-                                    mm.reset();
+                                for &i in &chans {
+                                    if let Some(mm) = self.in_meters.get_mut(i as usize) {
+                                        mm.reset();
+                                    }
                                 }
                             } else {
                                 self.selected_tracks.clear();
@@ -1628,31 +1717,51 @@ impl App {
     }
 }
 
+/// Largeur du menu de choix d'entrée (8 colonnes).
+fn picker_width(stereo: bool) -> f32 {
+    8.0 * if stereo { 46.0 } else { 34.0 }
+}
+
 /// Grille 8 colonnes pour choisir une entrée (jusqu'à 64 canaux Dante et plus).
+/// En stéréo, on choisit une paire fixe : 1-2, 3-4, 5-6…
+/// `me` = piste en cours de réglage (ses propres entrées ne comptent pas comme occupées).
 fn input_picker(
     ui: &mut egui::Ui,
     current: Option<u16>,
+    stereo: bool,
     in_ch: u16,
     tracks: &[crate::project::Track],
-    me: u64,
+    me: Option<u64>,
 ) -> Option<Option<u16>> {
     let mut out = None;
-    w::section(ui, "Entrée");
+    w::section(
+        ui,
+        if stereo {
+            "Paire d'entrées"
+        } else {
+            "Entrée"
+        },
+    );
     if in_ch == 0 {
         ui.label(egui::RichText::new("Aucune carte son").color(t::TEXT_3));
+    } else if stereo && in_ch < 2 {
+        ui.label(egui::RichText::new("La carte n'a qu'une entrée").color(t::TEXT_3));
     }
-    let used: Vec<u16> = tracks
+    let used: HashSet<u16> = tracks
         .iter()
-        .filter(|t| t.id != me)
-        .filter_map(|t| t.input)
+        .filter(|t| Some(t.id) != me)
+        .flat_map(|t| t.inputs())
         .collect();
+    let (step, cell_w) = if stereo { (2, 44.0) } else { (1, 32.0) };
+    let count = if stereo { in_ch / 2 } else { in_ch };
     egui::Grid::new("inpick")
         .spacing([2.0, 2.0])
         .show(ui, |ui| {
-            for i in 0..in_ch {
+            for n in 0..count {
+                let i = n * step;
                 let sel = current == Some(i);
-                let is_used = used.contains(&i);
-                let (r, resp) = ui.allocate_exact_size(vec2(32.0, 22.0), Sense::click());
+                let is_used = (i..i + step).any(|c| used.contains(&c));
+                let (r, resp) = ui.allocate_exact_size(vec2(cell_w, 22.0), Sense::click());
                 let bg = if sel {
                     t::ACCENT
                 } else if resp.hovered() {
@@ -1668,13 +1777,13 @@ fn input_picker(
                 } else {
                     t::TEXT
                 };
-                ui.painter().text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    format!("{}", i + 1),
-                    t::medium(10.5),
-                    fg,
-                );
+                let text = if stereo {
+                    format!("{}-{}", i + 1, i + 2)
+                } else {
+                    format!("{}", i + 1)
+                };
+                ui.painter()
+                    .text(r.center(), Align2::CENTER_CENTER, text, t::medium(10.5), fg);
                 if is_used && !sel {
                     ui.painter().rect_filled(
                         Rect::from_min_size(pos2(r.right() - 5.0, r.top() + 2.0), vec2(3.0, 3.0)),
@@ -1690,7 +1799,7 @@ fn input_picker(
                 if resp.clicked() {
                     out = Some(Some(i));
                 }
-                if i % 8 == 7 {
+                if n % 8 == 7 {
                     ui.end_row();
                 }
             }

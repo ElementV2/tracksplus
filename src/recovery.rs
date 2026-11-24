@@ -143,7 +143,9 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                     take.track_id
                 } else {
                     let name = take.file.trim_end_matches(".wav").to_string();
-                    project.add_track(Some(format!("{name} (récupérée)")), None)
+                    let stereo =
+                        hound::WavReader::open(&path).is_ok_and(|r| r.spec().channels >= 2);
+                    project.add_track_ch(Some(format!("{name} (récupérée)")), None, stereo)
                 };
                 let id = project.alloc_id();
                 if let Some(t) = project.track_mut(track_id) {

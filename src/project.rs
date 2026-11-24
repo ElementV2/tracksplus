@@ -97,7 +97,11 @@ pub struct Track {
     pub id: u64,
     pub name: String,
     /// Canal d'entrée de la carte son (0-based). `None` = pas d'entrée.
+    /// Piste stéréo : premier canal de la paire (`input`, `input + 1`).
     pub input: Option<u16>,
+    /// Piste stéréo : enregistre une paire d'entrées dans un seul WAV stéréo.
+    #[serde(default)]
+    pub stereo: bool,
     pub armed: bool,
     #[serde(default)]
     pub mute: bool,
@@ -105,6 +109,35 @@ pub struct Track {
     pub solo: bool,
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
     pub clips: Vec<Clip>,
+}
+
+impl Track {
+    /// Nombre de canaux de la piste (1 = mono, 2 = stéréo).
+    pub fn channels(&self) -> usize {
+        if self.stereo { 2 } else { 1 }
+    }
+
+    /// Canaux de la carte utilisés par la piste.
+    pub fn inputs(&self) -> impl Iterator<Item = u16> + '_ {
+        self.input
+            .into_iter()
+            .flat_map(move |i| (0..self.channels() as u16).map(move |k| i.saturating_add(k)))
+    }
+
+    /// L'entrée (ou la paire) existe sur une carte de `in_ch` canaux.
+    pub fn input_fits(&self, in_ch: u16) -> bool {
+        self.input
+            .is_some_and(|i| (i as usize) + self.channels() <= in_ch as usize)
+    }
+
+    /// Libellé court de l'entrée : « IN 3 », « IN 3-4 » ou « IN — ».
+    pub fn input_label(&self) -> String {
+        match self.input {
+            Some(i) if self.stereo => format!("IN {}-{}", i + 1, i + 2),
+            Some(i) => format!("IN {}", i + 1),
+            None => "IN —".into(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -161,13 +194,20 @@ impl Project {
         id
     }
 
+    /// Ajoute une piste mono.
     pub fn add_track(&mut self, name: Option<String>, input: Option<u16>) -> u64 {
+        self.add_track_ch(name, input, false)
+    }
+
+    /// Ajoute une piste mono ou stéréo (`input` = premier canal de la paire).
+    pub fn add_track_ch(&mut self, name: Option<String>, input: Option<u16>, stereo: bool) -> u64 {
         let id = self.alloc_id();
         let name = name.unwrap_or_else(|| format!("Piste {}", self.tracks.len() + 1));
         self.tracks.push(Track {
             id,
             name,
             input,
+            stereo,
             armed: input.is_some(),
             mute: false,
             solo: false,

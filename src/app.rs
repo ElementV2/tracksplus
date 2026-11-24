@@ -147,6 +147,8 @@ pub struct App {
     pub live: Vec<LiveTake>,
     pub peaks: HashMap<u64, Peaks>,
     pub in_meters: Vec<MeterState>,
+    /// Dernier choix mono / stéréo du menu « Ajouter une piste ».
+    pub add_stereo: bool,
     pub master_play: [MeterState; 2],
     pub master_pad: [MeterState; 2],
     pub view: View,
@@ -226,6 +228,7 @@ impl App {
             live: Vec::new(),
             peaks: HashMap::new(),
             in_meters: vec![MeterState::default(); audio::MAX_INPUTS],
+            add_stereo: false,
             master_play: Default::default(),
             master_pad: Default::default(),
             view: View {
@@ -412,13 +415,13 @@ impl App {
             return;
         }
         let in_ch = self.engine.status.in_channels;
-        let armed: Vec<(u64, String, u16)> = self
+        // (piste, nom, premier canal, stéréo)
+        let armed: Vec<(u64, String, u16, bool)> = self
             .project
             .tracks
             .iter()
-            .filter(|t| t.armed)
-            .filter_map(|t| t.input.map(|i| (t.id, t.name.clone(), i)))
-            .filter(|(_, _, i)| *i < in_ch)
+            .filter(|t| t.armed && t.input_fits(in_ch))
+            .filter_map(|t| t.input.map(|i| (t.id, t.name.clone(), i, t.stereo)))
             .collect();
         // Pistes armées dont l'entrée n'existe pas sur la carte (ex. Dante revenue avec
         // moins de canaux) : on enregistre les autres, mais on le signale clairement.
@@ -426,7 +429,7 @@ impl App {
             .project
             .tracks
             .iter()
-            .filter(|t| t.armed && t.input.is_none_or(|i| i >= in_ch))
+            .filter(|t| t.armed && !t.input_fits(in_ch))
             .map(|t| t.name.clone())
             .collect();
         if armed.is_empty() {
@@ -454,11 +457,13 @@ impl App {
         let mut targets = Vec::new();
         let mut used = HashSet::new();
         self.live.clear();
-        for (track_id, name, input) in armed {
+        for (track_id, name, input, stereo) in armed {
             // Nom unique sur le disque et dans cette prise, sans tenir compte de la casse.
             let file = self.project.new_take_file_avoiding(&name, &used);
             used.insert(file.to_lowercase());
-            let (prod, cons) = rtrb::RingBuffer::new(sr as usize * 4);
+            let width: u16 = if stereo { 2 } else { 1 };
+            // 4 s de tampon par piste, quel que soit le nombre de canaux.
+            let (prod, cons) = rtrb::RingBuffer::new(sr as usize * 4 * width as usize);
             let peaks: Peaks = Arc::new(RwLock::new(PeakData::default()));
             specs.push(RecSpec {
                 track_id,
@@ -466,8 +471,13 @@ impl App {
                 file,
                 peaks: peaks.clone(),
                 cons,
+                channels: width,
             });
-            targets.push(RecTarget::new(input as usize, prod));
+            targets.push(if stereo {
+                RecTarget::stereo(input as usize, prod)
+            } else {
+                RecTarget::new(input as usize, prod)
+            });
             self.live.push(LiveTake { track_id, peaks });
         }
         // Sécurité : la session et le journal des prises sont écrits AVANT de lancer
@@ -1096,7 +1106,7 @@ impl App {
         p.rec_format = self.project.rec_format;
         if d.keep_tracks {
             for tr in &self.project.tracks {
-                let id = p.add_track(Some(tr.name.clone()), tr.input);
+                let id = p.add_track_ch(Some(tr.name.clone()), tr.input, tr.stereo);
                 if let Some(nt) = p.track_mut(id) {
                     nt.armed = tr.armed;
                 }
@@ -1112,20 +1122,10 @@ impl App {
         self.notify(format!("Nouvelle session « {} »", self.project.name), false);
     }
 
-    pub fn add_track(&mut self) {
-        let used: HashSet<u16> = self.project.tracks.iter().filter_map(|t| t.input).collect();
-        let free = (0..self.engine.status.in_channels).find(|i| !used.contains(i));
-        self.project.add_track(None, free);
-    }
-
-    pub fn add_track_per_input(&mut self) {
-        let used: HashSet<u16> = self.project.tracks.iter().filter_map(|t| t.input).collect();
-        for i in 0..self.engine.status.in_channels {
-            if !used.contains(&i) {
-                self.project
-                    .add_track(Some(format!("Entrée {}", i + 1)), Some(i));
-            }
-        }
+    /// Ajoute une piste mono ou stéréo sur l'entrée choisie (`None` = sans entrée).
+    /// En stéréo, `input` est le premier canal de la paire.
+    pub fn add_track_on(&mut self, input: Option<u16>, stereo: bool) {
+        self.project.add_track_ch(None, input, stereo);
     }
 
     fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
@@ -1707,18 +1707,20 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(free) = self.disk_free {
-                    let armed = self
+                    let rec: Vec<_> = self
                         .project
                         .tracks
                         .iter()
                         .filter(|t| t.armed && t.input.is_some())
-                        .count()
-                        .max(1);
+                        .collect();
+                    let armed = rec.len().max(1);
+                    // Une piste stéréo occupe deux fois plus de place.
+                    let channels = rec.iter().map(|t| t.channels()).sum::<usize>().max(1);
                     let bps = match self.project.rec_format {
                         RecFormat::Int24 => 3,
                         RecFormat::Float32 => 4,
                     } * self.sr() as u64
-                        * armed as u64;
+                        * channels as u64;
                     let secs = free / bps.max(1);
                     let col = if secs < 1800 { t::REC } else { t::TEXT_3 };
                     ui.label(
