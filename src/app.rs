@@ -1089,10 +1089,18 @@ impl App {
         if frames != self.rec_watch.0 {
             self.rec_watch = (frames, self.now);
         } else if self.now - self.rec_watch.1 > 1.0 {
-            alerts.push(
-                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion / l'horloge Dante"
-                    .to_string(),
-            );
+            let dante = self
+                .engine
+                .status
+                .input
+                .as_deref()
+                .is_some_and(|n| n.to_lowercase().contains("dante"));
+            alerts.push(if dante {
+                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion et l'horloge Dante"
+                    .to_string()
+            } else {
+                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion".to_string()
+            });
         }
         let ov = self.engine.shared.overruns.load(Ordering::Relaxed);
         if ov > 0 {
@@ -2596,8 +2604,10 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width(520.0);
                 // Même hauteur pour tous les onglets : la fenêtre ne saute pas d'un onglet à
-                // l'autre.
-                ui.set_min_height(600.0);
+                // l'autre (boutons en bas).
+                const SETTINGS_H: f32 = 530.0;
+                let top = ui.cursor().top();
+                ui.set_min_height(SETTINGS_H);
                 close = Self::dialog_header(ui, "Réglages");
                 // Onglets : d'autres réglages de l'application pourront s'y ajouter.
                 ui.allocate_ui_with_layout(
@@ -2733,7 +2743,7 @@ impl App {
                         let differs = |o: &Option<String>| o.is_some() && input.is_some() && *o != input;
                         if differs(&main) || others.iter().any(differs) {
                             hints.push(
-                                "ASIO : un seul pilote à la fois. Choisissez l'entrée et les sorties sur la même carte (ex. Dante Virtual Soundcard pour tout), sinon l'ouverture échouera.",
+                                "ASIO : un seul pilote à la fois. Choisissez l'entrée et les sorties sur la même carte, sinon l'ouverture échouera.",
                             );
                         }
                     }
@@ -2826,22 +2836,31 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(txt).font(t::regular(11.5)).color(t::TEXT_3));
                 }
-                ui.add_space(10.0);
-                egui::Frame::new().fill(t::SURFACE_3).corner_radius(t::R).inner_margin(12).show(ui, |ui| {
+                // Rappel Dante seulement si une carte Dante est choisie.
+                let dante = [
+                    dlg.prefs.input.clone().or(dlg.default_in.clone()),
+                    dlg.prefs.output.clone().or(dlg.default_out.clone()),
+                    dlg.prefs.pad_output.clone(),
+                    dlg.prefs.monitor_output.clone(),
+                ]
+                .iter()
+                .flatten()
+                .any(|n| n.to_lowercase().contains("dante"));
+                if dante {
+                    ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(
-                            "Dante — Windows : pilote ASIO puis « Dante Virtual Soundcard ». macOS : CoreAudio puis « Dante Virtual Soundcard ». \
-                             La fréquence doit correspondre à Dante Controller. Le réglage est mémorisé.",
+                            "Dante : la fréquence doit être la même que dans Dante Controller.",
                         )
-                        .font(t::regular(12.0))
-                        .color(t::TEXT_2),
+                        .font(t::regular(11.5))
+                        .color(t::TEXT_3),
                     );
-                });
+                }
                 if let Some(e) = &dlg.error {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(e).font(t::medium(12.5)).color(t::REC));
                 }
-                ui.add_space(14.0);
+                ui.add_space((top + SETTINGS_H - 26.0 - ui.cursor().top()).max(14.0));
                 ui.horizontal(|ui| {
                     if w::secondary_button(ui, "Actualiser").clicked() {
                         dlg.refresh();
