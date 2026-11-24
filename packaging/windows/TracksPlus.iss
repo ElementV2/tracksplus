@@ -22,10 +22,12 @@ VersionInfoDescription=Installation de TracksPlus
 DefaultDirName={autopf}\TracksPlus
 DefaultGroupName=TracksPlus
 DisableProgramGroupPage=yes
-; Installation pour l'utilisateur courant par défaut (sans droits administrateur),
-; ou pour tous les utilisateurs au choix.
+; Toujours pour l'utilisateur courant (sans droits administrateur), même lancé en
+; administrateur (UAC désactivé) : les mises à jour remplacent la version installée au lieu
+; d'en créer une deuxième dans Program Files. « /ALLUSERS » en ligne de commande pour une
+; installation pour tous les utilisateurs (la mise à jour le redonne alors elle-même).
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0

@@ -251,10 +251,31 @@ pub fn installed() -> bool {
             .is_some_and(|u| u.exists())
 }
 
+/// Mode d'installation à redonner à l'installeur : celui de l'installation en cours (dans
+/// un dossier « Program Files » : pour tous les utilisateurs ; sinon : utilisateur courant).
+/// Sans cela, l'installeur peut choisir l'autre mode (application lancée en administrateur,
+/// par exemple) et créer une deuxième installation au lieu de mettre à jour la première.
+fn install_mode(exe_dir: &Path, program_dirs: &[PathBuf]) -> &'static str {
+    if program_dirs.iter().any(|d| exe_dir.starts_with(d)) {
+        "/ALLUSERS"
+    } else {
+        "/CURRENTUSER"
+    }
+}
+
 /// Lance l'installeur téléchargé en mode silencieux (fenêtre de progression seulement) ;
-/// il ferme l'ancienne version, installe, puis relance TracksPlus. L'application doit se
-/// fermer juste après.
+/// il ferme l'ancienne version, installe à la même place, puis relance TracksPlus.
+/// L'application doit se fermer juste après.
 pub fn launch_installer(file: &Path) -> Result<(), String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let program_dirs: Vec<PathBuf> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect();
     Command::new(file)
         .args([
             "/SILENT",
@@ -262,6 +283,7 @@ pub fn launch_installer(file: &Path) -> Result<(), String> {
             "/NOCANCEL",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
+            install_mode(&exe_dir, &program_dirs),
         ])
         .spawn()
         .map(|_| ())
@@ -438,6 +460,22 @@ pub fn plain_notes(md: &str) -> Vec<(bool, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_keeps_install_mode() {
+        let pf = vec![PathBuf::from(r"C:\Program Files")];
+        assert_eq!(
+            install_mode(Path::new(r"C:\Program Files\TracksPlus"), &pf),
+            "/ALLUSERS"
+        );
+        assert_eq!(
+            install_mode(
+                Path::new(r"C:\Users\a\AppData\Local\Programs\TracksPlus"),
+                &pf
+            ),
+            "/CURRENTUSER"
+        );
+    }
 
     #[test]
     fn versions_compare() {

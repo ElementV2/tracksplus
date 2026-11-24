@@ -933,45 +933,13 @@ impl App {
         });
     }
 
-    /// Onglet « Soundboard » des réglages : sortie, contrôleur MIDI, LED, disposition et
-    /// taille de la grille. `true` : aller à l'onglet « Carte son » (choix de la sortie).
-    pub fn sb_settings(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut open_audio = false;
+    /// Onglet « Soundboard » des réglages : contrôleur MIDI, LED, disposition et taille de
+    /// la grille (la sortie des pads se règle dans l'onglet « Carte son »).
+    pub fn sb_settings(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("sb_settings_grid")
                     .num_columns(2)
                     .spacing([16.0, 10.0])
                     .show(ui, |ui| {
-                        // La sortie se règle avec les autres sorties, dans « Carte son ».
-                        ui.label(egui::RichText::new("Sortie").color(t::TEXT_2));
-                        ui.horizontal(|ui| {
-                            let dev = self
-                                .prefs
-                                .pad_output
-                                .clone()
-                                .or_else(|| self.engine.status.output.clone())
-                                .unwrap_or_else(|| "—".into());
-                            let ch = self
-                                .out_devices
-                                .iter()
-                                .find(|d| d.name == dev)
-                                .map_or(2, |d| d.channels);
-                            ui.label(
-                                egui::RichText::new(short(
-                                    &crate::app::out_dest_label(&dev, ch, self.prefs.pad_out().left),
-                                    34,
-                                ))
-                                .color(t::TEXT),
-                            );
-                            if ui
-                                .button("Changer…")
-                                .on_hover_text("Les sorties se règlent dans l'onglet « Carte son »")
-                                .clicked()
-                            {
-                                open_audio = true;
-                            }
-                        });
-                        ui.end_row();
-
                         ui.label(egui::RichText::new("Contrôleur MIDI").color(t::TEXT_2));
                         ui.horizontal(|ui| {
                         let cur = self
@@ -1174,16 +1142,13 @@ impl App {
                     });
         ui.add_space(10.0);
         ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "Les sorties (multipiste, soundboard, monitoring) se règlent ensemble dans l'onglet « Carte son ». Le contrôleur MIDI déclenche les pads même fenêtre réduite.",
-                        )
-                        .font(t::regular(11.5))
-                        .color(t::TEXT_3),
-                    )
-                    .wrap(),
-                );
-        open_audio
+            egui::Label::new(
+                egui::RichText::new("Le contrôleur MIDI déclenche les pads même fenêtre réduite.")
+                    .font(t::regular(11.5))
+                    .color(t::TEXT_3),
+            )
+            .wrap(),
+        );
     }
 
     fn pad_grid(&mut self, ui: &mut egui::Ui) {

@@ -48,7 +48,7 @@ pub struct AudioPrefs {
 
 impl AudioPrefs {
     /// Sortie du soundboard pour le moteur.
-    /// « Comme le multipiste » (`None`) : même périphérique et même paire que l'écoute.
+    /// « Comme le main multipiste » (`None`) : même périphérique et même paire que l'écoute.
     pub fn pad_out(&self) -> PadOut {
         PadOut {
             device: self.pad_output.clone(),
@@ -60,7 +60,7 @@ impl AudioPrefs {
         }
     }
 
-    /// Paire de monitoring ; « Comme le multipiste » suit la paire de l'écoute.
+    /// Paire de monitoring ; « Comme le main multipiste » suit la paire de l'écoute.
     pub fn monitor_pair(&self) -> u16 {
         if self.monitor_output.is_some() {
             self.monitor_left

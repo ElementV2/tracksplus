@@ -2624,10 +2624,7 @@ impl App {
                 }
                 ui.add_space(12.0);
                 if dlg.tab == 1 {
-                    // « Changer… » (sortie des pads) : onglet Carte son.
-                    if self.sb_settings(ui) {
-                        dlg.tab = 0;
-                    }
+                    self.sb_settings(ui);
                     return;
                 }
                 // Notes affichées sous la grille (retour à la ligne dans la largeur du dialogue).
@@ -2688,17 +2685,17 @@ impl App {
                         "Par défaut{}",
                         dlg.default_out.as_ref().map_or(String::new(), |n| format!(" · {n}"))
                     );
-                    ui.label(egui::RichText::new("Multipiste").color(t::TEXT_2))
+                    ui.label(egui::RichText::new("Main multipiste").color(t::TEXT_2))
                         .on_hover_text("Lecture des pistes");
                     dest_combo(ui, "out_main", combo_w, &outs, &mut dlg.prefs.output, &mut dlg.prefs.out_left, "Par défaut (Windows)", &default_out);
                     ui.end_row();
+                    ui.label(egui::RichText::new("Monitoring multipiste").color(t::TEXT_2))
+                        .on_hover_text("Écoute en direct des entrées (bouton casque des pistes)");
+                    dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, "Comme le main multipiste", "Comme le main multipiste");
+                    ui.end_row();
                     ui.label(egui::RichText::new("Soundboard").color(t::TEXT_2))
                         .on_hover_text("Lecture des pads");
-                    dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, "Comme le multipiste", "Comme le multipiste");
-                    ui.end_row();
-                    ui.label(egui::RichText::new("Monitoring").color(t::TEXT_2))
-                        .on_hover_text("Écoute en direct des entrées (bouton casque des pistes)");
-                    dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, "Comme le multipiste", "Comme le multipiste");
+                    dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, "Comme le main multipiste", "Comme le main multipiste");
                     ui.end_row();
                     ui.add_space(4.0);
                     ui.label("");
@@ -3883,7 +3880,7 @@ fn dest_combo(
 
 /// Libellé d'une destination de sortie : le nom du périphérique s'il n'a que deux
 /// canaux (cas WASAPI), sinon le nom et la paire (cas ASIO, Dante…).
-pub fn out_dest_label(device: &str, channels: u16, left: u16) -> String {
+fn out_dest_label(device: &str, channels: u16, left: u16) -> String {
     if channels <= 2 {
         device.to_string()
     } else {
