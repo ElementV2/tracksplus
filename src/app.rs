@@ -54,6 +54,9 @@ pub struct AudioDialog {
     pub hosts: Vec<String>,
     pub ins: Vec<DeviceInfo>,
     pub outs: Vec<DeviceInfo>,
+    /// Périphériques utilisés quand l'entrée / la sortie est « Par défaut ».
+    pub default_in: Option<String>,
+    pub default_out: Option<String>,
     pub listed_host: Option<String>,
     pub error: Option<String>,
 }
@@ -65,6 +68,8 @@ impl AudioDialog {
             hosts: audio::host_names(),
             ins: Vec::new(),
             outs: Vec::new(),
+            default_in: None,
+            default_out: None,
             listed_host: None,
             error: None,
         };
@@ -79,7 +84,61 @@ impl AudioDialog {
         let (ins, outs) = audio::list_devices(self.prefs.host.as_deref());
         self.ins = ins;
         self.outs = outs;
+        (self.default_in, self.default_out) =
+            audio::default_device_names(self.prefs.host.as_deref());
         self.listed_host = self.prefs.host.clone();
+    }
+
+    /// Entrée choisie (ou celle par défaut du pilote).
+    fn input_info(&self) -> Option<&DeviceInfo> {
+        let name = self.prefs.input.as_ref().or(self.default_in.as_ref())?;
+        self.ins.iter().find(|d| &d.name == name)
+    }
+
+    /// Sortie choisie (ou celle par défaut du pilote).
+    fn output_info(&self) -> Option<&DeviceInfo> {
+        let name = self.prefs.output.as_ref().or(self.default_out.as_ref())?;
+        self.outs.iter().find(|d| &d.name == name)
+    }
+
+    /// Fréquences possibles : communes à l'entrée et à la sortie.
+    fn rates(&self) -> Vec<u32> {
+        let ins = self
+            .input_info()
+            .map(|d| d.rates.clone())
+            .unwrap_or_default();
+        let outs = self
+            .output_info()
+            .map(|d| d.rates.clone())
+            .unwrap_or_default();
+        let both: Vec<u32> = ins.iter().copied().filter(|r| outs.contains(r)).collect();
+        if !both.is_empty() {
+            both
+        } else if !ins.is_empty() {
+            ins
+        } else {
+            outs
+        }
+    }
+
+    /// Fréquence retenue en « Auto ».
+    fn default_rate(&self) -> Option<u32> {
+        self.input_info()
+            .and_then(|d| d.default_rate)
+            .or_else(|| self.output_info().and_then(|d| d.default_rate))
+    }
+
+    /// Tailles de buffer acceptées par l'entrée et la sortie (trames), si connues.
+    fn buffer_range(&self) -> Option<(u32, u32)> {
+        let a = self.input_info().and_then(|d| d.buffer);
+        let b = self.output_info().and_then(|d| d.buffer);
+        match (a, b) {
+            (Some((a0, a1)), Some((b0, b1))) if a0.max(b0) <= a1.min(b1) => {
+                Some((a0.max(b0), a1.min(b1)))
+            }
+            (Some(r), _) | (None, Some(r)) => Some(r),
+            _ => None,
+        }
     }
 }
 
@@ -147,6 +206,8 @@ pub struct App {
     pub live: Vec<LiveTake>,
     pub peaks: HashMap<u64, Peaks>,
     pub in_meters: Vec<MeterState>,
+    /// Périphériques de sortie du pilote en cours (choix des destinations d'écoute).
+    pub out_devices: Vec<DeviceInfo>,
     /// Dernier choix mono / stéréo du menu « Ajouter une piste ».
     pub add_stereo: bool,
     /// Repère dont le menu (renommer / supprimer) est ouvert.
@@ -207,7 +268,7 @@ impl App {
         t::apply(&cc.egui_ctx);
         let prefs = AudioPrefs::load();
         let board = Board::load_default();
-        let (engine, err) = match Engine::open(&prefs, board.out_left) {
+        let (engine, err) = match Engine::open(&prefs, &board.pad_out()) {
             Ok(e) => (e, None),
             Err(e) => (Engine::offline(), Some(format!("{e:#}"))),
         };
@@ -231,6 +292,7 @@ impl App {
             peaks: HashMap::new(),
             in_meters: vec![MeterState::default(); audio::MAX_INPUTS],
             add_stereo: false,
+            out_devices: Vec::new(),
             marker_editing: None,
             master_play: Default::default(),
             master_pad: Default::default(),
@@ -287,6 +349,7 @@ impl App {
         app.midi.connect(port.as_deref());
         let led_port = app.board.led_port.clone();
         app.midi.connect_leds(led_port.as_deref());
+        app.out_devices = audio::list_devices(app.prefs.host.as_deref()).1;
         app.sync_engine_to_board();
         let paths: Vec<PathBuf> = app.board.all_pads().map(|(_, p)| p.path.clone()).collect();
         for p in paths {
@@ -318,7 +381,7 @@ impl App {
 
     /// Envoie au moteur les réglages du soundboard (sortie, volume) et au MIDI le canal.
     pub fn sync_engine_to_board(&mut self) {
-        let out_ch = self.engine.status.out_channels.max(1) as usize;
+        let out_ch = self.engine.status.pad_out_channels.max(1) as usize;
         self.engine.pad(PadCmd::SetOutput {
             left: (self.board.out_left as usize).min(out_ch - 1),
         });
@@ -1143,7 +1206,7 @@ impl App {
         self.project.add_track_ch(None, input, stereo);
     }
 
-    fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
+    pub fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
         if self.is_recording() {
             return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
         }
@@ -1151,7 +1214,7 @@ impl App {
         self.engine.pad(PadCmd::StopAll { fade: 0 });
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
-        let res = match Engine::open(&prefs, self.board.out_left) {
+        let res = match Engine::open(&prefs, &self.board.pad_out()) {
             Ok(e) => {
                 self.engine = e;
                 self.prefs = prefs;
@@ -1162,13 +1225,14 @@ impl App {
                 Ok(())
             }
             Err(e) => {
-                if let Ok(old) = Engine::open(&self.prefs, self.board.out_left) {
+                if let Ok(old) = Engine::open(&self.prefs, &self.board.pad_out()) {
                     self.engine = old;
                 }
                 Err(format!("{e:#}"))
             }
         };
         self.cache.set_sample_rate(self.engine.status.sample_rate);
+        self.out_devices = audio::list_devices(self.prefs.host.as_deref()).1;
         self.sync_engine_to_board();
         res
     }
@@ -1686,14 +1750,25 @@ impl App {
                     .font(t::regular(11.5))
                     .color(t::TEXT_3)
             };
+            // Buffer réellement utilisé par le pilote (même en « Auto »).
+            let blk = self
+                .engine
+                .shared
+                .in_block
+                .load(Ordering::Relaxed)
+                .max(self.engine.shared.out_block.load(Ordering::Relaxed));
+            let buffer = match (blk, self.engine.status.buffer) {
+                (0, None) => "auto".to_string(),
+                (0, Some(b)) => b.to_string(),
+                (n, _) => format!(
+                    "{n} ({:.1} ms)",
+                    n as f64 * 1000.0 / self.engine.status.sample_rate.max(1) as f64
+                ),
+            };
             ui.label(dim(format!(
-                "Session {} kHz · WAV {} · buffer {}",
+                "Session {} kHz · WAV {} · buffer {buffer}",
                 fmt_khz(self.project.sample_rate),
                 self.project.rec_format.label(),
-                self.engine
-                    .status
-                    .buffer
-                    .map_or("auto".to_string(), |b| b.to_string())
             )));
             let sh = &self.engine.shared;
             let xr = sh.xruns.load(Ordering::Relaxed) + sh.underruns.load(Ordering::Relaxed);
@@ -1816,6 +1891,8 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width(480.0);
                 close = Self::dialog_header(ui, "Carte son");
+                // Notes affichées sous la grille (retour à la ligne dans la largeur du dialogue).
+                let mut hints: Vec<&str> = Vec::new();
                 egui::Grid::new("audio_grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
                     let combo_w = 320.0;
                     ui.label(egui::RichText::new("Pilote").color(t::TEXT_2));
@@ -1852,80 +1929,151 @@ impl App {
                     });
                     ui.end_row();
 
-                    ui.label(egui::RichText::new("Sortie").color(t::TEXT_2));
-                    let cur = dlg.prefs.output.clone().unwrap_or_else(|| "Par défaut".into());
-                    egui::ComboBox::from_id_salt("out").width(combo_w).selected_text(&cur).show_ui(ui, |ui| {
-                        if ui.selectable_label(dlg.prefs.output.is_none(), "Par défaut").clicked() {
-                            dlg.prefs.output = None;
+                    // ---- Sortie multipiste : toutes les paires de tous les périphériques
+                    // (en WASAPI, chaque paire de la carte est un périphérique à part).
+                    ui.label(egui::RichText::new("Sortie multipiste").color(t::TEXT_2));
+                    let cur = match &dlg.prefs.output {
+                        Some(name) => {
+                            let ch = dlg.outs.iter().find(|o| &o.name == name).map_or(2, |o| o.channels);
+                            out_dest_label(name, ch, dlg.prefs.out_left)
                         }
-                        for d in &dlg.outs {
-                            let txt = format!("{}   {} canaux", d.name, d.channels);
-                            if ui.selectable_label(dlg.prefs.output.as_deref() == Some(&d.name), txt).clicked() {
-                                dlg.prefs.output = Some(d.name.clone());
+                        None => format!(
+                            "Par défaut{}",
+                            dlg.default_out.as_ref().map_or(String::new(), |n| format!(" · {n}"))
+                        ),
+                    };
+                    egui::ComboBox::from_id_salt("out").width(combo_w).height(360.0).selected_text(cur).show_ui(ui, |ui| {
+                        if ui.selectable_label(dlg.prefs.output.is_none(), "Par défaut (Windows)").clicked() {
+                            dlg.prefs.output = None;
+                            dlg.prefs.out_left = 0;
+                        }
+                        for d in dlg.outs.clone() {
+                            for l in (0..d.channels.max(2)).step_by(2) {
+                                let sel = dlg.prefs.output.as_deref() == Some(&d.name) && dlg.prefs.out_left == l;
+                                if ui.selectable_label(sel, out_dest_label(&d.name, d.channels, l)).clicked() {
+                                    dlg.prefs.output = Some(d.name.clone());
+                                    dlg.prefs.out_left = l;
+                                }
                             }
                         }
                     });
                     ui.end_row();
 
-                    let out_ch = dlg
-                        .outs
-                        .iter()
-                        .find(|o| Some(&o.name) == dlg.prefs.output.as_ref())
-                        .map(|o| o.channels)
-                        .unwrap_or(2);
-                    ui.label(egui::RichText::new("Écoute multipiste").color(t::TEXT_2));
-                    let l = dlg.prefs.out_left;
-                    egui::ComboBox::from_id_salt("outpair")
-                        .width(140.0)
-                        .selected_text(format!("Sorties {} – {}", l + 1, l + 2))
-                        .height(300.0)
-                        .show_ui(ui, |ui| {
-                            let mut i = 0;
-                            while i < out_ch.max(2) {
-                                if ui.selectable_label(l == i, format!("Sorties {} – {}", i + 1, i + 2)).clicked() {
-                                    dlg.prefs.out_left = i;
-                                }
-                                i += 2;
-                            }
-                        });
-                    ui.end_row();
-
-                    let rates: Vec<u32> = dlg
-                        .ins
-                        .iter()
-                        .find(|d| Some(&d.name) == dlg.prefs.input.as_ref())
-                        .or(dlg.ins.first())
-                        .map(|d| d.rates.clone())
-                        .filter(|r| !r.is_empty())
-                        .unwrap_or_else(|| audio::COMMON_RATES.to_vec());
+                    // ---- Fréquence : celles que le pilote accepte vraiment.
+                    let rates = dlg.rates();
+                    let auto_sr = dlg.default_rate();
+                    let wasapi = dlg.prefs.host.as_deref() == Some("WASAPI");
+                    let asio = dlg.prefs.host.as_deref() == Some("ASIO");
+                    let auto_label = |what: Option<String>| match what {
+                        Some(v) => format!("Auto · {v}"),
+                        None => "Auto".to_string(),
+                    };
                     ui.label(egui::RichText::new("Fréquence").color(t::TEXT_2));
-                    let cur = dlg.prefs.sample_rate.map_or("Par défaut".to_string(), |r| format!("{} kHz", fmt_khz(r)));
-                    egui::ComboBox::from_id_salt("sr").width(140.0).selected_text(cur).show_ui(ui, |ui| {
-                        if ui.selectable_label(dlg.prefs.sample_rate.is_none(), "Par défaut").clicked() {
+                    let auto_sr_txt = auto_sr.map(|r| format!("{} kHz", fmt_khz(r)));
+                    let cur = dlg
+                        .prefs
+                        .sample_rate
+                        .map_or(auto_label(auto_sr_txt.clone()), |r| format!("{} kHz", fmt_khz(r)));
+                    egui::ComboBox::from_id_salt("sr").width(170.0).selected_text(cur).show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(dlg.prefs.sample_rate.is_none(), auto_label(auto_sr_txt.clone()))
+                            .on_hover_text("Fréquence actuelle du pilote")
+                            .clicked()
+                        {
                             dlg.prefs.sample_rate = None;
                         }
-                        for r in rates {
+                        for &r in &rates {
                             if ui.selectable_label(dlg.prefs.sample_rate == Some(r), format!("{} kHz", fmt_khz(r))).clicked() {
                                 dlg.prefs.sample_rate = Some(r);
                             }
                         }
                     });
                     ui.end_row();
+                    if wasapi && rates.len() <= 1 {
+                        hints.push(
+                            "Fréquence : en WASAPI, Windows impose celle réglée dans ses paramètres son (Propriétés de l'appareil → Format avancé). En ASIO, toutes les fréquences de la carte sont proposées.",
+                        );
+                    }
 
+                    // ---- Buffer : tailles acceptées par le pilote, avec la latence en ms.
+                    let ms_sr = dlg.prefs.sample_rate.or(auto_sr).unwrap_or(48000);
+                    let ms = |frames: u32| frames as f64 * 1000.0 / ms_sr as f64;
+                    let range = dlg.buffer_range();
+                    let fixed = range.filter(|(a, b)| a == b).map(|(a, _)| a);
+                    let sizes: Vec<u32> = match range {
+                        Some((a, b)) if a < b => audio::BUFFER_SIZES
+                            .iter()
+                            .copied()
+                            .filter(|&n| (a..=b).contains(&n))
+                            .collect(),
+                        Some(_) => Vec::new(),
+                        None => audio::BUFFER_SIZES.to_vec(),
+                    };
+                    // Valeur réellement utilisée, si ce sont les réglages en cours.
+                    let live = (dlg.prefs == self.prefs)
+                        .then(|| self.engine.shared.in_block.load(Ordering::Relaxed))
+                        .filter(|&n| n > 0);
+                    let auto_buf = live.or(fixed);
+                    let fmt_buf = |n: u32| format!("{n} éch. · {:.1} ms", ms(n));
                     ui.label(egui::RichText::new("Buffer").color(t::TEXT_2));
-                    let cur = dlg.prefs.buffer.map_or("Pilote".to_string(), |b| format!("{b} échantillons"));
-                    egui::ComboBox::from_id_salt("buf").width(140.0).selected_text(cur).show_ui(ui, |ui| {
-                        if ui.selectable_label(dlg.prefs.buffer.is_none(), "Pilote").clicked() {
+                    let cur = dlg
+                        .prefs
+                        .buffer
+                        .map_or(auto_label(auto_buf.map(fmt_buf)), fmt_buf);
+                    egui::ComboBox::from_id_salt("buf").width(170.0).selected_text(cur).show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(dlg.prefs.buffer.is_none(), auto_label(auto_buf.map(fmt_buf)))
+                            .on_hover_text(if asio {
+                                "Taille réglée dans le panneau du pilote ASIO"
+                            } else {
+                                "Taille choisie par le pilote"
+                            })
+                            .clicked()
+                        {
                             dlg.prefs.buffer = None;
                         }
-                        for b in audio::BUFFER_SIZES {
-                            if ui.selectable_label(dlg.prefs.buffer == Some(b), format!("{b} échantillons")).clicked() {
+                        for &b in &sizes {
+                            if ui.selectable_label(dlg.prefs.buffer == Some(b), fmt_buf(b)).clicked() {
                                 dlg.prefs.buffer = Some(b);
                             }
                         }
                     });
                     ui.end_row();
+                    if fixed.is_some() || (wasapi && sizes.is_empty()) {
+                        hints.push(
+                            "Buffer : en WASAPI, Windows le fixe lui-même. Pour une latence plus faible et réglable, passez en ASIO.",
+                        );
+                    }
+                    ui.end_row();
                 });
+                for h in &hints {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(*h).font(t::regular(11.5)).color(t::TEXT_3))
+                            .wrap(),
+                    );
+                }
+                // Ce qui tourne réellement en ce moment.
+                {
+                    let st = &self.engine.status;
+                    let sh = &self.engine.shared;
+                    let blk = |n: u32| {
+                        if n == 0 {
+                            "—".to_string()
+                        } else {
+                            format!("{n} éch. ({:.1} ms)", n as f64 * 1000.0 / st.sample_rate.max(1) as f64)
+                        }
+                    };
+                    let mut txt = format!("En cours : {} · {} kHz", st.host, fmt_khz(st.sample_rate));
+                    if st.input.is_some() {
+                        txt += &format!(" · entrée {}", blk(sh.in_block.load(Ordering::Relaxed)));
+                    }
+                    if st.output.is_some() {
+                        txt += &format!(" · sortie {}", blk(sh.out_block.load(Ordering::Relaxed)));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(txt).font(t::regular(11.5)).color(t::TEXT_3));
+                }
                 ui.add_space(10.0);
                 egui::Frame::new().fill(t::SURFACE_3).corner_radius(t::R).inner_margin(12).show(ui, |ui| {
                     ui.label(
@@ -2504,6 +2652,16 @@ pub fn fmt_time_short(samples: u64, sr: u32) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+/// Libellé d'une destination de sortie : le nom du périphérique s'il n'a que deux
+/// canaux (cas WASAPI), sinon le nom et la paire (cas ASIO, Dante…).
+pub fn out_dest_label(device: &str, channels: u16, left: u16) -> String {
+    if channels <= 2 {
+        device.to_string()
+    } else {
+        format!("{device} · Sorties {}–{}", left + 1, left + 2)
     }
 }
 

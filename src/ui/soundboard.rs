@@ -583,26 +583,62 @@ impl App {
         w::paint_icon(ui.painter(), Icon::Speaker, ir.center(), 5.5, t::TEXT_2);
         ui.add_space(6.0);
 
-        let out_ch = self.engine.status.out_channels.max(2);
-        let l = self.board.out_left;
+        // Sortie du soundboard : n'importe quelle paire de n'importe quel périphérique.
+        let main_dev = self.engine.status.output.clone();
+        let cur_dev = self.board.out_device.clone().or_else(|| main_dev.clone());
+        let ch_of = |name: &str| {
+            self.out_devices
+                .iter()
+                .find(|d| d.name == name)
+                .map_or(2, |d| d.channels)
+        };
+        let cur = cur_dev.as_deref().map_or("Pas de sortie".to_string(), |d| {
+            crate::app::out_dest_label(d, ch_of(d), self.board.out_left)
+        });
+        let mut pick: Option<(String, u16)> = None;
         egui::ComboBox::from_id_salt("sb_out")
-            .width(104.0)
-            .height(320.0)
-            .selected_text(format!("Sorties {} – {}", l + 1, l + 2))
+            .width(220.0)
+            .height(360.0)
+            .selected_text(short(&cur, 30))
             .show_ui(ui, |ui| {
-                let mut i = 0;
-                while i < out_ch {
-                    if ui
-                        .selectable_label(l == i, format!("Sorties {} – {}", i + 1, i + 2))
-                        .clicked()
-                    {
-                        self.board.out_left = i;
-                        self.engine.pad(PadCmd::SetOutput { left: i as usize });
-                        self.board_changed = Some(self.now);
+                for d in &self.out_devices {
+                    for l in (0..d.channels.max(2)).step_by(2) {
+                        let sel = cur_dev.as_deref() == Some(&d.name) && self.board.out_left == l;
+                        if ui
+                            .selectable_label(
+                                sel,
+                                crate::app::out_dest_label(&d.name, d.channels, l),
+                            )
+                            .clicked()
+                        {
+                            pick = Some((d.name.clone(), l));
+                        }
                     }
-                    i += 2;
                 }
-            });
+            })
+            .response
+            .on_hover_text(cur.clone());
+        if let Some((dev, l)) = pick {
+            let reopen = cur_dev.as_deref() != Some(dev.as_str());
+            if reopen && self.is_recording() {
+                self.notify(
+                    "Changement de sortie du soundboard impossible pendant un enregistrement",
+                    true,
+                );
+            } else {
+                // Même périphérique que l'écoute : un seul flux de sortie.
+                self.board.out_device = (main_dev.as_deref() != Some(dev.as_str())).then_some(dev);
+                self.board.out_left = l;
+                self.board_changed = Some(self.now);
+                if reopen {
+                    if let Err(e) = self.apply_audio(self.prefs.clone()) {
+                        self.notify(e, true);
+                    }
+                } else {
+                    self.engine.pad(PadCmd::SetOutput { left: l as usize });
+                }
+            }
+        }
 
         let active = self.now - self.sb.midi_seen < 0.15;
         let cur = self

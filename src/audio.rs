@@ -62,7 +62,13 @@ impl AudioPrefs {
 pub struct DeviceInfo {
     pub name: String,
     pub channels: u16,
+    /// Fréquences acceptées par le pilote (en WASAPI partagé : seulement celle réglée
+    /// dans Windows ; en ASIO : celles de la carte).
     pub rates: Vec<u32>,
+    /// Fréquence utilisée quand on laisse « Auto ».
+    pub default_rate: Option<u32>,
+    /// Tailles de buffer acceptées (trames), si le pilote les indique.
+    pub buffer: Option<(u32, u32)>,
 }
 
 pub fn host_names() -> Vec<String> {
@@ -85,6 +91,15 @@ fn find_host(name: Option<&str>) -> cpal::Host {
     cpal::default_host()
 }
 
+/// Noms des périphériques d'entrée et de sortie par défaut d'un pilote.
+pub fn default_device_names(host: Option<&str>) -> (Option<String>, Option<String>) {
+    let h = find_host(host);
+    (
+        h.default_input_device().map(|d| d.to_string()),
+        h.default_output_device().map(|d| d.to_string()),
+    )
+}
+
 pub fn default_host_name() -> String {
     cpal::default_host().id().name().to_string()
 }
@@ -92,11 +107,16 @@ pub fn default_host_name() -> String {
 fn ranges_info(
     name: String,
     ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    default_rate: Option<u32>,
 ) -> DeviceInfo {
     let mut channels = 0;
     let mut rates = Vec::new();
+    let mut buffer: Option<(u32, u32)> = None;
     for r in ranges {
         channels = channels.max(r.channels());
+        if let cpal::SupportedBufferSize::Range { min, max } = *r.buffer_size() {
+            buffer = Some(buffer.map_or((min, max), |(a, b)| (a.min(min), b.max(max))));
+        }
         for &sr in &COMMON_RATES {
             if r.min_sample_rate() <= sr && sr <= r.max_sample_rate() && !rates.contains(&sr) {
                 rates.push(sr);
@@ -108,6 +128,8 @@ fn ranges_info(
         name,
         channels,
         rates,
+        default_rate,
+        buffer,
     }
 }
 
@@ -120,13 +142,15 @@ pub fn list_devices(host: Option<&str>) -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
         for d in devs {
             let name = d.to_string();
             if let Ok(cfgs) = d.supported_input_configs() {
-                let info = ranges_info(name.clone(), cfgs);
+                let sr = d.default_input_config().ok().map(|c| c.sample_rate());
+                let info = ranges_info(name.clone(), cfgs, sr);
                 if info.channels > 0 {
                     ins.push(info);
                 }
             }
             if let Ok(cfgs) = d.supported_output_configs() {
-                let info = ranges_info(name, cfgs);
+                let sr = d.default_output_config().ok().map(|c| c.sample_rate());
+                let info = ranges_info(name, cfgs, sr);
                 if info.channels > 0 {
                     outs.push(info);
                 }
@@ -148,6 +172,10 @@ pub struct Shared {
     pub overruns: AtomicU32,
     /// Trous de lecture.
     pub underruns: AtomicU32,
+    /// Taille réelle des blocs reçus du pilote (trames par appel), entrée et sortie :
+    /// c'est le buffer effectivement utilisé, même en « Auto ».
+    pub in_block: AtomicU32,
+    pub out_block: AtomicU32,
     /// Xruns signalés par le pilote, comptés seulement pendant une prise ou une lecture.
     pub xruns: AtomicU32,
     /// Prise ou lecture en cours : les décrochages du pilote comptent. À l'arrêt, ils
@@ -172,6 +200,8 @@ impl Shared {
             underruns: AtomicU32::new(0),
             xruns: AtomicU32::new(0),
             counting: AtomicBool::new(false),
+            in_block: AtomicU32::new(0),
+            out_block: AtomicU32::new(0),
             last_error: Mutex::new(None),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -253,8 +283,20 @@ pub struct EngineStatus {
     pub sample_rate: u32,
     pub in_channels: u16,
     pub out_channels: u16,
+    /// Sortie du soundboard quand elle est sur un autre périphérique que l'écoute.
+    pub pad_output: Option<String>,
+    /// Canaux du périphérique où joue le soundboard.
+    pub pad_out_channels: u16,
     pub buffer: Option<u32>,
     pub in_format: Option<SampleFormat>,
+}
+
+/// Où joue le soundboard : `device` = périphérique de sortie (`None` = le même que
+/// l'écoute multipiste), `left` = premier canal de la paire stéréo.
+#[derive(Clone, Debug, Default)]
+pub struct PadOut {
+    pub device: Option<String>,
+    pub left: u16,
 }
 
 pub struct Engine {
@@ -262,6 +304,8 @@ pub struct Engine {
     pub status: EngineStatus,
     _input: Option<cpal::Stream>,
     _output: Option<cpal::Stream>,
+    /// Second flux de sortie, seulement si le soundboard joue sur un autre périphérique.
+    _pad_output: Option<cpal::Stream>,
     in_tx: Option<Sender<InCmd>>,
     out_tx: Option<Sender<OutCmd>>,
     /// Commandes du soundboard (clonable pour le thread MIDI).
@@ -286,6 +330,7 @@ impl Engine {
             },
             _input: None,
             _output: None,
+            _pad_output: None,
             in_tx: None,
             out_tx: None,
             pad_tx: None,
@@ -295,8 +340,8 @@ impl Engine {
         }
     }
 
-    /// Ouvre la carte. `pad_left` = premier canal de sortie du soundboard.
-    pub fn open(prefs: &AudioPrefs, pad_left: u16) -> Result<Self> {
+    /// Ouvre la carte. `pad` = sortie du soundboard.
+    pub fn open(prefs: &AudioPrefs, pad: &PadOut) -> Result<Self> {
         let host = find_host(prefs.host.as_deref());
         let host_name = host.id().name().to_string();
         let shared = Arc::new(Shared::new());
@@ -395,60 +440,100 @@ impl Engine {
             in_tx = Some(tx);
         }
 
+        // Soundboard sur un autre périphérique que l'écoute : second flux de sortie.
+        let out_name = out_dev.as_ref().map(|d| d.to_string());
+        let pad_dev = match pad
+            .device
+            .as_ref()
+            .filter(|n| Some(*n) != out_name.as_ref())
+        {
+            Some(n) => {
+                let d = host
+                    .output_devices()
+                    .ok()
+                    .and_then(|mut it| it.find(|d| &d.to_string() == n));
+                if d.is_none() {
+                    *shared.last_error.lock() = Some(format!(
+                        "Sortie soundboard « {n} » introuvable : pads sur l'écoute"
+                    ));
+                }
+                d
+            }
+            None => None,
+        };
+        // Les commandes des pads vont au flux qui porte le soundboard ; l'autre reçoit un
+        // canal vide (son lecteur de pads reste muet).
+        let (ptx, prx) = bounded(256);
+        let idle_pads = || bounded::<PadCmd>(1).1;
+        let (main_pads, sep_pads) = if pad_dev.is_some() {
+            (idle_pads(), Some(prx))
+        } else {
+            (prx, None)
+        };
+
         let mut output = None;
         let mut out_tx = None;
+        let mut pads_ok = false;
         if let Some(dev) = &out_dev {
-            match pick_config(dev, sample_rate, false) {
-                Ok((fmt, channels)) => {
-                    let cfg = StreamConfig {
-                        channels,
-                        sample_rate,
-                        buffer_size: buffer,
-                    };
-                    let (tx, rx) = bounded(8);
-                    let (ptx, prx) = bounded(256);
-                    let last = channels.saturating_sub(1) as usize;
-                    let left = (prefs.out_left as usize).min(last);
-                    let st = OutState {
-                        channels: channels as usize,
-                        left,
-                        rx,
-                        cons: None,
-                        garbage: garbage_tx,
-                        shared: shared.clone(),
-                        sampler: Sampler::new(
-                            prx,
-                            sample_garbage_tx,
-                            (pad_left as usize).min(last),
-                            sample_rate,
-                        ),
-                        mix: vec![0.0; MAX_BLOCK * channels as usize],
-                        play: vec![0.0; MAX_BLOCK * 2],
-                        pads: vec![0.0; MAX_BLOCK * 2],
-                    };
-                    let res = match fmt {
-                        SampleFormat::F32 => build_output::<f32>(dev, cfg, st),
-                        SampleFormat::I32 => build_output::<i32>(dev, cfg, st),
-                        SampleFormat::I24 => build_output::<cpal::I24>(dev, cfg, st),
-                        SampleFormat::I16 => build_output::<i16>(dev, cfg, st),
-                        f => Err(anyhow!("Format de sortie non géré : {f:?}")),
-                    };
-                    match res.and_then(|s| {
-                        s.play().context("Démarrage du flux de sortie")?;
-                        Ok(s)
-                    }) {
-                        Ok(s) => {
-                            status.output = Some(dev.to_string());
-                            status.out_channels = channels;
-                            output = Some(s);
-                            out_tx = Some(tx);
-                            pad_tx = Some(ptx);
-                        }
-                        Err(e) => *shared.last_error.lock() = Some(format!("Sortie : {e:#}")),
-                    }
+            let (tx, rx) = bounded(8);
+            let sgt = sample_garbage_tx.clone();
+            let gt = garbage_tx.clone();
+            let sh = shared.clone();
+            let res = start_output(dev, sample_rate, buffer, move |channels| {
+                let last = channels.saturating_sub(1) as usize;
+                OutState::new(
+                    channels as usize,
+                    (prefs.out_left as usize).min(last),
+                    rx,
+                    gt,
+                    sh,
+                    Sampler::new(main_pads, sgt, (pad.left as usize).min(last), sample_rate),
+                )
+            });
+            match res {
+                Ok((s, channels)) => {
+                    status.output = Some(dev.to_string());
+                    status.out_channels = channels;
+                    status.pad_out_channels = channels;
+                    output = Some(s);
+                    out_tx = Some(tx);
+                    pads_ok = sep_pads.is_none();
                 }
                 Err(e) => *shared.last_error.lock() = Some(format!("Sortie : {e:#}")),
             }
+        }
+        let mut pad_output = None;
+        if let (Some(dev), Some(prx)) = (&pad_dev, sep_pads) {
+            let sh = shared.clone();
+            let res = start_output(dev, sample_rate, buffer, move |channels| {
+                let last = channels.saturating_sub(1) as usize;
+                // Pas de lecture multipiste sur ce flux : canal de commandes vide.
+                OutState::new(
+                    channels as usize,
+                    0,
+                    bounded::<OutCmd>(1).1,
+                    garbage_tx,
+                    sh,
+                    Sampler::new(
+                        prx,
+                        sample_garbage_tx,
+                        (pad.left as usize).min(last),
+                        sample_rate,
+                    ),
+                )
+            });
+            match res {
+                Ok((s, channels)) => {
+                    status.pad_output = Some(dev.to_string());
+                    status.pad_out_channels = channels;
+                    pad_output = Some(s);
+                    pads_ok = true;
+                }
+                Err(e) => *shared.last_error.lock() = Some(format!("Sortie soundboard : {e:#}")),
+            }
+        }
+        if pads_ok {
+            pad_tx = Some(ptx);
         }
 
         Ok(Self {
@@ -456,6 +541,7 @@ impl Engine {
             status,
             _input: input,
             _output: output,
+            _pad_output: pad_output,
             in_tx,
             out_tx,
             pad_tx,
@@ -616,6 +702,7 @@ where
             }
             let frames = data.len() / ch;
             let sh = &*st.shared;
+            sh.in_block.store(frames as u32, Ordering::Relaxed);
 
             for c in 0..ch.min(MAX_INPUTS) {
                 let mut peak = 0f32;
@@ -696,6 +783,28 @@ struct OutState {
 }
 
 impl OutState {
+    fn new(
+        channels: usize,
+        left: usize,
+        rx: Receiver<OutCmd>,
+        garbage: Sender<Consumer<f32>>,
+        shared: Arc<Shared>,
+        sampler: Sampler,
+    ) -> Self {
+        Self {
+            channels,
+            left,
+            rx,
+            cons: None,
+            garbage,
+            shared,
+            sampler,
+            mix: vec![0.0; MAX_BLOCK * channels],
+            play: vec![0.0; MAX_BLOCK * 2],
+            pads: vec![0.0; MAX_BLOCK * 2],
+        }
+    }
+
     fn release(&mut self) {
         if let Some(c) = self.cons.take() {
             // Le ring buffer est libéré par l'interface, jamais par le thread audio.
@@ -752,6 +861,31 @@ impl OutState {
     }
 }
 
+/// Ouvre et démarre un flux de sortie. `state` reçoit le nombre de canaux retenu.
+fn start_output(
+    dev: &cpal::Device,
+    sample_rate: u32,
+    buffer: cpal::BufferSize,
+    state: impl FnOnce(u16) -> OutState,
+) -> Result<(cpal::Stream, u16)> {
+    let (fmt, channels) = pick_config(dev, sample_rate, false)?;
+    let cfg = StreamConfig {
+        channels,
+        sample_rate,
+        buffer_size: buffer,
+    };
+    let st = state(channels);
+    let s = match fmt {
+        SampleFormat::F32 => build_output::<f32>(dev, cfg, st),
+        SampleFormat::I32 => build_output::<i32>(dev, cfg, st),
+        SampleFormat::I24 => build_output::<cpal::I24>(dev, cfg, st),
+        SampleFormat::I16 => build_output::<i16>(dev, cfg, st),
+        f => Err(anyhow!("Format de sortie non géré : {f:?}")),
+    }?;
+    s.play().context("Démarrage du flux de sortie")?;
+    Ok((s, channels))
+}
+
 fn build_output<T>(dev: &cpal::Device, cfg: StreamConfig, mut st: OutState) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
@@ -776,6 +910,7 @@ where
                 return;
             }
             let total = data.len() / ch;
+            st.shared.out_block.store(total as u32, Ordering::Relaxed);
             let mut done = 0;
             while done < total {
                 let n = (total - done).min(MAX_BLOCK);

@@ -145,6 +145,9 @@ pub struct Board {
     /// Premier canal de sortie du soundboard (0-based).
     #[serde(default)]
     pub out_left: u16,
+    /// Périphérique de sortie du soundboard (`None` = le même que l'écoute multipiste).
+    #[serde(default)]
+    pub out_device: Option<String>,
     #[serde(default)]
     pub master_db: f32,
     /// Durée du fondu de « Stop tout » (s).
@@ -174,6 +177,7 @@ impl Default for Board {
             rows: 4,
             pages: vec![Page::new("Page 1".into())],
             out_left: 0,
+            out_device: None,
             master_db: 0.0,
             panic_fade: 1.0,
             midi_port: None,
@@ -185,6 +189,14 @@ impl Default for Board {
 }
 
 impl Board {
+    /// Sortie du soundboard pour le moteur audio.
+    pub fn pad_out(&self) -> crate::audio::PadOut {
+        crate::audio::PadOut {
+            device: self.out_device.clone(),
+            left: self.out_left,
+        }
+    }
+
     pub fn default_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("TracksPlus").join("soundboard.json"))
     }
