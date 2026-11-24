@@ -511,24 +511,31 @@ impl App {
             }
         }
 
-        let mut marker_hit = None;
+        // Étiquettes visibles des repères (une zone d'interaction chacune, à chaque image :
+        // indispensable pour que leur menu reste ouvert quand la souris le rejoint).
+        let mut marker_rects: Vec<(u64, Rect)> = Vec::new();
         for m in &self.project.markers {
             let x = self.x_of(rect.left(), m.pos);
             if x < rect.left() - 120.0 || x > rect.right() {
                 continue;
             }
+            let editing = self.marker_editing == Some(m.id);
             let gal = p.layout_no_wrap(m.name.clone(), t::medium(9.5), Color32::BLACK);
             let r = Rect::from_min_size(pos2(x, rect.top() + 2.0), vec2(gal.size().x + 8.0, 13.0));
-            p.rect_filled(r, CornerRadius::ZERO, t::MARKER);
+            let hovered = ui.rect_contains_pointer(r);
+            let bg = if editing || hovered {
+                t::mix(t::MARKER, Color32::WHITE, 0.3)
+            } else {
+                t::MARKER
+            };
+            p.rect_filled(r, CornerRadius::ZERO, bg);
             p.galley(
                 pos2(r.left() + 4.0, r.center().y - gal.size().y / 2.0),
                 gal,
                 Color32::BLACK,
             );
             w::vline(&p, x, rect.top() + 2.0, rect.bottom(), t::MARKER);
-            if ui.rect_contains_pointer(r) {
-                marker_hit = Some((m.id, r));
-            }
+            marker_rects.push((m.id, r));
         }
 
         let x = self.x_of(rect.left(), self.playhead);
@@ -554,18 +561,43 @@ impl App {
             ui.make_persistent_id("ruler"),
             Sense::click_and_drag(),
         );
-        if let Some((id, r)) = marker_hit {
-            let mresp = ui.interact(r, ui.make_persistent_id(("marker", id)), Sense::click());
+        let mut on_marker = false;
+        let mut any_menu = false;
+        for (id, r) in marker_rects {
+            let mresp = ui
+                .interact(r, ui.make_persistent_id(("marker", id)), Sense::click())
+                .on_hover_text(
+                    "Clic : aller au repère · double-clic ou clic droit : renommer, supprimer",
+                );
+            on_marker |= mresp.hovered() || mresp.is_pointer_button_down_on();
             if mresp.clicked()
+                && !mresp.double_clicked()
                 && let Some(m) = self.project.markers.iter().find(|m| m.id == id)
             {
                 let pos = m.pos;
                 self.seek(pos);
             }
-            mresp.context_menu(|ui| self.marker_menu(ui, id));
-            return;
+            // Menu sous l'étiquette, ouvert par clic droit ou double-clic. (Le menu
+            // contextuel d'egui se referme à chaque clic simple : incompatible avec le
+            // double-clic.) Il reste ouvert pendant la saisie du nom.
+            let open = (mresp.secondary_clicked() || mresp.double_clicked())
+                .then_some(egui::SetOpenCommand::Bool(true));
+            if egui::Popup::menu(&mresp)
+                .open_memory(open)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| self.marker_menu(ui, id))
+                .is_some()
+            {
+                any_menu = true;
+            }
         }
-        self.time_select(&resp, rect.left());
+        if !any_menu {
+            // Menu refermé : la prochaine ouverture redonnera le focus au nom.
+            self.marker_editing = None;
+        }
+        if !on_marker {
+            self.time_select(&resp, rect.left());
+        }
     }
 
     fn marker_menu(&mut self, ui: &mut egui::Ui, id: u64) {
@@ -573,14 +605,30 @@ impl App {
             return;
         };
         ui.set_width(220.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut self.project.markers[idx].name)
-                    .desired_width(200.0),
-            )
-            .changed()
-        {
+        w::section(ui, "Repère");
+        let name = ui.add(
+            egui::TextEdit::singleline(&mut self.project.markers[idx].name)
+                .desired_width(200.0)
+                .hint_text("Nom du repère"),
+        );
+        if self.marker_editing != Some(id) {
+            // Première image du menu : le nom est prêt à être retapé.
+            self.marker_editing = Some(id);
+            name.request_focus();
+            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), name.id) {
+                let len = self.project.markers[idx].name.chars().count();
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(len),
+                )));
+                st.store(ui.ctx(), name.id);
+            }
+        }
+        if name.changed() {
             self.project.dirty = true;
+        }
+        if name.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            ui.close();
         }
         let pos = self.project.markers[idx].pos;
         let next = self

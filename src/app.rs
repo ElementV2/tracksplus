@@ -149,6 +149,8 @@ pub struct App {
     pub in_meters: Vec<MeterState>,
     /// Dernier choix mono / stéréo du menu « Ajouter une piste ».
     pub add_stereo: bool,
+    /// Repère dont le menu (renommer / supprimer) est ouvert.
+    pub marker_editing: Option<u64>,
     pub master_play: [MeterState; 2],
     pub master_pad: [MeterState; 2],
     pub view: View,
@@ -229,6 +231,7 @@ impl App {
             peaks: HashMap::new(),
             in_meters: vec![MeterState::default(); audio::MAX_INPUTS],
             add_stereo: false,
+            marker_editing: None,
             master_play: Default::default(),
             master_pad: Default::default(),
             view: View {
@@ -578,6 +581,7 @@ impl App {
             }
         }
         self.transport = Transport::Stopped;
+        self.engine.shared.counting.store(false, Ordering::Relaxed);
     }
 
     /// Ajoute les prises terminées à la session, la sauvegarde et nettoie le journal.
@@ -673,6 +677,8 @@ impl App {
             recovery::remove_journal(&self.project.dir);
         }
         let overruns = self.engine.shared.overruns.swap(0, Ordering::Relaxed);
+        // Décrochages du pilote pendant la prise (ils restent affichés en bas d'écran).
+        let xruns = self.engine.shared.xruns.load(Ordering::Relaxed);
         if !errors.is_empty() {
             self.notify(
                 format!("Erreur d'enregistrement : {}", errors.join(" ; ")),
@@ -683,6 +689,15 @@ impl App {
         } else if overruns > 0 {
             self.notify(
                 format!("Prise enregistrée, mais {overruns} saturations disque compensées par du silence"),
+                true,
+            );
+        } else if xruns > 0 {
+            self.notify(
+                format!(
+                    "Prise enregistrée · {} · mais le pilote audio a signalé {xruns} décrochage{} : augmentez le buffer ou passez en ASIO",
+                    fmt_time(max_len, self.sr()),
+                    if xruns > 1 { "s" } else { "" }
+                ),
                 true,
             );
         } else if !released {
@@ -1686,13 +1701,25 @@ impl App {
             if xr > 0 || ov > 0 {
                 let r = ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format!("⚠ {xr} décrochages · {ov} pertes disque"))
-                            .font(t::medium(11.5))
-                            .color(t::ORANGE),
+                        egui::RichText::new(format!(
+                            "⚠ {xr} décrochage{} · {ov} perte{} disque",
+                            if xr > 1 { "s" } else { "" },
+                            if ov > 1 { "s" } else { "" }
+                        ))
+                        .font(t::medium(11.5))
+                        .color(t::ORANGE),
                     )
                     .sense(egui::Sense::click()),
                 );
-                if r.on_hover_text("Cliquer pour remettre à zéro").clicked() {
+                if r.on_hover_text(
+                    "Pendant la dernière prise ou lecture.\n\
+                     Décrochage : coupure signalée par le pilote audio (un peu de son a pu manquer) — \
+                     augmentez le buffer ou passez en ASIO.\n\
+                     Perte disque : le disque n'a pas suivi (remplacé par du silence, pistes toujours alignées).\n\
+                     Clic : remettre à zéro.",
+                )
+                .clicked()
+                {
                     sh.xruns.store(0, Ordering::Relaxed);
                     sh.underruns.store(0, Ordering::Relaxed);
                     sh.overruns.store(0, Ordering::Relaxed);

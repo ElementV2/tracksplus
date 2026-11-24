@@ -41,7 +41,8 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   pour régler le fondu d'entrée et de sortie (courbe en S, sans clic), ou clic droit →
   fondus 10 ms / 100 ms / 1 s sur la sélection. Deux prises qui se chevauchent avec un fondu
   font un fondu enchaîné. Les fondus s'appliquent à l'écoute comme à l'export.
-- **Repères** (touche M, même pendant l'enregistrement) : renommer, supprimer, sélectionner
+- **Repères** (touche M, même pendant l'enregistrement) : clic = y aller ; clic droit ou
+  double-clic sur l'étiquette = renommer, supprimer, sélectionner
   jusqu'au repère suivant, flèches ← / → pour sauter de repère en repère.
 - **Export** : pistes **choisies une à une** (ou la sélection de la timeline), toute la
   session ou **seulement la plage sélectionnée**, pistes séparées (stéréo pour les pistes stéréo) et/ou mix stéréo,
@@ -96,6 +97,10 @@ Conçu pour ne jamais perdre une prise :
 - **Alertes en direct** (bandeau rouge) : plus de signal de la carte (horloge Dante, câble),
   erreur disque, disque presque plein, saturation disque, erreur du pilote.
 - **Pas de mise en veille** de l'ordinateur pendant une prise.
+- **Une seule instance** : relancer TracksPlus déjà ouvert affiche un message et ramène la
+  fenêtre existante (deux instances se disputeraient la carte son).
+- **Décrochages** signalés par le pilote audio : comptés seulement pendant une prise ou une
+  lecture (remis à zéro à chaque prise) et rappelés à l'arrêt de la prise.
 - **Une erreur d'interface n'arrête jamais l'audio** (rattrapée, journalisée dans
   `crash.log` du dossier de configuration). Sauvegarde automatique du montage toutes les 30 s.
 - Sons du soundboard limités à 30 min (chargés en mémoire).

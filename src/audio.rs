@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use rtrb::{Consumer, Producer};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Nombre maximum de canaux d'entrée suivis par les vumètres.
 pub const MAX_INPUTS: usize = 256;
@@ -148,8 +148,11 @@ pub struct Shared {
     pub overruns: AtomicU32,
     /// Trous de lecture.
     pub underruns: AtomicU32,
-    /// Xruns signalés par le pilote.
+    /// Xruns signalés par le pilote, comptés seulement pendant une prise ou une lecture.
     pub xruns: AtomicU32,
+    /// Prise ou lecture en cours : les décrochages du pilote comptent. À l'arrêt, ils
+    /// n'ont aucune conséquence (et certains pilotes, surtout virtuels, en signalent).
+    pub counting: AtomicBool,
     pub last_error: Mutex<Option<String>>,
     /// Crêtes L/R de la lecture multipiste (bits f32).
     pub master_play: [AtomicU32; 2],
@@ -168,6 +171,7 @@ impl Shared {
             overruns: AtomicU32::new(0),
             underruns: AtomicU32::new(0),
             xruns: AtomicU32::new(0),
+            counting: AtomicBool::new(false),
             last_error: Mutex::new(None),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -189,7 +193,9 @@ impl Shared {
 
     fn on_error(&self, err: cpal::Error) {
         if err.kind() == cpal::ErrorKind::Xrun {
-            self.xruns.fetch_add(1, Ordering::Relaxed);
+            if self.counting.load(Ordering::Relaxed) {
+                self.xruns.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             *self.last_error.lock() = Some(err.to_string());
         }
@@ -473,6 +479,15 @@ impl Engine {
             .as_ref()
             .ok_or_else(|| anyhow!("Aucune entrée audio"))?;
         self.shared.rec_frames.store(0, Ordering::Relaxed);
+        // Compteurs propres à cette prise.
+        for c in [
+            &self.shared.xruns,
+            &self.shared.underruns,
+            &self.shared.overruns,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+        self.shared.counting.store(true, Ordering::Relaxed);
         tx.try_send(InCmd::Record(targets))
             .map_err(|_| anyhow!("Moteur audio occupé"))
     }
@@ -506,6 +521,7 @@ impl Engine {
     pub fn start_playback(&self, cons: Consumer<f32>) {
         // Remis à zéro ici et dans le callback : pas de saut de la tête au démarrage.
         self.shared.out_frames.store(0, Ordering::Relaxed);
+        self.shared.counting.store(true, Ordering::Relaxed);
         if let Some(tx) = &self.out_tx {
             let _ = tx.try_send(OutCmd::Play(cons));
         }
@@ -805,6 +821,21 @@ mod tests {
         assert!(got[80..100].iter().all(|&x| x == 2.0));
         assert!(got[100..130].iter().all(|&x| x == 0.0));
         assert!(got[130..].iter().all(|&x| x == 3.0));
+    }
+
+    /// Les décrochages du pilote ne comptent que pendant une prise ou une lecture.
+    #[test]
+    fn xruns_count_only_while_active() {
+        let sh = Shared::new();
+        sh.on_error(cpal::ErrorKind::Xrun.into());
+        assert_eq!(sh.xruns.load(Ordering::Relaxed), 0, "à l'arrêt : ignoré");
+        sh.counting.store(true, Ordering::Relaxed);
+        sh.on_error(cpal::ErrorKind::Xrun.into());
+        assert_eq!(sh.xruns.load(Ordering::Relaxed), 1);
+        assert!(
+            sh.last_error.lock().is_none(),
+            "un décrochage n'est pas une erreur"
+        );
     }
 
     /// Stéréo : entrelacement G/D, et la compensation de perte reste en trames entières
