@@ -249,6 +249,8 @@ pub enum Icon {
     Snap,
     Hold,
     Undo,
+    /// Réglages (curseurs).
+    Settings,
 }
 
 pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
@@ -403,6 +405,14 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
                 c + vec2(0.0, 0.8) * s,
             ];
             p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
+        }
+        Icon::Settings => {
+            // Trois curseurs horizontaux avec leur bouton, décalés.
+            for (k, x) in [(-1.0f32, 0.35f32), (0.0, -0.4), (1.0, 0.15)] {
+                let y = c.y + k * 0.55 * s;
+                p.line_segment([pos2(c.x - 0.8 * s, y), pos2(c.x + 0.8 * s, y)], st);
+                p.circle_filled(pos2(c.x + x * s, y), 0.22 * s, col);
+            }
         }
         Icon::Undo => {
             let r = 0.55 * s;
@@ -560,6 +570,74 @@ pub fn primary_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: boo
 }
 
 /// Onglets de vue en capitales, soulignés en orange (façon « ARRANGE · MIX »).
+/// Position réelle du curseur dans la fenêtre, demandée au système.
+/// Pendant un glisser-déposer de fichiers, Windows ne transmet aucun mouvement de souris
+/// à la fenêtre : la position connue d'egui est alors périmée.
+pub fn os_pointer_pos(ctx: &egui::Context) -> Option<Pos2> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut p = POINT { x: 0, y: 0 };
+        // SAFETY : simple lecture de la position du curseur dans `p`.
+        if unsafe { GetCursorPos(&mut p) } == 0 {
+            return None;
+        }
+        let (ppp, inner) = ctx.input(|i| (i.pixels_per_point, i.viewport().inner_rect));
+        let inner = inner?;
+        Some(pos2(
+            p.x as f32 / ppp - inner.min.x,
+            p.y as f32 / ppp - inner.min.y,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
+/// Largeur occupée par `view_tabs` (pour réserver la place avant de dessiner).
+pub fn view_tabs_width(ui: &Ui, labels: &[&str]) -> f32 {
+    let w: f32 = labels
+        .iter()
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap(l.to_string(), t::semibold(11.0), t::TEXT)
+                .size()
+                .x
+                + 24.0
+        })
+        .sum();
+    w + 2.0 * labels.len().saturating_sub(1) as f32
+}
+
+/// Raccourcit `text` avec « … » pour qu'il tienne dans `max_w` points.
+pub fn fit_text(ui: &Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let width = |s: &str| {
+        ui.painter()
+            .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    };
+    if width(text) <= max_w {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let s: String = chars[..mid].iter().collect::<String>() + "…";
+        if width(&s) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let kept: String = chars[..lo].iter().collect();
+    format!("{}…", kept.trim_end())
+}
+
 pub fn view_tabs(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
     view_tabs_rects(ui, value, labels).0
 }

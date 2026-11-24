@@ -1117,7 +1117,20 @@ impl App {
                         self.selected_tracks.insert(tid);
                     }
                 }
+                // Clic droit n'importe où sur la carte (le nom n'est plus un champ de saisie
+                // permanent : il ne capture plus le clic droit).
                 hresp.context_menu(|ui| {
+                    if ui
+                        .add_enabled(
+                            stopped,
+                            egui::Button::new("Renommer").shortcut_text("double-clic"),
+                        )
+                        .clicked()
+                    {
+                        self.renaming_track = Some(tid);
+                        self.renaming_focus = true;
+                        ui.close();
+                    }
                     if ui
                         .button("Sélectionner toutes les prises de la piste")
                         .clicked()
@@ -1144,6 +1157,7 @@ impl App {
                         .max_rect(header.shrink2(vec2(10.0, 7.0)).translate(vec2(3.0, 0.0))),
                 );
                 hdr.spacing_mut().item_spacing = vec2(4.0, 6.0);
+                let mut name_rect = Rect::NOTHING;
                 let track = &mut self.project.tracks[idx];
                 hdr.horizontal(|ui| {
                     if w::arm_button(
@@ -1158,16 +1172,47 @@ impl App {
                         self.project.dirty = true;
                     }
                     ui.add_space(2.0);
-                    let r = ui.add_enabled(
-                        stopped,
-                        egui::TextEdit::singleline(&mut track.name)
-                            .desired_width(178.0)
-                            .font(t::medium(12.0))
-                            .frame(egui::Frame::NONE)
-                            .margin(egui::Margin::symmetric(2, 2)),
-                    );
-                    if r.changed() {
-                        self.project.dirty = true;
+                    // Nom : simple texte (les clics vont à la carte) ; champ de saisie
+                    // seulement pendant un renommage (double-clic ou menu « Renommer »).
+                    if self.renaming_track == Some(tid) && stopped {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut track.name)
+                                .desired_width(178.0)
+                                .font(t::medium(12.0))
+                                .margin(egui::Margin::symmetric(2, 1)),
+                        );
+                        if self.renaming_focus {
+                            // Nom entièrement sélectionné : on retape directement.
+                            self.renaming_focus = false;
+                            r.request_focus();
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                                let len = track.name.chars().count();
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(len),
+                                )));
+                                st.store(ui.ctx(), r.id);
+                            }
+                        } else if r.lost_focus() {
+                            // Entrée, Échap ou clic ailleurs : fin du renommage.
+                            self.renaming_track = None;
+                        }
+                        if r.changed() {
+                            self.project.dirty = true;
+                        }
+                        name_rect = r.rect;
+                    } else {
+                        let (nr, _) = ui.allocate_exact_size(vec2(182.0, 18.0), Sense::hover());
+                        let font = t::medium(12.0);
+                        let shown = w::fit_text(ui, &track.name, &font, nr.width() - 4.0);
+                        ui.painter().text(
+                            pos2(nr.left() + 2.0, nr.center().y),
+                            Align2::LEFT_CENTER,
+                            shown,
+                            font,
+                            t::TEXT,
+                        );
+                        name_rect = nr;
                     }
                     if w::tag_button(ui, "M", track.mute, t::ORANGE, true, "Muet (lecture)")
                         .clicked()
@@ -1182,6 +1227,16 @@ impl App {
                         audible_changed = true;
                     }
                 });
+                // Double-clic sur le nom : renommer.
+                if stopped
+                    && hresp.double_clicked()
+                    && hresp
+                        .interact_pointer_pos()
+                        .is_some_and(|p| name_rect.contains(p))
+                {
+                    self.renaming_track = Some(tid);
+                    self.renaming_focus = true;
+                }
                 let input = track.input;
                 let stereo = track.stereo;
                 let label = track.input_label();

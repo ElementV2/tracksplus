@@ -180,6 +180,8 @@ pub struct SbState {
     /// Zoom de l'éditeur (fractions de la durée).
     pub zoom: (f64, f64),
     pub drag: Option<crate::ui::soundboard::Handle>,
+    /// Poignée de fondu survolée dans l'éditeur (0 = entrée, 1 = sortie).
+    pub hover_fade: Option<usize>,
     pub midi_seen: f64,
     pub midi_last: Option<String>,
     pub midi_dirty: bool,
@@ -192,6 +194,8 @@ pub struct SbState {
     pub page_tabs: Vec<Rect>,
     /// Page dont la suppression attend confirmation.
     pub confirm_delete_page: Option<usize>,
+    /// Fenêtre « Réglages du soundboard » ouverte.
+    pub settings_open: bool,
 }
 
 pub struct App {
@@ -212,6 +216,10 @@ pub struct App {
     pub add_stereo: bool,
     /// Repère dont le menu (renommer / supprimer) est ouvert.
     pub marker_editing: Option<u64>,
+    /// Piste en cours de renommage (champ de saisie à la place du nom).
+    pub renaming_track: Option<u64>,
+    /// Donner le focus au champ de renommage à la prochaine image.
+    pub renaming_focus: bool,
     pub master_play: [MeterState; 2],
     pub master_pad: [MeterState; 2],
     pub view: View,
@@ -294,6 +302,8 @@ impl App {
             add_stereo: false,
             out_devices: Vec::new(),
             marker_editing: None,
+            renaming_track: None,
+            renaming_focus: false,
             master_play: Default::default(),
             master_pad: Default::default(),
             view: View {
@@ -1309,6 +1319,7 @@ impl App {
 
     pub fn dialog_open(&self) -> bool {
         self.audio_dlg.is_some()
+            || self.sb.settings_open
             || self.export_dlg.is_some()
             || self.new_dlg.is_some()
             || self.export_job.is_some()
@@ -1412,25 +1423,38 @@ impl App {
         let p = ui.painter().clone();
         w::hline(&p, full.left(), full.right(), full.bottom() - 1.0, t::LINE);
 
-        // Gauche : menu + session.
+        // Trois zones qui ne se chevauchent jamais : transport au centre, menu + session +
+        // onglets à gauche, carte son à droite. Les textes se raccourcissent selon la place.
+        let tw = 4.0 * 30.0 + 12.0 + 168.0;
+        let center = egui::Rect::from_center_size(full.center(), vec2(tw, full.height()));
         let left =
-            egui::Rect::from_min_max(full.min, egui::pos2(full.left() + 360.0, full.bottom()));
+            egui::Rect::from_min_max(full.min, egui::pos2(center.left() - 12.0, full.bottom()));
+        let right =
+            egui::Rect::from_min_max(egui::pos2(center.right() + 12.0, full.top()), full.max);
+
+        // Gauche : menu, session, onglets de vue.
+        let tab_labels = ["MULTIPISTE", "SOUNDBOARD"];
+        let tabs_w = w::view_tabs_width(ui, &tab_labels);
         let mut lui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(left)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
+        lui.spacing_mut().item_spacing.x = 6.0;
         lui.add_space(6.0);
         let more = w::icon_button(&mut lui, Icon::More, 28.0, BtnStyle::Ghost, true, "Menu");
         egui::Popup::menu(&more)
             .width(250.0)
             .show(|ui| self.main_menu(ui));
-        lui.add_space(6.0);
-        lui.label(
-            egui::RichText::new(short(&self.project.name, 36))
-                .font(t::semibold(12.0))
-                .color(t::TEXT),
-        );
+        // Place pour le nom : ce qui reste après le menu, la pastille et les onglets.
+        let name_max = (lui.available_width() - tabs_w - 34.0).max(40.0);
+        let font = t::semibold(12.0);
+        let name = w::fit_text(&lui, &self.project.name, &font, name_max);
+        let shortened = name != self.project.name;
+        let r = lui.label(egui::RichText::new(name).font(font).color(t::TEXT));
+        if shortened {
+            r.on_hover_text(&self.project.name);
+        }
         if self.project.dirty {
             lui.label(
                 egui::RichText::new("●")
@@ -1439,10 +1463,21 @@ impl App {
             )
             .on_hover_text("Modifications non enregistrées (Ctrl+S)");
         }
+        let tabs = egui::Rect::from_min_max(
+            egui::pos2(left.right() - tabs_w, full.top()),
+            egui::pos2(left.right(), full.bottom() - 1.0),
+        );
+        let mut tui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(tabs)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let mut tab = self.tab;
+        if w::view_tabs(&mut tui, &mut tab, &tab_labels) {
+            self.tab = tab;
+        }
 
         // Centre : transport (visible dans les deux onglets : on peut enregistrer en lançant des pads).
-        let tw = 4.0 * 30.0 + 12.0 + 168.0;
-        let center = egui::Rect::from_center_size(full.center(), vec2(tw, full.height()));
         let mut cui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(center)
@@ -1450,9 +1485,7 @@ impl App {
         );
         self.transport_controls(&mut cui);
 
-        // Droite : onglets de vue + carte son.
-        let right =
-            egui::Rect::from_min_max(egui::pos2(full.right() - 560.0, full.top()), full.max);
+        // Droite : carte son (pastille raccourcie pour tenir dans la place restante).
         let mut rui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(right)
@@ -1466,21 +1499,39 @@ impl App {
             .clone()
             .or(st.output.clone())
             .unwrap_or_else(|| "Aucune carte son".into());
-        let label = if ok {
+        let full_label = if ok {
             format!(
                 "{} · {} · {} kHz · {}/{}",
                 st.host,
-                short(&dev, 26),
+                dev,
                 fmt_khz(st.sample_rate),
                 st.in_channels,
                 st.out_channels
             )
         } else {
-            dev
+            dev.clone()
         };
-        let gal = rui
-            .painter()
-            .layout_no_wrap(label, t::regular(11.0), t::TEXT_2);
+        let font = t::regular(11.0);
+        let label = if ok {
+            // On raccourcit le nom de la carte en priorité, pas la fréquence ni les canaux.
+            let tail = format!(
+                " · {} kHz · {}/{}",
+                fmt_khz(st.sample_rate),
+                st.in_channels,
+                st.out_channels
+            );
+            let head = format!("{} · ", st.host);
+            let fixed = rui
+                .painter()
+                .layout_no_wrap(format!("{head}{tail}"), font.clone(), t::TEXT_2)
+                .size()
+                .x;
+            let dev_max = (rui.available_width() - 34.0 - fixed).max(30.0);
+            format!("{head}{}{tail}", w::fit_text(&rui, &dev, &font, dev_max))
+        } else {
+            w::fit_text(&rui, &dev, &font, rui.available_width() - 34.0)
+        };
+        let gal = rui.painter().layout_no_wrap(label, font, t::TEXT_2);
         let (pr, resp) =
             rui.allocate_exact_size(vec2(gal.size().x + 26.0, 24.0), egui::Sense::click());
         let pp = rui.painter();
@@ -1500,23 +1551,11 @@ impl App {
             gal,
             t::TEXT_2,
         );
-        if resp.on_hover_text("Réglages de la carte son").clicked() {
+        if resp
+            .on_hover_text(format!("{full_label}\nRéglages de la carte son"))
+            .clicked()
+        {
             self.open_audio();
-        }
-        rui.add_space(10.0);
-        let mut tabs = egui::Rect::from_min_max(
-            egui::pos2(rui.cursor().left() - 230.0, full.top()),
-            egui::pos2(rui.cursor().left(), full.bottom() - 1.0),
-        );
-        tabs.set_left(tabs.left().max(center.right() + 10.0));
-        let mut tui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(tabs)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-        let mut tab = self.tab;
-        if w::view_tabs(&mut tui, &mut tab, &["MULTIPISTE", "SOUNDBOARD"]) {
-            self.tab = tab;
         }
     }
 
@@ -1651,7 +1690,10 @@ impl App {
         {
             self.open_session();
         }
-        if ui.button("Enregistrer  (Ctrl+S)").clicked() {
+        if ui
+            .add(egui::Button::new("Enregistrer").shortcut_text("Ctrl+S"))
+            .clicked()
+        {
             self.save();
         }
         if ui
@@ -1667,7 +1709,7 @@ impl App {
         if ui
             .add_enabled(
                 self.project.has_audio() && stopped,
-                egui::Button::new("Exporter…  (Ctrl+E)"),
+                egui::Button::new("Exporter…").shortcut_text("Ctrl+E"),
             )
             .clicked()
         {
@@ -1675,19 +1717,30 @@ impl App {
         }
         ui.separator();
         ui.label(
-            egui::RichText::new("ENREGISTREMENT")
+            egui::RichText::new("FORMAT DES PRISES")
                 .font(t::semibold(10.5))
                 .color(t::TEXT_3),
+        )
+        .on_hover_text(
+            "Format des fichiers écrits sur le disque pendant l'enregistrement (les originaux de la session, jamais modifiés).\nLe format des fichiers finaux (16 bits, 44.1 kHz…) se choisit à l'export.",
         );
         for f in [RecFormat::Int24, RecFormat::Float32] {
+            let (label, tip) = match f {
+                RecFormat::Int24 => (
+                    "WAV 24 bits (recommandé)",
+                    "Standard des enregistrements pro : largement assez de dynamique.",
+                ),
+                RecFormat::Float32 => (
+                    "WAV 32 bits flottant",
+                    "Un tiers d'espace disque en plus. Utile surtout si les fichiers seront beaucoup retraités ensuite ; la carte son sature de toute façon à 0 dB.",
+                ),
+            };
             if ui
                 .add_enabled(
                     stopped,
-                    egui::RadioButton::new(
-                        self.project.rec_format == f,
-                        format!("WAV {}", f.label()),
-                    ),
+                    egui::RadioButton::new(self.project.rec_format == f, label),
                 )
+                .on_hover_text(tip)
                 .clicked()
             {
                 self.project.rec_format = f;
@@ -1843,7 +1896,7 @@ impl App {
 
     // ---------------------------------------------------------------- dialogs
 
-    fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
+    pub fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
         let mut close = false;
         ui.horizontal(|ui| {
             ui.label(
@@ -2185,139 +2238,152 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width(560.0);
                 close = Self::dialog_header(ui, "Exporter");
-
-                Self::section(ui, "Pistes");
-                let with_audio: Vec<(u64, String, usize)> = self
-                    .project
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| !t.clips.is_empty())
-                    .map(|(i, t)| (t.id, t.name.clone(), i))
-                    .collect();
-                ui.horizontal(|ui| {
-                    if ui.small_button("Toutes").clicked() {
-                        d.tracks = with_audio.iter().map(|x| x.0).collect();
-                    }
-                    if ui.small_button("Aucune").clicked() {
-                        d.tracks.clear();
-                    }
-                    if !self.selected_tracks.is_empty()
-                        && ui.small_button("Sélection de la timeline").clicked()
-                    {
-                        d.tracks = with_audio
-                            .iter()
-                            .map(|x| x.0)
-                            .filter(|id| self.selected_tracks.contains(id))
-                            .collect();
-                    }
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} / {} sélectionnée(s)",
-                            d.tracks.len(),
-                            with_audio.len()
-                        ))
-                        .font(t::regular(12.0))
-                        .color(t::TEXT_3),
-                    );
-                });
-                egui::Frame::new()
-                    .fill(t::SURFACE)
-                    .corner_radius(t::R)
-                    .inner_margin(8)
+                // Contenu défilant si la fenêtre est trop basse : le bouton « Exporter »
+                // reste toujours visible.
+                let max_h = (ui.ctx().content_rect().height() - 190.0).max(160.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(150.0)
-                            .auto_shrink([false, true])
+                        Self::section(ui, "Pistes");
+                        let with_audio: Vec<(u64, String, usize)> = self
+                            .project
+                            .tracks
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| !t.clips.is_empty())
+                            .map(|(i, t)| (t.id, t.name.clone(), i))
+                            .collect();
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Toutes").clicked() {
+                                d.tracks = with_audio.iter().map(|x| x.0).collect();
+                            }
+                            if ui.small_button("Aucune").clicked() {
+                                d.tracks.clear();
+                            }
+                            if !self.selected_tracks.is_empty()
+                                && ui.small_button("Sélection de la timeline").clicked()
+                            {
+                                d.tracks = with_audio
+                                    .iter()
+                                    .map(|x| x.0)
+                                    .filter(|id| self.selected_tracks.contains(id))
+                                    .collect();
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {} sélectionnée(s)",
+                                    d.tracks.len(),
+                                    with_audio.len()
+                                ))
+                                .font(t::regular(12.0))
+                                .color(t::TEXT_3),
+                            );
+                        });
+                        egui::Frame::new()
+                            .fill(t::SURFACE)
+                            .corner_radius(t::R)
+                            .inner_margin(8)
                             .show(ui, |ui| {
-                                egui::Grid::new("exp_tracks")
-                                    .num_columns(3)
-                                    .spacing([18.0, 4.0])
+                                egui::ScrollArea::vertical()
+                                    .max_height(150.0)
+                                    .auto_shrink([false, true])
                                     .show(ui, |ui| {
-                                        for (k, (id, name, idx)) in with_audio.iter().enumerate() {
-                                            let mut on = d.tracks.contains(id);
-                                            let txt = egui::RichText::new(format!(
-                                                "{:02}  {}",
-                                                idx + 1,
-                                                short(name, 18)
-                                            ));
-                                            if ui.checkbox(&mut on, txt).changed() {
-                                                if on {
-                                                    d.tracks.insert(*id);
-                                                } else {
-                                                    d.tracks.remove(id);
+                                        egui::Grid::new("exp_tracks")
+                                            .num_columns(3)
+                                            .spacing([18.0, 4.0])
+                                            .show(ui, |ui| {
+                                                for (k, (id, name, idx)) in
+                                                    with_audio.iter().enumerate()
+                                                {
+                                                    let mut on = d.tracks.contains(id);
+                                                    let txt = egui::RichText::new(format!(
+                                                        "{:02}  {}",
+                                                        idx + 1,
+                                                        short(name, 18)
+                                                    ));
+                                                    if ui.checkbox(&mut on, txt).changed() {
+                                                        if on {
+                                                            d.tracks.insert(*id);
+                                                        } else {
+                                                            d.tracks.remove(id);
+                                                        }
+                                                    }
+                                                    if k % 3 == 2 {
+                                                        ui.end_row();
+                                                    }
                                                 }
-                                            }
-                                            if k % 3 == 2 {
-                                                ui.end_row();
-                                            }
-                                        }
+                                            });
                                     });
                             });
+
+                        Self::section(ui, "Plage");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(
+                                &mut d.range,
+                                RangeChoice::All,
+                                format!(
+                                    "Toute la session ({})",
+                                    fmt_duration(self.project.end() / sr as u64)
+                                ),
+                            );
+                            let sel_txt = match self.selection {
+                                Some((a, b)) => format!(
+                                    "Sélection {} → {}",
+                                    fmt_time_short(a, sr),
+                                    fmt_time_short(b, sr)
+                                ),
+                                None => "Sélection (glisser sur la règle)".into(),
+                            };
+                            ui.add_enabled_ui(self.selection.is_some(), |ui| {
+                                ui.radio_value(&mut d.range, RangeChoice::Selection, sel_txt);
+                            });
+                        });
+
+                        Self::section(ui, "Contenu");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut d.s.stems, "Pistes séparées (WAV mono)");
+                            ui.checkbox(&mut d.s.mix, "Mix stéréo des pistes");
+                        });
+
+                        Self::section(ui, "Format");
+                        ui.horizontal(|ui| {
+                            for r in [44100, 48000, 88200, 96000] {
+                                ui.selectable_value(
+                                    &mut d.s.sample_rate,
+                                    r,
+                                    format!("{} kHz", fmt_khz(r)),
+                                );
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            for b in BitDepth::ALL {
+                                ui.selectable_value(&mut d.s.depth, b, b.label());
+                            }
+                        });
+                        ui.add_enabled(
+                            d.s.depth == BitDepth::I16,
+                            egui::Checkbox::new(&mut d.s.dither, "Dither (recommandé en 16 bits)"),
+                        );
+
+                        Self::section(ui, "Destination");
+                        ui.horizontal(|ui| {
+                            let mut txt = d.s.dir.display().to_string();
+                            if ui
+                                .add(egui::TextEdit::singleline(&mut txt).desired_width(470.0))
+                                .changed()
+                            {
+                                d.s.dir = PathBuf::from(txt);
+                            }
+                            if ui.button("…").clicked()
+                                && let Some(p) = rfd::FileDialog::new()
+                                    .set_directory(&self.project.dir)
+                                    .pick_folder()
+                            {
+                                d.s.dir = p;
+                            }
+                        });
                     });
-
-                Self::section(ui, "Plage");
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut d.range,
-                        RangeChoice::All,
-                        format!(
-                            "Toute la session ({})",
-                            fmt_duration(self.project.end() / sr as u64)
-                        ),
-                    );
-                    let sel_txt = match self.selection {
-                        Some((a, b)) => format!(
-                            "Sélection {} → {}",
-                            fmt_time_short(a, sr),
-                            fmt_time_short(b, sr)
-                        ),
-                        None => "Sélection (glisser sur la règle)".into(),
-                    };
-                    ui.add_enabled_ui(self.selection.is_some(), |ui| {
-                        ui.radio_value(&mut d.range, RangeChoice::Selection, sel_txt);
-                    });
-                });
-
-                Self::section(ui, "Contenu");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut d.s.stems, "Pistes séparées (WAV mono)");
-                    ui.checkbox(&mut d.s.mix, "Mix stéréo des pistes");
-                });
-
-                Self::section(ui, "Format");
-                ui.horizontal(|ui| {
-                    for r in [44100, 48000, 88200, 96000] {
-                        ui.selectable_value(&mut d.s.sample_rate, r, format!("{} kHz", fmt_khz(r)));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    for b in BitDepth::ALL {
-                        ui.selectable_value(&mut d.s.depth, b, b.label());
-                    }
-                });
-                ui.add_enabled(
-                    d.s.depth == BitDepth::I16,
-                    egui::Checkbox::new(&mut d.s.dither, "Dither (recommandé en 16 bits)"),
-                );
-
-                Self::section(ui, "Destination");
-                ui.horizontal(|ui| {
-                    let mut txt = d.s.dir.display().to_string();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut txt).desired_width(470.0))
-                        .changed()
-                    {
-                        d.s.dir = PathBuf::from(txt);
-                    }
-                    if ui.button("…").clicked()
-                        && let Some(p) = rfd::FileDialog::new()
-                            .set_directory(&self.project.dir)
-                            .pick_folder()
-                    {
-                        d.s.dir = p;
-                    }
-                });
                 ui.add_space(14.0);
                 let n_files = if d.s.stems { d.tracks.len() } else { 0 }
                     + usize::from(d.s.mix && !d.tracks.is_empty());
