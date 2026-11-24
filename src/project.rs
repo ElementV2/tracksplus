@@ -51,8 +51,19 @@ pub struct Track {
     /// Canal d'entrée de la carte son (0-based). `None` = pas d'entrée.
     pub input: Option<u16>,
     pub armed: bool,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub solo: bool,
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
     pub clips: Vec<Clip>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Marker {
+    pub id: u64,
+    pub pos: u64,
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -62,6 +73,8 @@ pub struct Project {
     #[serde(default)]
     pub rec_format: RecFormat,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
     pub next_id: u64,
     /// Dossier de la session (non sérialisé).
     #[serde(skip)]
@@ -78,6 +91,7 @@ impl Project {
             sample_rate,
             rec_format: RecFormat::Int24,
             tracks: Vec::new(),
+            markers: Vec::new(),
             next_id: 1,
             dir,
             dirty: false,
@@ -107,6 +121,8 @@ impl Project {
             name,
             input,
             armed: input.is_some(),
+            mute: false,
+            solo: false,
             clips: Vec::new(),
         });
         self.dirty = true;
@@ -115,6 +131,28 @@ impl Project {
 
     pub fn track_mut(&mut self, id: u64) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Pistes audibles en lecture (mute / solo).
+    pub fn audible(&self) -> Vec<bool> {
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+        self.tracks
+            .iter()
+            .map(|t| if any_solo { t.solo } else { !t.mute })
+            .collect()
+    }
+
+    pub fn add_marker(&mut self, pos: u64) -> u64 {
+        let id = self.alloc_id();
+        let n = self.markers.len() + 1;
+        self.markers.push(Marker {
+            id,
+            pos,
+            name: format!("Repère {n}"),
+        });
+        self.markers.sort_by_key(|m| m.pos);
+        self.dirty = true;
+        id
     }
 
     pub fn has_audio(&self) -> bool {

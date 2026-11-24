@@ -1,0 +1,370 @@
+//! Moteur du soundboard, exécuté dans le callback de sortie audio.
+//!
+//! Les sons sont en mémoire (stéréo entrelacé, à la fréquence de la carte). Le callback
+//! reçoit des commandes (appui / relâchement de pad, stop) et mixe les voix actives.
+//! Aucune allocation ni libération n'a lieu dans le thread audio : les sons terminés
+//! sont rendus à l'interface via un canal « poubelle ».
+
+use crossbeam_channel::{Receiver, Sender};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Nombre de pads par page et nombre maximal de pages.
+pub const PADS_PER_PAGE: usize = 64;
+pub const MAX_PAGES: usize = 8;
+pub const MAX_PADS: usize = PADS_PER_PAGE * MAX_PAGES;
+const MAX_VOICES: usize = 64;
+
+/// Son chargé en mémoire.
+pub struct SampleData {
+    pub sample_rate: u32,
+    pub frames: usize,
+    /// Stéréo entrelacé.
+    pub data: Vec<f32>,
+    /// Forme d'onde (min, max) par bloc de `SAMPLE_PEAK` trames.
+    pub peaks: Vec<[f32; 2]>,
+}
+
+pub const SAMPLE_PEAK: usize = 256;
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PadMode {
+    /// Chaque appui relance le son depuis le début.
+    #[default]
+    OneShot,
+    /// Un appui lance, un autre arrête.
+    Toggle,
+    /// Le son joue tant que le pad est maintenu.
+    Gate,
+}
+
+impl PadMode {
+    pub const ALL: [PadMode; 3] = [PadMode::OneShot, PadMode::Toggle, PadMode::Gate];
+    pub fn label(self) -> &'static str {
+        match self {
+            PadMode::OneShot => "One shot",
+            PadMode::Toggle => "Play / Stop",
+            PadMode::Gate => "Maintien",
+        }
+    }
+}
+
+/// Paramètres de lecture d'un pad, en trames.
+#[derive(Clone, Copy, Debug)]
+pub struct PadParams {
+    pub start: usize,
+    pub end: usize,
+    pub fade_in: usize,
+    pub fade_out: usize,
+    pub gain: f32,
+    pub mode: PadMode,
+    pub looped: bool,
+}
+
+pub enum PadCmd {
+    Press {
+        slot: u16,
+        sample: Arc<SampleData>,
+        params: PadParams,
+    },
+    Release {
+        slot: u16,
+    },
+    Stop {
+        slot: u16,
+    },
+    StopAll {
+        fade: usize,
+    },
+    SetOutput {
+        left: usize,
+    },
+    SetMaster {
+        gain: f32,
+    },
+}
+
+struct Voice {
+    slot: u16,
+    sample: Arc<SampleData>,
+    p: PadParams,
+    pos: usize,
+    /// Fondu de relâchement : (trames restantes, total).
+    release: Option<(usize, usize)>,
+    /// Premier passage (le fondu d'entrée ne s'applique qu'une fois en boucle).
+    first: bool,
+}
+
+impl Voice {
+    fn release(&mut self, fade: usize) {
+        let fade = fade.max(64);
+        match self.release {
+            Some((rem, _)) if rem <= fade => {}
+            _ => self.release = Some((fade, fade)),
+        }
+    }
+}
+
+fn smooth(x: f32) -> f32 {
+    // Courbe en S (sinus²) : fondus doux et sans clic.
+    let x = x.clamp(0.0, 1.0);
+    let s = (x * std::f32::consts::FRAC_PI_2).sin();
+    s * s
+}
+
+pub struct Sampler {
+    voices: Vec<Voice>,
+    rx: Receiver<PadCmd>,
+    garbage: Sender<Arc<SampleData>>,
+    pub left: usize,
+    master: f32,
+    sample_rate: usize,
+}
+
+impl Sampler {
+    pub fn new(
+        rx: Receiver<PadCmd>,
+        garbage: Sender<Arc<SampleData>>,
+        left: usize,
+        sample_rate: u32,
+    ) -> Self {
+        Self {
+            voices: Vec::with_capacity(MAX_VOICES),
+            rx,
+            garbage,
+            left,
+            master: 1.0,
+            sample_rate: sample_rate as usize,
+        }
+    }
+
+    fn dispose(&self, s: Arc<SampleData>) {
+        if let Err(e) = self.garbage.try_send(s) {
+            std::mem::forget(e.into_inner());
+        }
+    }
+
+    fn quick(&self) -> usize {
+        self.sample_rate / 100 // 10 ms
+    }
+
+    fn handle(&mut self, cmd: PadCmd) {
+        let quick = self.quick();
+        match cmd {
+            PadCmd::Press {
+                slot,
+                sample,
+                params,
+            } => {
+                let active = self
+                    .voices
+                    .iter()
+                    .any(|v| v.slot == slot && v.release.is_none());
+                match params.mode {
+                    PadMode::Toggle if active => {
+                        for v in self.voices.iter_mut().filter(|v| v.slot == slot) {
+                            v.release(params.fade_out.max(quick));
+                        }
+                        self.dispose(sample);
+                        return;
+                    }
+                    PadMode::Gate if active => {
+                        self.dispose(sample);
+                        return;
+                    }
+                    _ => {
+                        for v in self.voices.iter_mut().filter(|v| v.slot == slot) {
+                            v.release(quick);
+                        }
+                    }
+                }
+                if self.voices.len() >= MAX_VOICES || params.start >= params.end {
+                    self.dispose(sample);
+                    return;
+                }
+                self.voices.push(Voice {
+                    slot,
+                    pos: params.start,
+                    p: params,
+                    sample,
+                    release: None,
+                    first: true,
+                });
+            }
+            PadCmd::Release { slot } => {
+                for v in self
+                    .voices
+                    .iter_mut()
+                    .filter(|v| v.slot == slot && v.p.mode == PadMode::Gate)
+                {
+                    let f = v.p.fade_out.max(quick);
+                    v.release(f);
+                }
+            }
+            PadCmd::Stop { slot } => {
+                for v in self.voices.iter_mut().filter(|v| v.slot == slot) {
+                    v.release(quick * 2);
+                }
+            }
+            PadCmd::StopAll { fade } => {
+                for v in &mut self.voices {
+                    v.release(fade.max(quick));
+                }
+            }
+            PadCmd::SetOutput { left } => self.left = left,
+            PadCmd::SetMaster { gain } => self.master = gain,
+        }
+    }
+
+    /// Mixe les voix dans `out` (stéréo entrelacé, `frames` trames) en additionnant.
+    pub fn render(&mut self, out: &mut [f32], frames: usize, pad_pos: &[AtomicU64]) {
+        while let Ok(cmd) = self.rx.try_recv() {
+            self.handle(cmd);
+        }
+        let master = self.master;
+        for v in &mut self.voices {
+            let data = &v.sample.data;
+            let p = v.p;
+            let end = p.end.min(v.sample.frames);
+            for f in 0..frames {
+                if v.pos >= end {
+                    if p.looped && v.release.is_none() {
+                        v.pos = p.start;
+                        v.first = false;
+                    } else {
+                        v.release = Some((0, 1));
+                        break;
+                    }
+                }
+                let mut g = p.gain * master;
+                if v.first && p.fade_in > 0 {
+                    let k = v.pos.saturating_sub(p.start);
+                    if k < p.fade_in {
+                        g *= smooth(k as f32 / p.fade_in as f32);
+                    }
+                }
+                if !p.looped && p.fade_out > 0 {
+                    let k = end - v.pos;
+                    if k < p.fade_out {
+                        g *= smooth(k as f32 / p.fade_out as f32);
+                    }
+                }
+                if let Some((rem, total)) = &mut v.release {
+                    if *rem == 0 {
+                        break;
+                    }
+                    g *= smooth(*rem as f32 / *total as f32);
+                    *rem -= 1;
+                }
+                let i = v.pos * 2;
+                out[f * 2] += data[i] * g;
+                out[f * 2 + 1] += data[i + 1] * g;
+                v.pos += 1;
+            }
+        }
+        // Voix terminées : position à zéro, son rendu à l'interface.
+        let mut i = 0;
+        while i < self.voices.len() {
+            if matches!(self.voices[i].release, Some((0, _))) {
+                let v = self.voices.swap_remove(i);
+                if let Some(a) = pad_pos.get(v.slot as usize) {
+                    a.store(0, Ordering::Relaxed);
+                }
+                self.dispose(v.sample);
+            } else {
+                i += 1;
+            }
+        }
+        for v in &self.voices {
+            if v.release.is_none()
+                && let Some(a) = pad_pos.get(v.slot as usize)
+            {
+                a.store(v.pos as u64 + 1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+
+    fn sample(frames: usize) -> Arc<SampleData> {
+        Arc::new(SampleData {
+            sample_rate: 48000,
+            frames,
+            data: vec![0.5; frames * 2],
+            peaks: Vec::new(),
+        })
+    }
+
+    fn params(mode: PadMode, frames: usize) -> PadParams {
+        PadParams {
+            start: 0,
+            end: frames,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            mode,
+            looped: false,
+        }
+    }
+
+    #[test]
+    fn oneshot_plays_to_end_then_stops() {
+        let (tx, rx) = bounded(16);
+        let (gtx, grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        tx.send(PadCmd::Press {
+            slot: 1,
+            sample: sample(100),
+            params: params(PadMode::OneShot, 100),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 128];
+        s.render(&mut out, 64, &pos);
+        assert_eq!(out[0], 0.5);
+        assert_eq!(pos[1].load(Ordering::Relaxed), 65);
+        let mut out = vec![0.0; 128];
+        s.render(&mut out, 64, &pos);
+        assert_eq!(out[2 * 35], 0.5);
+        assert_eq!(out[2 * 36], 0.0);
+        assert_eq!(pos[1].load(Ordering::Relaxed), 0);
+        assert!(
+            grx.try_recv().is_ok(),
+            "le son doit être rendu à l'interface"
+        );
+    }
+
+    #[test]
+    fn toggle_second_press_fades_out() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        let smp = sample(48000);
+        tx.send(PadCmd::Press {
+            slot: 0,
+            sample: smp.clone(),
+            params: params(PadMode::Toggle, 48000),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 2048];
+        s.render(&mut out, 1024, &pos);
+        tx.send(PadCmd::Press {
+            slot: 0,
+            sample: smp,
+            params: params(PadMode::Toggle, 48000),
+        })
+        .unwrap();
+        for _ in 0..4 {
+            out.fill(0.0);
+            s.render(&mut out, 1024, &pos);
+        }
+        assert!(out.iter().all(|&x| x == 0.0));
+        assert_eq!(pos[0].load(Ordering::Relaxed), 0);
+    }
+}

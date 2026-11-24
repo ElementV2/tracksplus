@@ -4,6 +4,7 @@
 //! Les callbacks audio ne font aucune allocation ni aucun verrou : ils échangent les
 //! données avec les threads disque via des ring buffers `rtrb`.
 
+use crate::sampler::{MAX_PADS, PadCmd, SampleData, Sampler};
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -150,6 +151,12 @@ pub struct Shared {
     /// Xruns signalés par le pilote.
     pub xruns: AtomicU32,
     pub last_error: Mutex<Option<String>>,
+    /// Crêtes L/R de la lecture multipiste (bits f32).
+    pub master_play: [AtomicU32; 2],
+    /// Crêtes L/R du soundboard (bits f32).
+    pub master_pad: [AtomicU32; 2],
+    /// Position de lecture de chaque pad (+1, 0 = arrêté).
+    pub pad_pos: Vec<AtomicU64>,
 }
 
 impl Shared {
@@ -162,7 +169,14 @@ impl Shared {
             underruns: AtomicU32::new(0),
             xruns: AtomicU32::new(0),
             last_error: Mutex::new(None),
+            master_play: [AtomicU32::new(0), AtomicU32::new(0)],
+            master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
+            pad_pos: (0..MAX_PADS).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    pub fn take_peak(a: &AtomicU32) -> f32 {
+        f32::from_bits(a.swap(0, Ordering::Relaxed))
     }
 
     /// Lit puis remet à zéro la crête d'un canal.
@@ -217,14 +231,18 @@ pub struct Engine {
     _output: Option<cpal::Stream>,
     in_tx: Option<Sender<InCmd>>,
     out_tx: Option<Sender<OutCmd>>,
+    /// Commandes du soundboard (clonable pour le thread MIDI).
+    pub pad_tx: Option<Sender<PadCmd>>,
     /// Objets rendus par le callback pour être libérés hors du thread audio.
     garbage_rx: Receiver<Consumer<f32>>,
+    sample_garbage_rx: Receiver<Arc<SampleData>>,
 }
 
 impl Engine {
     /// Moteur sans carte son (en cas d'échec d'ouverture).
     pub fn offline() -> Self {
         let (_tx, garbage_rx) = bounded(1);
+        let (_tx2, sample_garbage_rx) = bounded(1);
         Self {
             shared: Arc::new(Shared::new()),
             status: EngineStatus {
@@ -235,11 +253,14 @@ impl Engine {
             _output: None,
             in_tx: None,
             out_tx: None,
+            pad_tx: None,
             garbage_rx,
+            sample_garbage_rx,
         }
     }
 
-    pub fn open(prefs: &AudioPrefs) -> Result<Self> {
+    /// Ouvre la carte. `pad_left` = premier canal de sortie du soundboard.
+    pub fn open(prefs: &AudioPrefs, pad_left: u16) -> Result<Self> {
         let host = find_host(prefs.host.as_deref());
         let host_name = host.id().name().to_string();
         let shared = Arc::new(Shared::new());
@@ -295,6 +316,8 @@ impl Engine {
         };
 
         let (garbage_tx, garbage_rx) = bounded(16);
+        let (sample_garbage_tx, sample_garbage_rx) = bounded(256);
+        let mut pad_tx = None;
         let mut status = EngineStatus {
             host: host_name,
             sample_rate,
@@ -345,15 +368,25 @@ impl Engine {
                         buffer_size: buffer,
                     };
                     let (tx, rx) = bounded(8);
-                    let left = (prefs.out_left as usize).min(channels.saturating_sub(1) as usize);
+                    let (ptx, prx) = bounded(256);
+                    let last = channels.saturating_sub(1) as usize;
+                    let left = (prefs.out_left as usize).min(last);
                     let st = OutState {
                         channels: channels as usize,
                         left,
-                        right: (left + 1).min(channels as usize - 1),
                         rx,
                         cons: None,
                         garbage: garbage_tx,
                         shared: shared.clone(),
+                        sampler: Sampler::new(
+                            prx,
+                            sample_garbage_tx,
+                            (pad_left as usize).min(last),
+                            sample_rate,
+                        ),
+                        mix: vec![0.0; MAX_BLOCK * channels as usize],
+                        play: vec![0.0; MAX_BLOCK * 2],
+                        pads: vec![0.0; MAX_BLOCK * 2],
                     };
                     let res = match fmt {
                         SampleFormat::F32 => build_output::<f32>(dev, cfg, st),
@@ -371,6 +404,7 @@ impl Engine {
                             status.out_channels = channels;
                             output = Some(s);
                             out_tx = Some(tx);
+                            pad_tx = Some(ptx);
                         }
                         Err(e) => *shared.last_error.lock() = Some(format!("Sortie : {e:#}")),
                     }
@@ -386,7 +420,9 @@ impl Engine {
             _output: output,
             in_tx,
             out_tx,
+            pad_tx,
             garbage_rx,
+            sample_garbage_rx,
         })
     }
 
@@ -430,6 +466,13 @@ impl Engine {
     /// À appeler régulièrement depuis l'interface.
     pub fn collect_garbage(&self) {
         while self.garbage_rx.try_recv().is_ok() {}
+        while self.sample_garbage_rx.try_recv().is_ok() {}
+    }
+
+    pub fn pad(&self, cmd: PadCmd) {
+        if let Some(tx) = &self.pad_tx {
+            let _ = tx.try_send(cmd);
+        }
     }
 }
 
@@ -521,14 +564,19 @@ where
     Ok(stream)
 }
 
+const MAX_BLOCK: usize = 4096;
+
 struct OutState {
     channels: usize,
     left: usize,
-    right: usize,
     rx: Receiver<OutCmd>,
     cons: Option<Consumer<f32>>,
     garbage: Sender<Consumer<f32>>,
     shared: Arc<Shared>,
+    sampler: Sampler,
+    mix: Vec<f32>,
+    play: Vec<f32>,
+    pads: Vec<f32>,
 }
 
 impl OutState {
@@ -539,6 +587,52 @@ impl OutState {
                 std::mem::forget(e.into_inner());
             }
         }
+    }
+
+    /// Calcule `frames` trames (≤ MAX_BLOCK) dans `self.mix`.
+    fn process(&mut self, frames: usize) {
+        let ch = self.channels;
+        let sh = &*self.shared;
+        let play = &mut self.play[..frames * 2];
+        play.fill(0.0);
+        if let Some(cons) = self.cons.as_mut() {
+            let n = frames.min(cons.slots() / 2);
+            if n < frames && !cons.is_abandoned() {
+                sh.underruns.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Ok(chunk) = cons.read_chunk(n * 2) {
+                let (a, b) = chunk.as_slices();
+                play[..a.len()].copy_from_slice(a);
+                play[a.len()..a.len() + b.len()].copy_from_slice(b);
+                chunk.commit_all();
+            }
+            sh.out_frames.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        let pads = &mut self.pads[..frames * 2];
+        pads.fill(0.0);
+        self.sampler.render(pads, frames, &sh.pad_pos);
+
+        let mix = &mut self.mix[..frames * ch];
+        mix.fill(0.0);
+        let route = |mix: &mut [f32], src: &[f32], left: usize, meter: &[AtomicU32; 2]| {
+            let right = (left + 1).min(ch - 1);
+            let (mut pl, mut pr) = (0f32, 0f32);
+            for f in 0..frames {
+                let (l, r) = (src[f * 2], src[f * 2 + 1]);
+                pl = pl.max(l.abs());
+                pr = pr.max(r.abs());
+                if left == right {
+                    mix[f * ch + left] += 0.5 * (l + r);
+                } else {
+                    mix[f * ch + left] += l;
+                    mix[f * ch + right] += r;
+                }
+            }
+            meter[0].fetch_max(pl.to_bits(), Ordering::Relaxed);
+            meter[1].fetch_max(pr.to_bits(), Ordering::Relaxed);
+        };
+        route(mix, play, self.left, &sh.master_play);
+        route(mix, pads, self.sampler.left, &sh.master_pad);
     }
 }
 
@@ -559,38 +653,21 @@ where
                     OutCmd::Stop => st.release(),
                 }
             }
-            for s in data.iter_mut() {
-                *s = T::EQUILIBRIUM;
-            }
             let ch = st.channels;
-            let Some(cons) = st.cons.as_mut() else {
-                return;
-            };
             if ch == 0 {
                 return;
             }
-            let frames = data.len() / ch;
-            let avail = cons.slots() / 2;
-            let n = frames.min(avail);
-            if n < frames && !cons.is_abandoned() {
-                st.shared.underruns.fetch_add(1, Ordering::Relaxed);
-            }
-            if let Ok(chunk) = cons.read_chunk(n * 2) {
-                let (a, b) = chunk.as_slices();
-                let mut it = a.iter().chain(b.iter());
-                for f in 0..n {
-                    let l = *it.next().unwrap_or(&0.0);
-                    let r = *it.next().unwrap_or(&0.0);
-                    if st.left == st.right {
-                        data[f * ch + st.left] = T::from_sample(0.5 * (l + r));
-                    } else {
-                        data[f * ch + st.left] = T::from_sample(l);
-                        data[f * ch + st.right] = T::from_sample(r);
-                    }
+            let total = data.len() / ch;
+            let mut done = 0;
+            while done < total {
+                let n = (total - done).min(MAX_BLOCK);
+                st.process(n);
+                let out = &mut data[done * ch..(done + n) * ch];
+                for (d, s) in out.iter_mut().zip(&st.mix[..n * ch]) {
+                    *d = T::from_sample(*s);
                 }
-                chunk.commit_all();
+                done += n;
             }
-            st.shared.out_frames.fetch_add(n as u64, Ordering::Relaxed);
         },
         move |e| err_shared.on_error(e),
         None,

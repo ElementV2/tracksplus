@@ -61,6 +61,12 @@ pub struct ExportSettings {
     /// Dither TPDF lors du passage en 16 bits.
     pub dither: bool,
     pub dir: PathBuf,
+    /// Pistes à exporter (identifiants). Vide = toutes.
+    #[serde(default)]
+    pub tracks: Vec<u64>,
+    /// Plage (début, fin) en échantillons ; `None` = toute la session.
+    #[serde(default)]
+    pub range: Option<(u64, u64)>,
 }
 
 pub struct ExportJob {
@@ -105,15 +111,21 @@ fn run(
     progress: &AtomicU32,
     cancel: &AtomicBool,
 ) -> Result<Vec<PathBuf>> {
-    let len = project.end();
-    if len == 0 {
-        bail!("Rien à exporter : la session est vide");
+    let (start, end) = s.range.unwrap_or((0, project.end()));
+    let end = end.min(project.end().max(start));
+    if end <= start {
+        bail!("Rien à exporter : la plage est vide");
     }
+    let len = end - start;
     std::fs::create_dir_all(&s.dir).with_context(|| format!("Création de {}", s.dir.display()))?;
 
     let with_audio: Vec<usize> = (0..project.tracks.len())
         .filter(|&i| !project.tracks[i].clips.is_empty())
+        .filter(|&i| s.tracks.is_empty() || s.tracks.contains(&project.tracks[i].id))
         .collect();
+    if with_audio.is_empty() {
+        bail!("Aucune piste sélectionnée ne contient d'audio");
+    }
     let units = if s.stems { with_audio.len() } else { 0 } + usize::from(s.mix);
     if units == 0 {
         bail!("Choisissez au moins « Pistes séparées » ou « Mix stéréo »");
@@ -122,11 +134,12 @@ fn run(
     let mut out = Vec::new();
 
     if s.stems {
-        for (n, &i) in with_audio.iter().enumerate() {
-            let name = format!("{:02} - {}.wav", n + 1, sanitize(&project.tracks[i].name));
+        for &i in &with_audio {
+            let num = i + 1;
+            let name = format!("{:02} - {}.wav", num, sanitize(&project.tracks[i].name));
             let path = s.dir.join(name);
             let renderers = vec![TrackRenderer::new(project, i)];
-            export_one(project, renderers, 1, len, s, &path, |f| {
+            export_one(project, renderers, 1, start, len, s, &path, |f| {
                 let p = (done_units as f64 + f) / units as f64;
                 progress.store((p * 1000.0) as u32, Ordering::Relaxed);
                 !cancel.load(Ordering::Relaxed)
@@ -141,7 +154,7 @@ fn run(
             .iter()
             .map(|&i| TrackRenderer::new(project, i))
             .collect();
-        export_one(project, renderers, 2, len, s, &path, |f| {
+        export_one(project, renderers, 2, start, len, s, &path, |f| {
             let p = (done_units as f64 + f) / units as f64;
             progress.store((p * 1000.0) as u32, Ordering::Relaxed);
             !cancel.load(Ordering::Relaxed)
@@ -191,10 +204,12 @@ impl SampleWriter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_one(
     project: &Project,
     mut renderers: Vec<TrackRenderer>,
     channels: usize,
+    offset: u64,
     len: u64,
     s: &ExportSettings,
     path: &Path,
@@ -257,7 +272,7 @@ fn export_one(
             ch.resize(n, 0.0);
         }
         for r in &mut renderers {
-            r.render(pos, &mut tbuf[..n]);
+            r.render(offset + pos, &mut tbuf[..n]);
             for ch in &mut input {
                 for (d, x) in ch.iter_mut().zip(&tbuf[..n]) {
                     *d += *x;
@@ -337,6 +352,8 @@ mod tests {
             mix: true,
             dither: true,
             dir: p.dir.join("Export"),
+            tracks: Vec::new(),
+            range: None,
         }
     }
 
@@ -385,5 +402,59 @@ mod tests {
         let first = s.iter().position(|v| v.abs() > 300).unwrap();
         assert!((88..100).contains(&first), "first = {first}");
         std::fs::remove_dir_all(&p.dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::project::Clip;
+
+    #[test]
+    fn export_range_and_selection() {
+        let dir = std::env::temp_dir().join(format!("tp-export-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("R".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = WavWriter::create(p.audio_dir().join("a.wav"), spec).unwrap();
+        for i in 0..10000 {
+            w.write_sample(i as f32 / 10000.0).unwrap();
+        }
+        w.finalize().unwrap();
+        let a = p.add_track(Some("A".into()), Some(0));
+        let b = p.add_track(Some("B".into()), Some(1));
+        for id in [a, b] {
+            p.track_mut(id).unwrap().clips.push(Clip {
+                id: id + 100,
+                file: "a.wav".into(),
+                start: 0,
+                offset: 0,
+                len: 10000,
+            });
+        }
+        let s = ExportSettings {
+            sample_rate: 48000,
+            depth: BitDepth::F32,
+            stems: true,
+            mix: false,
+            dither: false,
+            dir: dir.join("Export"),
+            tracks: vec![b],
+            range: Some((2000, 5000)),
+        };
+        let files = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("02 - B.wav"));
+        let mut r = hound::WavReader::open(&files[0]).unwrap();
+        assert_eq!(r.duration(), 3000);
+        let first: f32 = r.samples::<f32>().next().unwrap().unwrap();
+        assert!((first - 0.2).abs() < 1e-4);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

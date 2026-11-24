@@ -12,6 +12,8 @@ dirs = "7.0.0"
 eframe = "0.37.0"
 fs4 = "1.1.0"
 hound = "3.5.1"
+midir = "0.11.1"
+symphonia = { version = "0.5.5", default-features = false, features = ["all"] }
 parking_lot = "0.13.0"
 rfd = "0.18.0"
 rtrb = "0.4.1"

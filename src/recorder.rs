@@ -258,3 +258,61 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod load_test {
+    use super::*;
+    use crate::render::PeakData;
+    use parking_lot::RwLock;
+
+    /// 64 pistes à 48 kHz, cadence réelle, blocs de 256 trames (comme un callback ASIO).
+    /// `cargo test --release -- --ignored realtime_64_tracks`
+    #[test]
+    #[ignore]
+    fn realtime_64_tracks() {
+        let dir = std::env::temp_dir().join(format!("tp-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sr = 48000usize;
+        let mut prods = Vec::new();
+        let mut specs = Vec::new();
+        for i in 0..64 {
+            let (p, c) = rtrb::RingBuffer::new(sr * 4);
+            prods.push(p);
+            specs.push(RecSpec {
+                track_id: i,
+                file: format!("t{i}.wav"),
+                path: dir.join(format!("t{i}.wav")),
+                peaks: Arc::new(RwLock::new(PeakData::default())),
+                cons: c,
+            });
+        }
+        let rec = Recorder::start(specs, sr as u32, RecFormat::Int24);
+        let block = 256;
+        let secs = 10;
+        let start = Instant::now();
+        let mut overruns = 0;
+        let mut sent = 0usize;
+        while sent < sr * secs {
+            let due = Duration::from_secs_f64((sent + block) as f64 / sr as f64);
+            if let Some(w) = due.checked_sub(start.elapsed()) {
+                std::thread::sleep(w);
+            }
+            for p in &mut prods {
+                if p.slots() < block {
+                    overruns += 1;
+                    continue;
+                }
+                let chunk = p.write_chunk_uninit(block).unwrap();
+                chunk.fill_from_iter((0..block).map(|k| ((sent + k) as f32 * 0.01).sin() * 0.5));
+            }
+            sent += block;
+        }
+        drop(prods);
+        let res = rec.finish();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(overruns, 0);
+        assert!(res.iter().all(
+            |r| r.frames == (sr * secs).div_ceil(block) as u64 * block as u64 && r.error.is_none()
+        ));
+    }
+}

@@ -1,51 +1,60 @@
-//! Interface : barre de transport, pistes, timeline, réglages audio et export.
+//! Application : état global, transport, sessions, barre supérieure et fenêtres.
+//! Les onglets sont dans `ui::multitrack` et `ui::soundboard`.
 
-use crate::audio::{self, AudioPrefs, DeviceInfo, Engine, RecTarget};
+use crate::audio::{self, AudioPrefs, DeviceInfo, Engine, RecTarget, Shared};
 use crate::export::{BitDepth, ExportJob, ExportSettings};
+use crate::midi::Midi;
 use crate::player::Player;
 use crate::project::{self, Clip, PROJECT_EXT, Project, RecFormat};
 use crate::recorder::{RecSpec, Recorder};
-use crate::render::{self, PEAK_BLOCK, PEAK_L1, PeakData, Peaks};
-use crate::theme;
-use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Key, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind,
-    UiBuilder, Vec2, pos2, vec2,
-};
+use crate::render::{self, PeakData, Peaks};
+use crate::sampler::PadCmd;
+use crate::soundboard::{Board, SampleCache, db_to_gain};
+use crate::ui::theme as t;
+use crate::ui::widgets::{self as w, BtnStyle, Icon, MeterState, sq};
+use eframe::egui::{self, Align2, Color32, Key, Vec2, vec2};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-const HEADER_W: f32 = 270.0;
-const RULER_H: f32 = 26.0;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Transport {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
     Stopped,
     Playing { start: u64 },
     Recording { start: u64 },
 }
 
-struct LiveTake {
-    track_id: u64,
-    peaks: Peaks,
+pub struct LiveTake {
+    pub track_id: u64,
+    pub peaks: Peaks,
 }
 
-struct View {
+pub struct View {
     /// Échantillons par pixel.
-    spp: f64,
+    pub spp: f64,
     /// Échantillon au bord gauche de la timeline.
-    scroll: f64,
+    pub scroll: f64,
+    pub track_h: f32,
+    /// Suivi automatique de la tête de lecture.
+    pub follow: bool,
+    /// Le suivi reprend après cet instant (l'utilisateur navigue).
+    pub nav_until: f64,
+    /// Défilement vertical demandé.
+    pub want_scroll_y: Option<f32>,
+    pub scroll_y: f32,
+    pub viewport_h: f32,
+    pub width: f32,
 }
 
-struct AudioDialog {
-    prefs: AudioPrefs,
-    hosts: Vec<String>,
-    ins: Vec<DeviceInfo>,
-    outs: Vec<DeviceInfo>,
-    listed_host: Option<String>,
-    error: Option<String>,
+pub struct AudioDialog {
+    pub prefs: AudioPrefs,
+    pub hosts: Vec<String>,
+    pub ins: Vec<DeviceInfo>,
+    pub outs: Vec<DeviceInfo>,
+    pub listed_host: Option<String>,
+    pub error: Option<String>,
 }
 
 impl AudioDialog {
@@ -73,10 +82,22 @@ impl AudioDialog {
     }
 }
 
-struct NewSessionDialog {
-    name: String,
-    parent: PathBuf,
-    keep_tracks: bool,
+pub struct NewSessionDialog {
+    pub name: String,
+    pub parent: PathBuf,
+    pub keep_tracks: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RangeChoice {
+    All,
+    Selection,
+}
+
+pub struct ExportDialog {
+    pub s: ExportSettings,
+    pub range: RangeChoice,
+    pub tracks: HashSet<u64>,
 }
 
 struct Toast {
@@ -85,44 +106,84 @@ struct Toast {
     until: f64,
 }
 
+/// État de l'onglet soundboard.
+#[derive(Default)]
+pub struct SbState {
+    pub page: usize,
+    pub selected: Option<u16>,
+    pub learn_midi: Option<u16>,
+    pub learn_key: Option<u16>,
+    /// Pad maintenu à la souris.
+    pub mouse_down: Option<u16>,
+    /// Touches clavier maintenues → pad.
+    pub held_keys: HashMap<Key, u16>,
+    /// Zoom de l'éditeur (fractions de la durée).
+    pub zoom: (f64, f64),
+    pub drag: Option<crate::ui::soundboard::Handle>,
+    pub midi_seen: f64,
+    pub midi_last: Option<String>,
+    pub midi_dirty: bool,
+    pub flash: HashMap<u16, f64>,
+}
+
 pub struct App {
-    project: Project,
-    engine: Engine,
-    prefs: AudioPrefs,
-    transport: Transport,
-    playhead: u64,
-    player: Option<Player>,
-    recorder: Option<Recorder>,
-    live: Vec<LiveTake>,
-    peaks: HashMap<u64, Peaks>,
-    meters: Vec<f32>,
-    clip_hold: Vec<f64>,
-    view: View,
-    audio_dlg: Option<AudioDialog>,
-    export_dlg: Option<ExportSettings>,
-    export_job: Option<ExportJob>,
-    new_dlg: Option<NewSessionDialog>,
+    pub tab: usize,
+    pub project: Project,
+    pub engine: Engine,
+    pub prefs: AudioPrefs,
+    pub transport: Transport,
+    pub playhead: u64,
+    pub player: Option<Player>,
+    pub recorder: Option<Recorder>,
+    pub live: Vec<LiveTake>,
+    pub peaks: HashMap<u64, Peaks>,
+    pub in_meters: Vec<MeterState>,
+    pub master_play: [MeterState; 2],
+    pub master_pad: [MeterState; 2],
+    pub view: View,
+    pub selection: Option<(u64, u64)>,
+    pub selected_tracks: HashSet<u64>,
+    pub show_bridge: bool,
+    pub ruler_anchor: Option<u64>,
+    pub audio_dlg: Option<AudioDialog>,
+    pub export_dlg: Option<ExportDialog>,
+    pub export_job: Option<ExportJob>,
+    pub new_dlg: Option<NewSessionDialog>,
     toast: Option<Toast>,
-    ctx_clip: Option<(u64, u64)>,
-    disk_free: Option<u64>,
+    pub ctx_clip: Option<(u64, u64)>,
+    pub disk_free: Option<u64>,
     disk_checked: f64,
     title: String,
-    export_last: Option<ExportSettings>,
+    pub export_last: Option<ExportSettings>,
+    pub now: f64,
+    // Soundboard
+    pub board: Board,
+    pub board_path: PathBuf,
+    pub board_changed: Option<f64>,
+    pub cache: SampleCache,
+    pub midi: Midi,
+    pub midi_ports: Vec<String>,
+    pub sb: SbState,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx);
+        t::apply(&cc.egui_ctx);
         let prefs = AudioPrefs::load();
-        let (engine, err) = match Engine::open(&prefs) {
+        let board = Board::load_default();
+        let (engine, err) = match Engine::open(&prefs, board.out_left) {
             Ok(e) => (e, None),
             Err(e) => (Engine::offline(), Some(format!("{e:#}"))),
         };
         let mut project = Project::untitled(engine.status.sample_rate);
-        project.add_track(None, Some(0));
-        project.add_track(None, Some(1));
+        let n = engine.status.in_channels.clamp(1, 2);
+        for i in 0..n {
+            project.add_track(None, Some(i));
+        }
         project.dirty = false;
+        let cache = SampleCache::new(engine.status.sample_rate);
         let mut app = Self {
+            tab: 0,
             project,
             engine,
             prefs,
@@ -132,12 +193,24 @@ impl App {
             recorder: None,
             live: Vec::new(),
             peaks: HashMap::new(),
-            meters: vec![0.0; audio::MAX_INPUTS],
-            clip_hold: vec![0.0; audio::MAX_INPUTS],
+            in_meters: vec![MeterState::default(); audio::MAX_INPUTS],
+            master_play: Default::default(),
+            master_pad: Default::default(),
             view: View {
-                spp: 2048.0,
+                spp: 1200.0,
                 scroll: 0.0,
+                track_h: 76.0,
+                follow: true,
+                nav_until: 0.0,
+                want_scroll_y: None,
+                scroll_y: 0.0,
+                viewport_h: 400.0,
+                width: 800.0,
             },
+            selection: None,
+            selected_tracks: HashSet::new(),
+            show_bridge: false,
+            ruler_anchor: None,
             audio_dlg: None,
             export_dlg: None,
             export_job: None,
@@ -148,67 +221,132 @@ impl App {
             disk_checked: -100.0,
             title: String::new(),
             export_last: None,
+            now: 0.0,
+            board_path: Board::default_path().unwrap_or_else(|| PathBuf::from("soundboard.json")),
+            board,
+            board_changed: None,
+            cache,
+            midi: Midi::new(),
+            midi_ports: crate::midi::list_ports(),
+            sb: SbState {
+                zoom: (0.0, 1.0),
+                midi_dirty: true,
+                ..Default::default()
+            },
         };
+        app.midi.shared.lock().ctx = Some(cc.egui_ctx.clone());
+        let port = app.board.midi_port.clone();
+        app.midi.connect(port.as_deref());
+        app.sync_engine_to_board();
+        let paths: Vec<PathBuf> = app.board.all_pads().map(|(_, p)| p.path.clone()).collect();
+        for p in paths {
+            app.cache.request(&p, Some(&cc.egui_ctx));
+        }
         if let Some(e) = err {
-            app.audio_dlg = Some(AudioDialog::new(&app.prefs));
-            if let Some(d) = &mut app.audio_dlg {
-                d.error = Some(e);
-            }
+            let mut d = AudioDialog::new(&app.prefs);
+            d.error = Some(e);
+            app.audio_dlg = Some(d);
         }
         app
     }
 
-    fn notify(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
-        let now = ctx.input(|i| i.time);
+    pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some(Toast {
             text: text.into(),
             error,
-            until: now + if error { 8.0 } else { 4.0 },
+            until: self.now + if error { 8.0 } else { 3.5 },
         });
     }
 
-    fn sr(&self) -> u32 {
+    pub fn sr(&self) -> u32 {
         self.engine.status.sample_rate.max(1)
+    }
+
+    /// Envoie au moteur les réglages du soundboard (sortie, volume) et au MIDI le canal.
+    pub fn sync_engine_to_board(&mut self) {
+        let out_ch = self.engine.status.out_channels.max(1) as usize;
+        self.engine.pad(PadCmd::SetOutput {
+            left: (self.board.out_left as usize).min(out_ch - 1),
+        });
+        self.engine.pad(PadCmd::SetMaster {
+            gain: db_to_gain(self.board.master_db),
+        });
+        self.midi.shared.lock().tx = self.engine.pad_tx.clone();
+        self.sb.midi_dirty = true;
+    }
+
+    pub fn board_modified(&mut self) {
+        self.board_changed = Some(self.now);
+        self.sb.midi_dirty = true;
     }
 
     // ---------------------------------------------------------------- transport
 
-    fn is_stopped(&self) -> bool {
+    pub fn is_stopped(&self) -> bool {
         self.transport == Transport::Stopped
     }
 
-    fn play(&mut self, ctx: &egui::Context) {
+    pub fn is_recording(&self) -> bool {
+        matches!(self.transport, Transport::Recording { .. })
+    }
+
+    pub fn play(&mut self) {
         if !self.is_stopped() {
             return;
         }
         if !self.engine.has_output() {
             self.notify(
-                ctx,
-                "Aucune sortie audio : choisissez-en une dans Audio ▸ Réglages",
+                "Aucune sortie audio : choisissez-en une dans les réglages audio",
                 true,
             );
             return;
         }
-        let (player, cons) = Player::start(&self.project, self.playhead);
+        if self.playhead >= self.project.end() && self.project.end() > 0 {
+            self.playhead = self.selection.map_or(0, |s| s.0);
+        }
+        let (player, cons) = Player::start(&self.project, self.playhead, self.project.audible());
         self.engine.start_playback(cons);
         self.player = Some(player);
         self.transport = Transport::Playing {
             start: self.playhead,
         };
+        self.view.nav_until = 0.0;
     }
 
-    fn record(&mut self, ctx: &egui::Context) {
+    /// Déplace la tête de lecture ; en lecture, la lecture repart de là immédiatement.
+    pub fn seek(&mut self, pos: u64) {
+        match self.transport {
+            Transport::Stopped => self.playhead = pos,
+            Transport::Playing { .. } => {
+                self.playhead = pos;
+                let (player, cons) = Player::start(&self.project, pos, self.project.audible());
+                self.engine.start_playback(cons);
+                self.player = Some(player);
+                self.transport = Transport::Playing { start: pos };
+            }
+            Transport::Recording { .. } => {}
+        }
+    }
+
+    pub fn update_audible(&mut self) {
+        if let Some(p) = &self.player {
+            for (a, v) in p.audible.iter().zip(self.project.audible()) {
+                a.store(v, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn record(&mut self) {
         if !self.is_stopped() {
             if matches!(self.transport, Transport::Playing { .. }) {
-                self.stop(ctx);
+                self.stop();
             } else {
                 return;
             }
         }
         if !self.engine.has_input() {
             self.notify(
-                ctx,
-                "Aucune entrée audio : choisissez votre carte dans Audio ▸ Réglages",
+                "Aucune entrée audio : choisissez votre carte dans les réglages audio",
                 true,
             );
             return;
@@ -216,10 +354,10 @@ impl App {
         let sr = self.engine.status.sample_rate;
         if self.project.has_audio() && self.project.sample_rate != sr {
             self.notify(
-                ctx,
                 format!(
-                    "La session est en {} Hz mais la carte tourne en {} Hz. Changez la fréquence dans Audio ▸ Réglages.",
-                    self.project.sample_rate, sr
+                    "La session est en {} kHz mais la carte tourne en {} kHz. Changez la fréquence dans les réglages audio.",
+                    fmt_khz(self.project.sample_rate),
+                    fmt_khz(sr)
                 ),
                 true,
             );
@@ -236,15 +374,14 @@ impl App {
             .collect();
         if armed.is_empty() {
             self.notify(
-                ctx,
-                "Armez au moins une piste (bouton ● rouge) avec une entrée valide",
+                "Armez au moins une piste (pastille rouge) avec une entrée valide",
                 true,
             );
             return;
         }
         self.project.sample_rate = sr;
         if let Err(e) = self.project.ensure_dirs() {
-            self.notify(ctx, format!("{e:#}"), true);
+            self.notify(format!("{e:#}"), true);
             return;
         }
 
@@ -279,12 +416,12 @@ impl App {
         if let Err(e) = self.engine.start_record(targets) {
             let _ = recorder.finish();
             self.live.clear();
-            self.notify(ctx, format!("{e:#}"), true);
+            self.notify(format!("{e:#}"), true);
             return;
         }
-        // Écoute des pistes déjà enregistrées pendant la prise.
         if self.engine.has_output() && self.project.has_audio() {
-            let (player, cons) = Player::start(&self.project, self.playhead);
+            let (player, cons) =
+                Player::start(&self.project, self.playhead, self.project.audible());
             self.engine.start_playback(cons);
             self.player = Some(player);
         }
@@ -292,9 +429,11 @@ impl App {
         self.transport = Transport::Recording {
             start: self.playhead,
         };
+        self.view.nav_until = 0.0;
+        self.reveal_recording_tracks();
     }
 
-    fn stop(&mut self, ctx: &egui::Context) {
+    pub fn stop(&mut self) {
         match self.transport {
             Transport::Stopped => {}
             Transport::Playing { .. } => {
@@ -313,7 +452,6 @@ impl App {
                 let mut errors = Vec::new();
                 let mut max_len = 0;
                 for r in results {
-                    let live = self.live.iter().find(|l| l.track_id == r.track_id);
                     if let Some(e) = &r.error {
                         errors.push(e.clone());
                     }
@@ -323,11 +461,11 @@ impl App {
                     }
                     max_len = max_len.max(r.frames);
                     let id = self.project.alloc_id();
-                    if let Some(l) = live {
+                    if let Some(l) = self.live.iter().find(|l| l.track_id == r.track_id) {
                         self.peaks.insert(id, l.peaks.clone());
                     }
-                    if let Some(t) = self.project.track_mut(r.track_id) {
-                        t.clips.push(Clip {
+                    if let Some(tr) = self.project.track_mut(r.track_id) {
+                        tr.clips.push(Clip {
                             id,
                             file: r.file,
                             start,
@@ -343,22 +481,19 @@ impl App {
                 let overruns = self.engine.shared.overruns.swap(0, Ordering::Relaxed);
                 if !errors.is_empty() {
                     self.notify(
-                        ctx,
                         format!("Erreur d'enregistrement : {}", errors.join(" ; ")),
                         true,
                     );
                 } else if overruns > 0 {
                     self.notify(
-                        ctx,
                         format!("Attention : {overruns} pertes de données (disque trop lent ?)"),
                         true,
                     );
                 } else if let Err(e) = save {
-                    self.notify(ctx, format!("Sauvegarde impossible : {e:#}"), true);
+                    self.notify(format!("Sauvegarde impossible : {e:#}"), true);
                 } else {
                     self.notify(
-                        ctx,
-                        format!("Prise enregistrée ({})", fmt_time(max_len, self.sr())),
+                        format!("Prise enregistrée · {}", fmt_time(max_len, self.sr())),
                         false,
                     );
                 }
@@ -380,12 +515,44 @@ impl App {
         }
     }
 
+    /// Fait défiler verticalement si aucune piste en cours d'enregistrement n'est visible.
+    pub fn reveal_recording_tracks(&mut self) {
+        let h = self.view.track_h;
+        let rows: Vec<usize> = self
+            .project
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| self.live.iter().any(|l| l.track_id == t.id))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&first) = rows.first() else {
+            return;
+        };
+        let top = self.view.scroll_y;
+        let bottom = top + self.view.viewport_h;
+        let visible = rows.iter().any(|&i| {
+            let y = i as f32 * h + h * 0.5;
+            y >= top && y <= bottom
+        });
+        if !visible {
+            self.view.want_scroll_y = Some((first as f32 * h - 8.0).max(0.0));
+        }
+    }
+
+    pub fn add_marker(&mut self) {
+        let pos = self.playhead;
+        self.project.add_marker(pos);
+        let n = self.project.markers.len();
+        self.notify(format!("Repère {n} · {}", fmt_time(pos, self.sr())), false);
+    }
+
     // ---------------------------------------------------------------- session
 
     fn load_peaks(&mut self) {
         self.peaks.clear();
-        for t in &self.project.tracks {
-            for c in &t.clips {
+        for tr in &self.project.tracks {
+            for c in &tr.clips {
                 let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
                 self.peaks.insert(c.id, p.clone());
                 let path = self.project.clip_path(c);
@@ -398,9 +565,26 @@ impl App {
         if self.project.dirty && self.project.has_audio() {
             let _ = self.project.save();
         }
+        self.save_board_now();
     }
 
-    fn open_session(&mut self, ctx: &egui::Context) {
+    pub fn save_board_now(&mut self) {
+        if self.board_changed.take().is_some()
+            && let Err(e) = self.board.save(&self.board_path.clone())
+        {
+            self.notify(format!("Soundboard non sauvegardé : {e:#}"), true);
+        }
+    }
+
+    fn reset_view_for_session(&mut self) {
+        self.playhead = 0;
+        self.view.scroll = 0.0;
+        self.view.want_scroll_y = Some(0.0);
+        self.selection = None;
+        self.selected_tracks.clear();
+    }
+
+    pub fn open_session(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Ouvrir une session")
             .add_filter("Session TracksPlus", &[PROJECT_EXT])
@@ -409,50 +593,44 @@ impl App {
         else {
             return;
         };
-        self.stop(ctx);
+        self.stop();
         self.autosave();
         match Project::load(&path) {
             Ok(p) => {
                 self.project = p;
-                self.playhead = 0;
-                self.view.scroll = 0.0;
+                self.reset_view_for_session();
                 self.load_peaks();
                 if self.project.has_audio()
                     && self.project.sample_rate != self.engine.status.sample_rate
                 {
                     let msg = format!(
-                        "Session en {} Hz, carte en {} Hz : réglez la carte sur {} Hz pour lire/enregistrer.",
-                        self.project.sample_rate,
-                        self.engine.status.sample_rate,
-                        self.project.sample_rate
+                        "Session en {} kHz, carte en {} kHz : réglez la carte sur {} kHz.",
+                        fmt_khz(self.project.sample_rate),
+                        fmt_khz(self.engine.status.sample_rate),
+                        fmt_khz(self.project.sample_rate)
                     );
-                    self.notify(ctx, msg, true);
+                    self.notify(msg, true);
                 } else {
-                    self.notify(
-                        ctx,
-                        format!("Session « {} » ouverte", self.project.name),
-                        false,
-                    );
+                    self.notify(format!("« {} » ouverte", self.project.name), false);
                 }
             }
-            Err(e) => self.notify(ctx, format!("{e:#}"), true),
+            Err(e) => self.notify(format!("{e:#}"), true),
         }
     }
 
-    fn save(&mut self, ctx: &egui::Context) {
+    pub fn save(&mut self) {
         match self.project.save() {
             Ok(()) => self.notify(
-                ctx,
-                format!("Enregistré dans {}", self.project.dir.display()),
+                format!("Enregistré · {}", self.project.dir.display()),
                 false,
             ),
-            Err(e) => self.notify(ctx, format!("{e:#}"), true),
+            Err(e) => self.notify(format!("{e:#}"), true),
         }
     }
 
-    fn save_as(&mut self, ctx: &egui::Context) {
+    pub fn save_as(&mut self) {
         let Some(parent) = rfd::FileDialog::new()
-            .set_title("Choisir le dossier où créer la session")
+            .set_title("Dossier où créer la session")
             .set_directory(project::default_sessions_root())
             .pick_folder()
         else {
@@ -462,53 +640,49 @@ impl App {
         let dir = parent.join(project::sanitize(&name));
         match self.project.save_as(dir, name) {
             Ok(()) => self.notify(
-                ctx,
-                format!("Session enregistrée dans {}", self.project.dir.display()),
+                format!("Session enregistrée · {}", self.project.dir.display()),
                 false,
             ),
-            Err(e) => self.notify(ctx, format!("{e:#}"), true),
+            Err(e) => self.notify(format!("{e:#}"), true),
         }
     }
 
-    fn create_session(&mut self, ctx: &egui::Context, d: NewSessionDialog) {
-        self.stop(ctx);
+    fn create_session(&mut self, d: NewSessionDialog) {
+        self.stop();
         self.autosave();
         let name = project::sanitize(&d.name);
         let dir = d.parent.join(&name);
         if dir.join(format!("{name}.{PROJECT_EXT}")).exists() {
-            self.notify(
-                ctx,
-                format!("Une session « {name} » existe déjà à cet endroit"),
-                true,
-            );
+            self.notify(format!("Une session « {name} » existe déjà ici"), true);
             return;
         }
         let mut p = Project::new(name, dir, self.engine.status.sample_rate);
         p.rec_format = self.project.rec_format;
         if d.keep_tracks {
-            for t in &self.project.tracks {
-                let id = p.add_track(Some(t.name.clone()), t.input);
+            for tr in &self.project.tracks {
+                let id = p.add_track(Some(tr.name.clone()), tr.input);
                 if let Some(nt) = p.track_mut(id) {
-                    nt.armed = t.armed;
+                    nt.armed = tr.armed;
                 }
             }
         }
         if let Err(e) = p.save() {
-            self.notify(ctx, format!("{e:#}"), true);
+            self.notify(format!("{e:#}"), true);
             return;
         }
         self.project = p;
         self.peaks.clear();
-        self.playhead = 0;
-        self.view.scroll = 0.0;
-        self.notify(
-            ctx,
-            format!("Nouvelle session « {} »", self.project.name),
-            false,
-        );
+        self.reset_view_for_session();
+        self.notify(format!("Nouvelle session « {} »", self.project.name), false);
     }
 
-    fn add_track_per_input(&mut self) {
+    pub fn add_track(&mut self) {
+        let used: HashSet<u16> = self.project.tracks.iter().filter_map(|t| t.input).collect();
+        let free = (0..self.engine.status.in_channels).find(|i| !used.contains(i));
+        self.project.add_track(None, free);
+    }
+
+    pub fn add_track_per_input(&mut self) {
         let used: HashSet<u16> = self.project.tracks.iter().filter_map(|t| t.input).collect();
         for i in 0..self.engine.status.in_channels {
             if !used.contains(&i) {
@@ -518,16 +692,12 @@ impl App {
         }
     }
 
-    fn next_free_input(&self) -> Option<u16> {
-        let used: HashSet<u16> = self.project.tracks.iter().filter_map(|t| t.input).collect();
-        (0..self.engine.status.in_channels).find(|i| !used.contains(i))
-    }
-
-    fn apply_audio(&mut self, ctx: &egui::Context, prefs: AudioPrefs) -> Result<(), String> {
-        self.stop(ctx);
+    fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
+        self.stop();
+        self.engine.pad(PadCmd::StopAll { fade: 0 });
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
-        match Engine::open(&prefs) {
+        let res = match Engine::open(&prefs, self.board.out_left) {
             Ok(e) => {
                 self.engine = e;
                 self.prefs = prefs;
@@ -538,67 +708,75 @@ impl App {
                 Ok(())
             }
             Err(e) => {
-                // On essaie de revenir à la configuration précédente.
-                if let Ok(old) = Engine::open(&self.prefs) {
+                if let Ok(old) = Engine::open(&self.prefs, self.board.out_left) {
                     self.engine = old;
                 }
                 Err(format!("{e:#}"))
             }
-        }
+        };
+        self.cache.set_sample_rate(self.engine.status.sample_rate);
+        self.sync_engine_to_board();
+        res
     }
 
-    // ---------------------------------------------------------------- frame
-
-    fn handle_keys(&mut self, ctx: &egui::Context) {
-        let dialog_open =
-            self.audio_dlg.is_some() || self.export_dlg.is_some() || self.new_dlg.is_some();
-        if dialog_open {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-                self.close_dialogs();
-            }
+    pub fn open_export(&mut self) {
+        if !self.project.has_audio() {
+            self.notify("Rien à exporter pour l'instant", true);
             return;
         }
-        if ctx.egui_wants_keyboard_input() {
-            return;
-        }
-        let (space, rec, home, end, save, fit) = ctx.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::NONE, Key::Space),
-                i.consume_key(egui::Modifiers::NONE, Key::R),
-                i.consume_key(egui::Modifiers::NONE, Key::Home)
-                    || i.consume_key(egui::Modifiers::NONE, Key::Enter),
-                i.consume_key(egui::Modifiers::NONE, Key::End),
-                i.consume_key(egui::Modifiers::COMMAND, Key::S),
-                i.consume_key(egui::Modifiers::NONE, Key::F),
-            )
+        self.close_dialogs();
+        let s = self.export_last.clone().unwrap_or_else(|| ExportSettings {
+            sample_rate: self.project.sample_rate,
+            depth: BitDepth::I24,
+            stems: true,
+            mix: false,
+            dither: true,
+            dir: self.project.dir.join("Export"),
+            tracks: Vec::new(),
+            range: None,
         });
-        if space {
-            if self.is_stopped() {
-                self.play(ctx);
+        let with_audio: HashSet<u64> = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| !t.clips.is_empty())
+            .map(|t| t.id)
+            .collect();
+        let sel: HashSet<u64> = self
+            .selected_tracks
+            .intersection(&with_audio)
+            .copied()
+            .collect();
+        self.export_dlg = Some(ExportDialog {
+            s,
+            range: if self.selection.is_some() {
+                RangeChoice::Selection
             } else {
-                self.stop(ctx);
-            }
-        }
-        if rec {
-            if matches!(self.transport, Transport::Recording { .. }) {
-                self.stop(ctx);
-            } else {
-                self.record(ctx);
-            }
-        }
-        if home && self.is_stopped() {
-            self.playhead = 0;
-            self.view.scroll = 0.0;
-        }
-        if end && self.is_stopped() {
-            self.playhead = self.project.end();
-        }
-        if save {
-            self.save(ctx);
-        }
-        if fit {
-            self.zoom_to_fit(ctx);
-        }
+                RangeChoice::All
+            },
+            tracks: if sel.is_empty() { with_audio } else { sel },
+        });
+    }
+
+    pub fn open_audio(&mut self) {
+        self.close_dialogs();
+        self.audio_dlg = Some(AudioDialog::new(&self.prefs));
+    }
+
+    pub fn open_new_session(&mut self) {
+        self.close_dialogs();
+        self.new_dlg = Some(NewSessionDialog {
+            name: chrono::Local::now()
+                .format("Session %Y-%m-%d %Hh%M")
+                .to_string(),
+            parent: self
+                .project
+                .dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(project::default_sessions_root),
+            keep_tracks: true,
+        });
     }
 
     fn close_dialogs(&mut self) {
@@ -607,40 +785,65 @@ impl App {
         self.new_dlg = None;
     }
 
-    fn open_export(&mut self) {
-        self.close_dialogs();
-        self.export_dlg = Some(self.export_last.clone().unwrap_or_else(|| ExportSettings {
-            sample_rate: self.project.sample_rate,
-            depth: BitDepth::I24,
-            stems: true,
-            mix: false,
-            dither: true,
-            dir: self.project.dir.join("Export"),
-        }));
+    pub fn dialog_open(&self) -> bool {
+        self.audio_dlg.is_some()
+            || self.export_dlg.is_some()
+            || self.new_dlg.is_some()
+            || self.export_job.is_some()
     }
 
-    fn open_audio(&mut self) {
-        self.close_dialogs();
-        self.audio_dlg = Some(AudioDialog::new(&self.prefs));
-    }
-
-    fn zoom_to_fit(&mut self, ctx: &egui::Context) {
-        let w = (ctx.content_rect().width() - HEADER_W - 30.0).max(100.0) as f64;
+    pub fn zoom_to_fit(&mut self) {
+        let w = self.view.width.max(100.0) as f64;
         let end = self.project.end().max(self.sr() as u64 * 30) as f64;
         self.view.spp = (end * 1.05 / w).max(1.0);
         self.view.scroll = 0.0;
+        self.view.nav_until = self.now + 3.0;
+    }
+
+    // ---------------------------------------------------------------- frame
+
+    fn global_keys(&mut self, ctx: &egui::Context) {
+        if self.dialog_open() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+                && self.export_job.is_none()
+            {
+                self.close_dialogs();
+            }
+            return;
+        }
+        let (save, export, tab1, tab2) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, Key::S),
+                i.consume_key(egui::Modifiers::COMMAND, Key::E),
+                i.consume_key(egui::Modifiers::COMMAND, Key::Num1),
+                i.consume_key(egui::Modifiers::COMMAND, Key::Num2),
+            )
+        });
+        if save {
+            self.save();
+        }
+        if export {
+            self.open_export();
+        }
+        if tab1 {
+            self.tab = 0;
+        }
+        if tab2 {
+            self.tab = 1;
+        }
     }
 
     fn update_meters(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|i| i.time);
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        let decay = (-dt * 1000.0 / 300.0).exp(); // ~ -26 dB/s
+        let now = self.now;
+        let sh = &self.engine.shared;
         for ch in 0..(self.engine.status.in_channels as usize).min(audio::MAX_INPUTS) {
-            let p = self.engine.shared.take_meter(ch);
-            self.meters[ch] = p.max(self.meters[ch] * decay);
-            if p >= 0.999 {
-                self.clip_hold[ch] = now + 2.0;
-            }
+            let p = sh.take_meter(ch);
+            self.in_meters[ch].update(p, now, dt);
+        }
+        for k in 0..2 {
+            self.master_play[k].update(Shared::take_peak(&sh.master_play[k]), now, dt);
+            self.master_pad[k].update(Shared::take_peak(&sh.master_pad[k]), now, dt);
         }
         if now - self.disk_checked > 2.0 {
             self.disk_checked = now;
@@ -656,280 +859,270 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let t = format!(
+        let tt = format!(
             "{}{} — TracksPlus",
             self.project.name,
             if self.project.dirty { " •" } else { "" }
         );
-        if t != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.clone()));
-            self.title = t;
+        if tt != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(tt.clone()));
+            self.title = tt;
         }
     }
 
-    // ---------------------------------------------------------------- UI parts
-
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("Fichier", |ui| {
-                if ui.button("Nouvelle session…").clicked() {
-                    self.close_dialogs();
-                    self.new_dlg = Some(NewSessionDialog {
-                        name: chrono::Local::now()
-                            .format("Session %Y-%m-%d %Hh%M")
-                            .to_string(),
-                        parent: self
-                            .project
-                            .dir
-                            .parent()
-                            .map(Path::to_path_buf)
-                            .unwrap_or_else(project::default_sessions_root),
-                        keep_tracks: true,
-                    });
-                }
-                if ui.button("Ouvrir…").clicked() {
-                    self.open_session(&ctx);
-                }
-                ui.separator();
-                if ui.button("Enregistrer        Ctrl+S").clicked() {
-                    self.save(&ctx);
-                }
-                if ui.button("Enregistrer sous…").clicked() {
-                    self.save_as(&ctx);
-                }
-                if ui.button("Ouvrir le dossier de la session").clicked() {
-                    let _ = self.project.ensure_dirs();
-                    open_in_file_manager(&self.project.dir);
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(self.project.has_audio(), egui::Button::new("Exporter…"))
-                    .clicked()
-                {
-                    self.open_export();
-                }
-            });
-            ui.menu_button("Pistes", |ui| {
-                let enabled = self.is_stopped();
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Ajouter une piste"))
-                    .clicked()
-                {
-                    let i = self.next_free_input();
-                    self.project.add_track(None, i);
-                }
-                if ui
-                    .add_enabled(
-                        enabled && self.engine.status.in_channels > 0,
-                        egui::Button::new("Une piste par entrée de la carte"),
-                    )
-                    .clicked()
-                {
-                    self.add_track_per_input();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Tout armer"))
-                    .clicked()
-                {
-                    for t in &mut self.project.tracks {
-                        t.armed = t.input.is_some();
-                    }
-                }
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Tout désarmer"))
-                    .clicked()
-                {
-                    for t in &mut self.project.tracks {
-                        t.armed = false;
-                    }
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        enabled && self.project.tracks.iter().any(|t| t.clips.is_empty()),
-                        egui::Button::new("Supprimer les pistes vides"),
-                    )
-                    .clicked()
-                {
-                    self.project.tracks.retain(|t| !t.clips.is_empty());
-                    self.project.dirty = true;
-                }
-            });
-            ui.menu_button("Audio", |ui| {
-                if ui.button("Réglages de la carte son…").clicked() {
-                    self.open_audio();
-                }
-                ui.separator();
-                ui.label("Format d'enregistrement");
-                let enabled = self.is_stopped();
-                for f in [RecFormat::Int24, RecFormat::Float32] {
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::RadioButton::new(self.project.rec_format == f, f.label()),
-                        )
-                        .clicked()
-                    {
-                        self.project.rec_format = f;
-                        self.project.dirty = true;
-                    }
-                }
-            });
-            ui.menu_button("Affichage", |ui| {
-                if ui.button("Tout afficher          F").clicked() {
-                    self.zoom_to_fit(&ctx);
-                }
-                if ui.button("Zoom +").clicked() {
-                    self.view.spp = (self.view.spp / 1.5).max(1.0);
-                }
-                if ui.button("Zoom −").clicked() {
-                    self.view.spp = (self.view.spp * 1.5).min(1.0e6);
-                }
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let full = ui.max_rect();
+        ui.horizontal_centered(|ui| {
+            ui.add_space(4.0);
+            let more = w::icon_button(ui, Icon::More, sq(30.0), BtnStyle::Ghost, true, "Menu");
+            egui::Popup::menu(&more)
+                .width(250.0)
+                .show(|ui| self.main_menu(ui));
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.add_space(10.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(
+                    egui::RichText::new(short(&self.project.name, 34))
+                        .font(t::semibold(13.5))
+                        .color(t::TEXT),
+                );
+                let sub = if self.project.dirty {
+                    "Modifications non enregistrées"
+                } else {
+                    "Enregistrée"
+                };
+                ui.label(
+                    egui::RichText::new(sub)
+                        .font(t::regular(11.0))
+                        .color(t::TEXT_3),
+                );
             });
         });
+
+        // Onglets centrés.
+        let seg_w = 130.0;
+        let r = egui::Rect::from_center_size(full.center(), vec2(seg_w * 2.0 + 6.0, 34.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
+        let mut tab = self.tab;
+        if w::segmented(
+            &mut child,
+            &mut tab,
+            &["Multipiste", "Soundboard"],
+            seg_w,
+            34.0,
+        ) {
+            self.tab = tab;
+        }
+
+        // Carte son à droite.
+        let st = &self.engine.status;
+        let ok = st.input.is_some() || st.output.is_some();
+        let dev = st
+            .input
+            .clone()
+            .or(st.output.clone())
+            .unwrap_or_else(|| "Aucune carte son".into());
+        let label = if ok {
+            format!(
+                "{}  ·  {}  ·  {} kHz  ·  {} in / {} out",
+                st.host,
+                short(&dev, 28),
+                fmt_khz(st.sample_rate),
+                st.in_channels,
+                st.out_channels
+            )
+        } else {
+            dev
+        };
+        let font = t::medium(12.0);
+        let gal = ui.painter().layout_no_wrap(label, font, t::TEXT_2);
+        let pw = gal.size().x + 44.0;
+        let pr = egui::Rect::from_min_size(
+            egui::pos2(full.right() - pw - 8.0, full.center().y - 15.0),
+            vec2(pw, 30.0),
+        );
+        let resp = ui.interact(
+            pr,
+            ui.make_persistent_id("device_pill"),
+            egui::Sense::click(),
+        );
+        let p = ui.painter();
+        p.rect_filled(
+            pr,
+            15.0,
+            if resp.hovered() {
+                t::SURFACE_3
+            } else {
+                t::SURFACE_2
+            },
+        );
+        p.circle_filled(
+            egui::pos2(pr.left() + 16.0, pr.center().y),
+            4.0,
+            if ok { t::PLAY } else { t::REC },
+        );
+        p.galley(
+            egui::pos2(pr.left() + 28.0, pr.center().y - gal.size().y / 2.0),
+            gal,
+            t::TEXT_2,
+        );
+        if resp.on_hover_text("Réglages de la carte son").clicked() {
+            self.open_audio();
+        }
     }
 
-    fn transport_bar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let recording = matches!(self.transport, Transport::Recording { .. });
-        let playing = matches!(self.transport, Transport::Playing { .. });
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if transport_button(
-                ui,
-                Icon::ToStart,
-                false,
-                self.is_stopped(),
-                "Retour au début (Origine)",
+    fn main_menu(&mut self, ui: &mut egui::Ui) {
+        let stopped = self.is_stopped();
+        ui.label(
+            egui::RichText::new("SESSION")
+                .font(t::semibold(10.5))
+                .color(t::TEXT_3),
+        );
+        if ui
+            .add_enabled(stopped, egui::Button::new("Nouvelle session…"))
+            .clicked()
+        {
+            self.open_new_session();
+        }
+        if ui
+            .add_enabled(stopped, egui::Button::new("Ouvrir…"))
+            .clicked()
+        {
+            self.open_session();
+        }
+        if ui.button("Enregistrer  (Ctrl+S)").clicked() {
+            self.save();
+        }
+        if ui
+            .add_enabled(stopped, egui::Button::new("Enregistrer sous…"))
+            .clicked()
+        {
+            self.save_as();
+        }
+        if ui.button("Afficher le dossier").clicked() {
+            let _ = self.project.ensure_dirs();
+            open_in_file_manager(&self.project.dir);
+        }
+        if ui
+            .add_enabled(
+                self.project.has_audio() && stopped,
+                egui::Button::new("Exporter…  (Ctrl+E)"),
             )
             .clicked()
-            {
-                self.playhead = 0;
-                self.view.scroll = 0.0;
-            }
-            if transport_button(ui, Icon::Stop, false, !self.is_stopped(), "Stop (Espace)")
+        {
+            self.open_export();
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new("ENREGISTREMENT")
+                .font(t::semibold(10.5))
+                .color(t::TEXT_3),
+        );
+        for f in [RecFormat::Int24, RecFormat::Float32] {
+            if ui
+                .add_enabled(
+                    stopped,
+                    egui::RadioButton::new(
+                        self.project.rec_format == f,
+                        format!("WAV {}", f.label()),
+                    ),
+                )
                 .clicked()
             {
-                self.stop(&ctx);
+                self.project.rec_format = f;
+                self.project.dirty = true;
             }
-            if transport_button(ui, Icon::Play, playing, !recording, "Lecture (Espace)").clicked() {
-                if playing {
-                    self.stop(&ctx);
-                } else {
-                    self.play(&ctx);
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new("SOUNDBOARD")
+                .font(t::semibold(10.5))
+                .color(t::TEXT_3),
+        );
+        if ui.button("Ouvrir un soundboard…").clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter("Soundboard", &["json"])
+                .pick_file()
+        {
+            match Board::load(&p) {
+                Ok(b) => {
+                    self.engine.pad(PadCmd::StopAll { fade: 0 });
+                    self.board = b;
+                    self.board_path = p;
+                    self.sb.selected = None;
+                    self.sb.page = 0;
+                    let paths: Vec<PathBuf> =
+                        self.board.all_pads().map(|(_, p)| p.path.clone()).collect();
+                    for p in paths {
+                        self.cache.request(&p, None);
+                    }
+                    let port = self.board.midi_port.clone();
+                    self.midi.connect(port.as_deref());
+                    self.sync_engine_to_board();
                 }
+                Err(e) => self.notify(format!("{e:#}"), true),
             }
-            if transport_button(ui, Icon::Record, recording, true, "Enregistrer (R)").clicked() {
-                if recording {
-                    self.stop(&ctx);
-                } else {
-                    self.record(&ctx);
-                }
-            }
-            ui.add_space(12.0);
-
-            // Compteur
-            let (rect, _) = ui.allocate_exact_size(vec2(190.0, 40.0), Sense::hover());
-            ui.painter().rect_filled(rect, 6.0, theme::COUNTER_BG);
-            let col = if recording { theme::REC } else { theme::TEXT };
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                fmt_time(self.playhead, self.sr()),
-                FontId::monospace(24.0),
-                col,
-            );
-            ui.add_space(10.0);
-
-            if recording {
-                let blink = (ctx.input(|i| i.time) * 2.0).fract() < 0.6;
-                let n = self.live.len();
-                let txt = format!(
-                    "{}  ENREGISTREMENT · {} piste{}",
-                    if blink { "●" } else { " " },
-                    n,
-                    if n > 1 { "s" } else { "" }
-                );
-                ui.label(
-                    egui::RichText::new(txt)
-                        .color(theme::REC)
-                        .strong()
-                        .size(15.0),
-                );
-            } else {
-                let armed = self.project.tracks.iter().filter(|t| t.armed).count();
-                ui.label(
-                    egui::RichText::new(format!("{armed} piste(s) armée(s)"))
-                        .color(theme::TEXT_DIM)
-                        .size(14.0),
-                );
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        self.project.has_audio() && self.is_stopped(),
-                        egui::Button::new("⇪  Exporter"),
-                    )
-                    .clicked()
-                {
-                    self.open_export();
-                }
-                if ui.button("🔧  Carte son").clicked() {
-                    self.open_audio();
-                }
-                if ui
-                    .add_enabled(self.is_stopped(), egui::Button::new("＋  Piste"))
-                    .clicked()
-                {
-                    let i = self.next_free_input();
-                    self.project.add_track(None, i);
-                }
-            });
-        });
+        }
+        if ui.button("Enregistrer le soundboard sous…").clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .add_filter("Soundboard", &["json"])
+                .set_file_name("soundboard.json")
+                .save_file()
+        {
+            self.board_path = p;
+            self.board_changed = Some(self.now);
+            self.save_board_now();
+        }
+        ui.separator();
+        if ui.button("Réglages audio…").clicked() {
+            self.open_audio();
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let st = &self.engine.status;
-        ui.horizontal(|ui| {
-            let dim = theme::TEXT_DIM;
-            match &st.input {
-                Some(name) => {
-                    ui.label(egui::RichText::new("●").color(theme::OK));
-                    ui.label(format!("{} · {}", st.host, name));
-                }
-                None => {
-                    ui.label(egui::RichText::new("●").color(theme::REC));
-                    ui.label("Aucune carte son");
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            let dim = |s: String| {
+                egui::RichText::new(s)
+                    .font(t::regular(11.5))
+                    .color(t::TEXT_3)
+            };
+            ui.label(dim(format!(
+                "Session {} kHz · WAV {} · buffer {}",
+                fmt_khz(self.project.sample_rate),
+                self.project.rec_format.label(),
+                self.engine
+                    .status
+                    .buffer
+                    .map_or("auto".to_string(), |b| b.to_string())
+            )));
+            let sh = &self.engine.shared;
+            let xr = sh.xruns.load(Ordering::Relaxed) + sh.underruns.load(Ordering::Relaxed);
+            let ov = sh.overruns.load(Ordering::Relaxed);
+            if xr > 0 || ov > 0 {
+                let r = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("⚠ {xr} décrochages · {ov} pertes disque"))
+                            .font(t::medium(11.5))
+                            .color(t::ORANGE),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if r.on_hover_text("Cliquer pour remettre à zéro").clicked() {
+                    sh.xruns.store(0, Ordering::Relaxed);
+                    sh.underruns.store(0, Ordering::Relaxed);
+                    sh.overruns.store(0, Ordering::Relaxed);
                 }
             }
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} kHz · {} entrées / {} sorties · buffer {}",
-                    fmt_khz(st.sample_rate),
-                    st.in_channels,
-                    st.out_channels,
-                    st.buffer.map_or("auto".to_string(), |b| b.to_string())
-                ))
-                .color(dim),
-            );
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!(
-                    "Session {} kHz · {}",
-                    fmt_khz(self.project.sample_rate),
-                    self.project.rec_format.label()
-                ))
-                .color(dim),
-            );
-
+            if let Some(e) = sh.last_error.lock().clone() {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {e}"))
+                        .font(t::medium(11.5))
+                        .color(t::REC),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let sh = &self.engine.shared;
-                let xr = sh.xruns.load(Ordering::Relaxed) + sh.underruns.load(Ordering::Relaxed);
-                let ov = sh.overruns.load(Ordering::Relaxed);
                 if let Some(free) = self.disk_free {
                     let armed = self
                         .project
@@ -944,435 +1137,71 @@ impl App {
                     } * self.sr() as u64
                         * armed as u64;
                     let secs = free / bps.max(1);
-                    let col = if secs < 1800 { theme::REC } else { dim };
+                    let col = if secs < 1800 { t::REC } else { t::TEXT_3 };
                     ui.label(
                         egui::RichText::new(format!(
-                            "Disque : {:.1} Go libres · ≈ {} d'enregistrement",
+                            "Disque {:.0} Go · ≈ {} d'enregistrement ({} piste{})",
                             free as f64 / 1e9,
-                            fmt_duration(secs)
+                            fmt_duration(secs),
+                            armed,
+                            if armed > 1 { "s" } else { "" }
                         ))
+                        .font(t::regular(11.5))
                         .color(col),
                     );
                 }
-                if xr > 0 || ov > 0 {
-                    ui.separator();
-                    let r = ui.label(
-                        egui::RichText::new(format!("⚠ {xr} décrochages · {ov} pertes disque"))
-                            .color(theme::WARN),
-                    );
-                    if r.on_hover_text("Cliquer pour remettre à zéro").clicked() {
-                        sh.xruns.store(0, Ordering::Relaxed);
-                        sh.underruns.store(0, Ordering::Relaxed);
-                        sh.overruns.store(0, Ordering::Relaxed);
-                    }
-                }
-                if let Some(e) = sh.last_error.lock().as_ref() {
-                    ui.separator();
-                    ui.label(egui::RichText::new(format!("⚠ {e}")).color(theme::REC));
-                }
             });
         });
-    }
-
-    fn x_of(&self, rect: Rect, sample: u64) -> f32 {
-        rect.left() + ((sample as f64 - self.view.scroll) / self.view.spp) as f32
-    }
-
-    fn sample_at(&self, rect: Rect, x: f32) -> u64 {
-        (self.view.scroll + (x - rect.left()) as f64 * self.view.spp).max(0.0) as u64
-    }
-
-    fn ruler(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, theme::RULER_BG);
-        let sr = self.sr() as f64;
-        let px_per_sec = sr / self.view.spp;
-        let steps = [
-            0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
-            1800.0, 3600.0,
-        ];
-        let step = steps
-            .iter()
-            .copied()
-            .find(|s| s * px_per_sec >= 90.0)
-            .unwrap_or(3600.0);
-        let t0 = self.view.scroll / sr;
-        let t1 = t0 + rect.width() as f64 * self.view.spp / sr;
-        let mut t = (t0 / step).floor() * step;
-        while t <= t1 {
-            let x = self.x_of(rect, (t * sr) as u64);
-            painter.line_segment(
-                [pos2(x, rect.top() + 12.0), pos2(x, rect.bottom())],
-                Stroke::new(1.0, theme::GRID_STRONG),
-            );
-            for k in 1..4 {
-                let xs = x + (k as f64 * step / 4.0 * px_per_sec) as f32;
-                painter.line_segment(
-                    [pos2(xs, rect.bottom() - 5.0), pos2(xs, rect.bottom())],
-                    Stroke::new(1.0, theme::GRID),
-                );
-            }
-            painter.text(
-                pos2(x + 4.0, rect.top() + 3.0),
-                Align2::LEFT_TOP,
-                fmt_ruler(t, step),
-                FontId::monospace(11.0),
-                theme::TEXT_DIM,
-            );
-            t += step;
-        }
-        // Tête de lecture
-        let x = self.x_of(rect, self.playhead);
-        if rect.x_range().contains(x) {
-            let tri = vec![
-                pos2(x - 6.0, rect.top()),
-                pos2(x + 6.0, rect.top()),
-                pos2(x, rect.top() + 9.0),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                tri,
-                theme::PLAYHEAD,
-                Stroke::NONE,
-            ));
-        }
-        let resp = ui.interact(
-            rect,
-            ui.make_persistent_id("ruler"),
-            Sense::click_and_drag(),
-        );
-        if self.is_stopped()
-            && (resp.clicked() || resp.dragged())
-            && let Some(p) = resp.interact_pointer_pos()
-        {
-            self.playhead = self.sample_at(rect, p.x);
-        }
-    }
-
-    fn timeline_input(&mut self, ui: &egui::Ui, rect: Rect) {
-        let hovered = ui.rect_contains_pointer(rect);
-        if !hovered {
-            return;
-        }
-        let (zoom, scroll_x, pointer) = ui.input(|i| {
-            (
-                i.zoom_delta(),
-                i.smooth_scroll_delta().x,
-                i.pointer.hover_pos(),
-            )
-        });
-        if zoom != 1.0 {
-            let px = pointer.map_or(rect.center().x, |p| p.x);
-            let anchor = self.view.scroll + (px - rect.left()) as f64 * self.view.spp;
-            self.view.spp = (self.view.spp / zoom as f64).clamp(1.0, 1.0e6);
-            self.view.scroll = (anchor - (px - rect.left()) as f64 * self.view.spp).max(0.0);
-        }
-        if scroll_x != 0.0 {
-            self.view.scroll = (self.view.scroll - scroll_x as f64 * self.view.spp).max(0.0);
-        }
-    }
-
-    fn follow_playhead(&mut self, width: f32) {
-        if self.is_stopped() {
-            return;
-        }
-        let visible = width as f64 * self.view.spp;
-        let ph = self.playhead as f64;
-        if ph > self.view.scroll + visible * 0.9 || ph < self.view.scroll {
-            self.view.scroll = (ph - visible * 0.1).max(0.0);
-        }
-    }
-
-    fn tracks_area(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let full = ui.available_rect_before_wrap();
-        let tl_left = full.left() + HEADER_W;
-        let ruler_rect = Rect::from_min_max(
-            pos2(tl_left, full.top()),
-            pos2(full.right(), full.top() + RULER_H),
-        );
-        let corner = Rect::from_min_max(full.min, pos2(tl_left, full.top() + RULER_H));
-        ui.painter().rect_filled(corner, 0.0, theme::RULER_BG);
-        ui.painter().text(
-            corner.left_center() + vec2(12.0, 0.0),
-            Align2::LEFT_CENTER,
-            format!("{} pistes", self.project.tracks.len()),
-            FontId::proportional(12.0),
-            theme::TEXT_DIM,
-        );
-        self.follow_playhead(ruler_rect.width());
-        self.ruler(ui, ruler_rect);
-        let tl_all = Rect::from_min_max(pos2(tl_left, full.top()), full.max);
-        self.timeline_input(ui, tl_all);
-
-        let body = Rect::from_min_max(pos2(full.left(), full.top() + RULER_H), full.max);
-        let mut child = ui.new_child(UiBuilder::new().max_rect(body));
-        let track_h = 70.0;
-        let mut to_delete = None;
-        let mut clip_to_delete = None;
-        let stopped = self.is_stopped();
-        let in_ch = self.engine.status.in_channels;
-        let now = ctx.input(|i| i.time);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(&mut child, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let ntracks = self.project.tracks.len();
-                for idx in 0..ntracks {
-                    let (row, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), track_h), Sense::hover());
-                    if !ui.is_rect_visible(row) {
-                        continue;
-                    }
-                    let color = theme::track_color(idx);
-                    let header = Rect::from_min_size(row.min, vec2(HEADER_W, track_h));
-                    let tl = Rect::from_min_max(pos2(row.left() + HEADER_W, row.top()), row.max);
-                    let bg = if idx % 2 == 0 {
-                        theme::ROW_A
-                    } else {
-                        theme::ROW_B
-                    };
-                    ui.painter().rect_filled(tl, 0.0, bg);
-                    ui.painter().rect_filled(header, 0.0, theme::HEADER_BG);
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(header.min, vec2(4.0, track_h)),
-                        0.0,
-                        color,
-                    );
-                    ui.painter().line_segment(
-                        [
-                            pos2(row.left(), row.bottom() - 0.5),
-                            pos2(row.right(), row.bottom() - 0.5),
-                        ],
-                        Stroke::new(1.0, theme::SEPARATOR),
-                    );
-
-                    // ---- En-tête de piste
-                    let track = &mut self.project.tracks[idx];
-                    let mut hdr_ui = ui.new_child(
-                        UiBuilder::new()
-                            .max_rect(header.shrink2(vec2(10.0, 7.0)).translate(vec2(3.0, 0.0))),
-                    );
-                    hdr_ui.horizontal(|ui| {
-                        if arm_button(ui, track.armed, stopped && track.input.is_some()).clicked() {
-                            track.armed = !track.armed;
-                        }
-                        let r = ui.add_enabled(
-                            stopped,
-                            egui::TextEdit::singleline(&mut track.name)
-                                .desired_width(150.0)
-                                .font(FontId::proportional(14.0)),
-                        );
-                        if r.changed() {
-                            self.project.dirty = true;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_enabled(stopped, egui::Button::new("✕").frame(false))
-                                .on_hover_text(
-                                    "Supprimer la piste (les fichiers restent sur le disque)",
-                                )
-                                .clicked()
-                            {
-                                to_delete = Some(idx);
-                            }
-                        });
-                    });
-                    hdr_ui.add_space(4.0);
-                    let track = &mut self.project.tracks[idx];
-                    hdr_ui.horizontal(|ui| {
-                        let label = match track.input {
-                            Some(i) => format!("In {}", i + 1),
-                            None => "—".into(),
-                        };
-                        ui.add_enabled_ui(stopped, |ui| {
-                            egui::ComboBox::from_id_salt(("input", track.id))
-                                .width(70.0)
-                                .selected_text(label)
-                                .height(400.0)
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(track.input.is_none(), "Aucune")
-                                        .clicked()
-                                    {
-                                        track.input = None;
-                                        track.armed = false;
-                                    }
-                                    for i in 0..in_ch {
-                                        if ui
-                                            .selectable_label(
-                                                track.input == Some(i),
-                                                format!("Entrée {}", i + 1),
-                                            )
-                                            .clicked()
-                                        {
-                                            track.input = Some(i);
-                                        }
-                                    }
-                                });
-                        });
-                        let (mrect, _) = ui.allocate_exact_size(
-                            vec2(ui.available_width() - 4.0, 12.0),
-                            Sense::hover(),
-                        );
-                        let (lvl, clip) = match track.input {
-                            Some(i) if (i as usize) < audio::MAX_INPUTS && i < in_ch => {
-                                (self.meters[i as usize], self.clip_hold[i as usize] > now)
-                            }
-                            _ => (0.0, false),
-                        };
-                        draw_meter(ui.painter(), mrect, lvl, clip);
-                    });
-
-                    // ---- Timeline de la piste
-                    let painter = ui.painter_at(tl);
-                    let track = &self.project.tracks[idx];
-                    let lane = tl.shrink2(vec2(0.0, 4.0));
-                    for c in &track.clips {
-                        let x0 = self.x_of(tl, c.start);
-                        let x1 = self.x_of(tl, c.end());
-                        if x1 < tl.left() || x0 > tl.right() {
-                            continue;
-                        }
-                        let crect = Rect::from_min_max(
-                            pos2(x0, lane.top()),
-                            pos2(x1.max(x0 + 2.0), lane.bottom()),
-                        );
-                        draw_clip(
-                            &painter,
-                            crect,
-                            tl,
-                            color,
-                            self.peaks.get(&c.id),
-                            c.offset,
-                            self.view.spp,
-                            Some(&c.file),
-                        );
-                    }
-                    // Prise en cours
-                    if let Transport::Recording { start } = self.transport
-                        && let Some(l) = self.live.iter().find(|l| l.track_id == track.id)
-                    {
-                        let x0 = self.x_of(tl, start);
-                        let x1 = self.x_of(tl, self.playhead);
-                        let crect = Rect::from_min_max(
-                            pos2(x0, lane.top()),
-                            pos2(x1.max(x0 + 2.0), lane.bottom()),
-                        );
-                        draw_clip(
-                            &painter,
-                            crect,
-                            tl,
-                            theme::REC,
-                            Some(&l.peaks),
-                            0,
-                            self.view.spp,
-                            None,
-                        );
-                    }
-
-                    let resp =
-                        ui.interact(tl, ui.make_persistent_id(("tl", track.id)), Sense::click());
-                    if resp.clicked()
-                        && stopped
-                        && let Some(p) = resp.interact_pointer_pos()
-                    {
-                        self.playhead = self.sample_at(tl, p.x);
-                    }
-                    if resp.secondary_clicked() {
-                        self.ctx_clip = resp.interact_pointer_pos().and_then(|p| {
-                            let s = self.sample_at(tl, p.x);
-                            track
-                                .clips
-                                .iter()
-                                .rev()
-                                .find(|c| c.start <= s && s < c.end())
-                                .map(|c| (track.id, c.id))
-                        });
-                    }
-                    let tid = track.id;
-                    resp.context_menu(|ui| match self.ctx_clip {
-                        Some((t, c)) if t == tid => {
-                            if ui
-                                .add_enabled(stopped, egui::Button::new("Supprimer cette prise"))
-                                .clicked()
-                            {
-                                clip_to_delete = Some((t, c));
-                                ui.close();
-                            }
-                        }
-                        _ => {
-                            ui.label(
-                                egui::RichText::new("Aucune prise ici").color(theme::TEXT_DIM),
-                            );
-                        }
-                    });
-                }
-
-                // Zone "ajouter"
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    if ui
-                        .add_enabled(stopped, egui::Button::new("＋  Ajouter une piste"))
-                        .clicked()
-                    {
-                        let i = self.next_free_input();
-                        self.project.add_track(None, i);
-                    }
-                    if ui
-                        .add_enabled(
-                            stopped && in_ch > 0,
-                            egui::Button::new(format!("＋  Une piste par entrée ({in_ch})")),
-                        )
-                        .clicked()
-                    {
-                        self.add_track_per_input();
-                    }
-                });
-                ui.add_space(20.0);
-            });
-
-        // Tête de lecture sur toute la hauteur
-        let x = self.x_of(tl_all, self.playhead);
-        if x >= tl_left && x <= full.right() {
-            ui.painter().line_segment(
-                [pos2(x, full.top() + RULER_H), pos2(x, full.bottom())],
-                Stroke::new(1.5, theme::PLAYHEAD),
-            );
-        }
-
-        if let Some(i) = to_delete {
-            self.project.tracks.remove(i);
-            self.project.dirty = true;
-        }
-        if let Some((t, c)) = clip_to_delete
-            && let Some(track) = self.project.track_mut(t)
-        {
-            track.clips.retain(|x| x.id != c);
-            self.project.dirty = true;
-        }
     }
 
     // ---------------------------------------------------------------- dialogs
+
+    fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).font(t::semibold(17.0)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = w::icon_button(
+                    ui,
+                    Icon::Close,
+                    sq(26.0),
+                    BtnStyle::Ghost,
+                    true,
+                    "Fermer (Échap)",
+                )
+                .clicked();
+            });
+        });
+        ui.add_space(10.0);
+        close
+    }
+
+    fn section(ui: &mut egui::Ui, title: &str) {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(title.to_uppercase())
+                .font(t::semibold(10.5))
+                .color(t::TEXT_3),
+        );
+        ui.add_space(2.0);
+    }
 
     fn audio_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.audio_dlg.take() else {
             return;
         };
-        let mut open = true;
+        let mut close = false;
         let mut apply = false;
-        egui::Window::new("Réglages de la carte son")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(440.0)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        egui::Modal::new(egui::Id::unique("audio_dlg"))
+            .frame(t::window_frame())
             .show(ctx, |ui| {
-                egui::Grid::new("audio_grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-                    ui.label("Pilote");
+                ui.set_width(480.0);
+                close = Self::dialog_header(ui, "Carte son");
+                egui::Grid::new("audio_grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+                    let combo_w = 320.0;
+                    ui.label(egui::RichText::new("Pilote").color(t::TEXT_2));
                     let cur = dlg.prefs.host.clone().unwrap_or_default();
-                    egui::ComboBox::from_id_salt("host").width(280.0).selected_text(&cur).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("host").width(combo_w).selected_text(&cur).show_ui(ui, |ui| {
                         for h in dlg.hosts.clone() {
                             if ui.selectable_label(cur == h, &h).clicked() {
                                 dlg.prefs.host = Some(h);
@@ -1386,17 +1215,16 @@ impl App {
                         dlg.refresh();
                     }
 
-                    ui.label("Entrée");
+                    ui.label(egui::RichText::new("Entrée").color(t::TEXT_2));
                     let cur = dlg.prefs.input.clone().unwrap_or_else(|| "Par défaut".into());
-                    egui::ComboBox::from_id_salt("in").width(280.0).selected_text(&cur).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("in").width(combo_w).selected_text(&cur).show_ui(ui, |ui| {
                         if ui.selectable_label(dlg.prefs.input.is_none(), "Par défaut").clicked() {
                             dlg.prefs.input = None;
                         }
                         for d in &dlg.ins {
-                            let txt = format!("{}  ({} canaux)", d.name, d.channels);
+                            let txt = format!("{}   {} canaux", d.name, d.channels);
                             if ui.selectable_label(dlg.prefs.input.as_deref() == Some(&d.name), txt).clicked() {
                                 dlg.prefs.input = Some(d.name.clone());
-                                // Même carte en sortie si elle existe (cas ASIO / Dante).
                                 if dlg.outs.iter().any(|o| o.name == d.name) {
                                     dlg.prefs.output = Some(d.name.clone());
                                 }
@@ -1405,14 +1233,14 @@ impl App {
                     });
                     ui.end_row();
 
-                    ui.label("Sortie (écoute)");
+                    ui.label(egui::RichText::new("Sortie").color(t::TEXT_2));
                     let cur = dlg.prefs.output.clone().unwrap_or_else(|| "Par défaut".into());
-                    egui::ComboBox::from_id_salt("out").width(280.0).selected_text(&cur).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("out").width(combo_w).selected_text(&cur).show_ui(ui, |ui| {
                         if ui.selectable_label(dlg.prefs.output.is_none(), "Par défaut").clicked() {
                             dlg.prefs.output = None;
                         }
                         for d in &dlg.outs {
-                            let txt = format!("{}  ({} canaux)", d.name, d.channels);
+                            let txt = format!("{}   {} canaux", d.name, d.channels);
                             if ui.selectable_label(dlg.prefs.output.as_deref() == Some(&d.name), txt).clicked() {
                                 dlg.prefs.output = Some(d.name.clone());
                             }
@@ -1426,15 +1254,16 @@ impl App {
                         .find(|o| Some(&o.name) == dlg.prefs.output.as_ref())
                         .map(|o| o.channels)
                         .unwrap_or(2);
-                    ui.label("Canaux d'écoute");
+                    ui.label(egui::RichText::new("Écoute multipiste").color(t::TEXT_2));
                     let l = dlg.prefs.out_left;
                     egui::ComboBox::from_id_salt("outpair")
-                        .width(120.0)
-                        .selected_text(format!("{} – {}", l + 1, l + 2))
+                        .width(140.0)
+                        .selected_text(format!("Sorties {} – {}", l + 1, l + 2))
+                        .height(300.0)
                         .show_ui(ui, |ui| {
                             let mut i = 0;
                             while i < out_ch.max(2) {
-                                if ui.selectable_label(l == i, format!("{} – {}", i + 1, i + 2)).clicked() {
+                                if ui.selectable_label(l == i, format!("Sorties {} – {}", i + 1, i + 2)).clicked() {
                                     dlg.prefs.out_left = i;
                                 }
                                 i += 2;
@@ -1442,7 +1271,6 @@ impl App {
                         });
                     ui.end_row();
 
-                    // Fréquences communes à l'entrée choisie.
                     let rates: Vec<u32> = dlg
                         .ins
                         .iter()
@@ -1451,9 +1279,9 @@ impl App {
                         .map(|d| d.rates.clone())
                         .filter(|r| !r.is_empty())
                         .unwrap_or_else(|| audio::COMMON_RATES.to_vec());
-                    ui.label("Fréquence");
+                    ui.label(egui::RichText::new("Fréquence").color(t::TEXT_2));
                     let cur = dlg.prefs.sample_rate.map_or("Par défaut".to_string(), |r| format!("{} kHz", fmt_khz(r)));
-                    egui::ComboBox::from_id_salt("sr").width(120.0).selected_text(cur).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("sr").width(140.0).selected_text(cur).show_ui(ui, |ui| {
                         if ui.selectable_label(dlg.prefs.sample_rate.is_none(), "Par défaut").clicked() {
                             dlg.prefs.sample_rate = None;
                         }
@@ -1465,10 +1293,10 @@ impl App {
                     });
                     ui.end_row();
 
-                    ui.label("Taille de buffer");
-                    let cur = dlg.prefs.buffer.map_or("Par défaut (pilote)".to_string(), |b| format!("{b} échantillons"));
-                    egui::ComboBox::from_id_salt("buf").width(180.0).selected_text(cur).show_ui(ui, |ui| {
-                        if ui.selectable_label(dlg.prefs.buffer.is_none(), "Par défaut (pilote)").clicked() {
+                    ui.label(egui::RichText::new("Buffer").color(t::TEXT_2));
+                    let cur = dlg.prefs.buffer.map_or("Pilote".to_string(), |b| format!("{b} échantillons"));
+                    egui::ComboBox::from_id_salt("buf").width(140.0).selected_text(cur).show_ui(ui, |ui| {
+                        if ui.selectable_label(dlg.prefs.buffer.is_none(), "Pilote").clicked() {
                             dlg.prefs.buffer = None;
                         }
                         for b in audio::BUFFER_SIZES {
@@ -1479,34 +1307,35 @@ impl App {
                     });
                     ui.end_row();
                 });
-
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Dante : sous Windows choisissez le pilote ASIO puis « Dante Virtual Soundcard » ; \
-                         sous macOS, CoreAudio puis « Dante Virtual Soundcard ». La configuration est mémorisée.",
-                    )
-                    .color(theme::TEXT_DIM)
-                    .size(12.0),
-                );
+                ui.add_space(10.0);
+                egui::Frame::new().fill(t::SURFACE_3).corner_radius(t::R).inner_margin(12).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Dante — Windows : pilote ASIO puis « Dante Virtual Soundcard ». macOS : CoreAudio puis « Dante Virtual Soundcard ». \
+                             La fréquence doit correspondre à Dante Controller. Le réglage est mémorisé.",
+                        )
+                        .font(t::regular(12.0))
+                        .color(t::TEXT_2),
+                    );
+                });
                 if let Some(e) = &dlg.error {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(format!("⚠ {e}")).color(theme::REC));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(e).font(t::medium(12.5)).color(t::REC));
                 }
-                ui.add_space(8.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Actualiser la liste").clicked() {
+                    if ui.button("Actualiser").clicked() {
                         dlg.refresh();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(egui::RichText::new("Appliquer").strong()).fill(theme::ACCENT_DARK)).clicked() {
+                        if w::pill(ui, None, "Appliquer", Some(t::ACCENT), true).clicked() {
                             apply = true;
                         }
                     });
                 });
             });
         if apply {
-            match self.apply_audio(ctx, dlg.prefs.clone()) {
+            match self.apply_audio(dlg.prefs.clone()) {
                 Ok(()) => {
                     let st = &self.engine.status;
                     let msg = format!(
@@ -1515,13 +1344,13 @@ impl App {
                         fmt_khz(st.sample_rate),
                         st.in_channels
                     );
-                    self.notify(ctx, msg, false);
+                    self.notify(msg, false);
                     return;
                 }
                 Err(e) => dlg.error = Some(e),
             }
         }
-        if open {
+        if !close {
             self.audio_dlg = Some(dlg);
         }
     }
@@ -1530,20 +1359,29 @@ impl App {
         if let Some(job) = &self.export_job {
             let p = job.progress.load(Ordering::Relaxed) as f32 / 1000.0;
             let mut cancel = false;
-            egui::Window::new("Export en cours")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            egui::Modal::new(egui::Id::unique("export_job"))
+                .frame(t::window_frame())
                 .show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(egui::RichText::new("Export en cours").font(t::semibold(16.0)));
+                    ui.add_space(12.0);
                     ui.add(
                         egui::ProgressBar::new(p)
-                            .desired_width(320.0)
-                            .show_percentage(),
+                            .desired_width(360.0)
+                            .desired_height(8.0)
+                            .fill(t::ACCENT),
                     );
                     ui.add_space(6.0);
-                    if ui.button("Annuler").clicked() {
-                        cancel = true;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:.0} %", p * 100.0)).color(t::TEXT_2),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Annuler").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
                 });
             if cancel {
                 job.cancel.store(true, Ordering::Relaxed);
@@ -1557,137 +1395,207 @@ impl App {
                             .and_then(|f| f.parent())
                             .map(Path::to_path_buf);
                         self.notify(
-                            ctx,
-                            format!("Export terminé : {} fichier(s)", files.len()),
+                            format!("Export terminé · {} fichier(s)", files.len()),
                             false,
                         );
                         if let Some(d) = dir {
                             open_in_file_manager(&d);
                         }
                     }
-                    Err(e) => self.notify(ctx, format!("{e:#}"), true),
+                    Err(e) => self.notify(format!("{e:#}"), true),
                 }
             }
             return;
         }
-        let Some(mut s) = self.export_dlg.take() else {
+        let Some(mut d) = self.export_dlg.take() else {
             return;
         };
-        let mut open = true;
+        let mut close = false;
         let mut go = false;
-        let n_tracks = self
-            .project
-            .tracks
-            .iter()
-            .filter(|t| !t.clips.is_empty())
-            .count();
-        egui::Window::new("Exporter")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        let sr = self.project.sample_rate.max(1);
+        egui::Modal::new(egui::Id::unique("export_dlg"))
+            .frame(t::window_frame())
             .show(ctx, |ui| {
-                egui::Grid::new("exp_grid")
-                    .num_columns(2)
-                    .spacing([14.0, 10.0])
-                    .show(ui, |ui| {
-                        ui.label("Contenu");
-                        ui.vertical(|ui| {
-                            ui.checkbox(
-                                &mut s.stems,
-                                format!("Pistes séparées ({n_tracks} fichiers mono)"),
-                            );
-                            ui.checkbox(&mut s.mix, "Mix stéréo (somme des pistes)");
-                        });
-                        ui.end_row();
+                ui.set_width(560.0);
+                close = Self::dialog_header(ui, "Exporter");
 
-                        ui.label("Fréquence");
-                        ui.horizontal(|ui| {
-                            for r in [44100, 48000, 88200, 96000] {
-                                ui.selectable_value(
-                                    &mut s.sample_rate,
-                                    r,
-                                    format!("{} kHz", fmt_khz(r)),
-                                );
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("Résolution");
-                        ui.horizontal(|ui| {
-                            for d in BitDepth::ALL {
-                                ui.selectable_value(&mut s.depth, d, d.label());
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("");
-                        ui.add_enabled(
-                            s.depth == BitDepth::I16,
-                            egui::Checkbox::new(&mut s.dither, "Dither (recommandé en 16 bits)"),
-                        );
-                        ui.end_row();
-
-                        ui.label("Dossier");
-                        ui.horizontal(|ui| {
-                            let mut txt = s.dir.display().to_string();
-                            if ui
-                                .add(egui::TextEdit::singleline(&mut txt).desired_width(330.0))
-                                .changed()
-                            {
-                                s.dir = PathBuf::from(txt);
-                            }
-                            if ui.button("…").clicked()
-                                && let Some(d) = rfd::FileDialog::new()
-                                    .set_directory(&self.project.dir)
-                                    .pick_folder()
-                            {
-                                s.dir = d;
-                            }
-                        });
-                        ui.end_row();
-                    });
-                ui.add_space(4.0);
-                let secs = self.project.end() / self.project.sample_rate.max(1) as u64;
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Durée : {} · session en {} kHz{}",
-                        fmt_duration(secs),
-                        fmt_khz(self.project.sample_rate),
-                        if s.sample_rate != self.project.sample_rate {
-                            " → conversion de fréquence"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .color(theme::TEXT_DIM)
-                    .size(12.0),
-                );
-                ui.add_space(8.0);
+                Self::section(ui, "Pistes");
+                let with_audio: Vec<(u64, String, usize)> = self
+                    .project
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| !t.clips.is_empty())
+                    .map(|(i, t)| (t.id, t.name.clone(), i))
+                    .collect();
                 ui.horizontal(|ui| {
+                    if ui.small_button("Toutes").clicked() {
+                        d.tracks = with_audio.iter().map(|x| x.0).collect();
+                    }
+                    if ui.small_button("Aucune").clicked() {
+                        d.tracks.clear();
+                    }
+                    if !self.selected_tracks.is_empty()
+                        && ui.small_button("Sélection de la timeline").clicked()
+                    {
+                        d.tracks = with_audio
+                            .iter()
+                            .map(|x| x.0)
+                            .filter(|id| self.selected_tracks.contains(id))
+                            .collect();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {} sélectionnée(s)",
+                            d.tracks.len(),
+                            with_audio.len()
+                        ))
+                        .font(t::regular(12.0))
+                        .color(t::TEXT_3),
+                    );
+                });
+                egui::Frame::new()
+                    .fill(t::SURFACE)
+                    .corner_radius(t::R)
+                    .inner_margin(8)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                egui::Grid::new("exp_tracks")
+                                    .num_columns(3)
+                                    .spacing([18.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for (k, (id, name, idx)) in with_audio.iter().enumerate() {
+                                            let mut on = d.tracks.contains(id);
+                                            let txt = egui::RichText::new(format!(
+                                                "{:02}  {}",
+                                                idx + 1,
+                                                short(name, 18)
+                                            ));
+                                            if ui.checkbox(&mut on, txt).changed() {
+                                                if on {
+                                                    d.tracks.insert(*id);
+                                                } else {
+                                                    d.tracks.remove(id);
+                                                }
+                                            }
+                                            if k % 3 == 2 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            });
+                    });
+
+                Self::section(ui, "Plage");
+                ui.horizontal(|ui| {
+                    ui.radio_value(
+                        &mut d.range,
+                        RangeChoice::All,
+                        format!(
+                            "Toute la session ({})",
+                            fmt_duration(self.project.end() / sr as u64)
+                        ),
+                    );
+                    let sel_txt = match self.selection {
+                        Some((a, b)) => format!(
+                            "Sélection {} → {}",
+                            fmt_time_short(a, sr),
+                            fmt_time_short(b, sr)
+                        ),
+                        None => "Sélection (glisser sur la règle)".into(),
+                    };
+                    ui.add_enabled_ui(self.selection.is_some(), |ui| {
+                        ui.radio_value(&mut d.range, RangeChoice::Selection, sel_txt);
+                    });
+                });
+
+                Self::section(ui, "Contenu");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut d.s.stems, "Pistes séparées (WAV mono)");
+                    ui.checkbox(&mut d.s.mix, "Mix stéréo des pistes");
+                });
+
+                Self::section(ui, "Format");
+                ui.horizontal(|ui| {
+                    for r in [44100, 48000, 88200, 96000] {
+                        ui.selectable_value(&mut d.s.sample_rate, r, format!("{} kHz", fmt_khz(r)));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for b in BitDepth::ALL {
+                        ui.selectable_value(&mut d.s.depth, b, b.label());
+                    }
+                });
+                ui.add_enabled(
+                    d.s.depth == BitDepth::I16,
+                    egui::Checkbox::new(&mut d.s.dither, "Dither (recommandé en 16 bits)"),
+                );
+
+                Self::section(ui, "Destination");
+                ui.horizontal(|ui| {
+                    let mut txt = d.s.dir.display().to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut txt).desired_width(470.0))
+                        .changed()
+                    {
+                        d.s.dir = PathBuf::from(txt);
+                    }
+                    if ui.button("…").clicked()
+                        && let Some(p) = rfd::FileDialog::new()
+                            .set_directory(&self.project.dir)
+                            .pick_folder()
+                    {
+                        d.s.dir = p;
+                    }
+                });
+                ui.add_space(14.0);
+                let n_files = if d.s.stems { d.tracks.len() } else { 0 }
+                    + usize::from(d.s.mix && !d.tracks.is_empty());
+                ui.horizontal(|ui| {
+                    let conv = if d.s.sample_rate != sr {
+                        " · conversion de fréquence"
+                    } else {
+                        ""
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{n_files} fichier(s){conv}")).color(t::TEXT_3),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                s.stems || s.mix,
-                                egui::Button::new(egui::RichText::new("Exporter").strong())
-                                    .fill(theme::ACCENT_DARK),
-                            )
-                            .clicked()
+                        if w::pill(
+                            ui,
+                            Some(Icon::Export),
+                            "Exporter",
+                            Some(t::ACCENT),
+                            n_files > 0,
+                        )
+                        .clicked()
                         {
                             go = true;
                         }
-                    })
+                    });
                 });
             });
         if go {
-            self.stop(ctx);
-            self.export_last = Some(s.clone());
+            self.stop();
+            let mut s = d.s.clone();
+            s.tracks = d.tracks.iter().copied().collect();
+            s.range = match d.range {
+                RangeChoice::Selection => self.selection,
+                RangeChoice::All => None,
+            };
+            self.export_last = Some(ExportSettings {
+                tracks: Vec::new(),
+                range: None,
+                ..s.clone()
+            });
             self.export_job = Some(ExportJob::start(&self.project, s));
             return;
         }
-        if open {
-            self.export_dlg = Some(s);
+        if !close {
+            self.export_dlg = Some(d);
         }
     }
 
@@ -1695,95 +1603,103 @@ impl App {
         let Some(mut d) = self.new_dlg.take() else {
             return;
         };
-        let mut open = true;
+        let mut close = false;
         let mut create = false;
-        egui::Window::new("Nouvelle session")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        egui::Modal::new(egui::Id::unique("new_dlg"))
+            .frame(t::window_frame())
             .show(ctx, |ui| {
-                egui::Grid::new("new_grid")
-                    .num_columns(2)
-                    .spacing([14.0, 10.0])
-                    .show(ui, |ui| {
-                        ui.label("Nom");
-                        ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(260.0));
-                        ui.end_row();
-                        ui.label("Emplacement");
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(d.parent.display().to_string())
-                                    .color(theme::TEXT_DIM),
-                            );
-                            if ui.button("…").clicked()
-                                && let Some(p) = rfd::FileDialog::new()
-                                    .set_directory(&d.parent)
-                                    .pick_folder()
-                            {
-                                d.parent = p;
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(
-                            &mut d.keep_tracks,
-                            "Reprendre les pistes et entrées actuelles",
-                        );
-                        ui.end_row();
+                ui.set_width(460.0);
+                close = Self::dialog_header(ui, "Nouvelle session");
+                Self::section(ui, "Nom");
+                ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(460.0));
+                Self::section(ui, "Emplacement");
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(short(&d.parent.display().to_string(), 52))
+                            .color(t::TEXT_2),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Choisir…").clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .set_directory(&d.parent)
+                                .pick_folder()
+                        {
+                            d.parent = p;
+                        }
                     });
-                ui.add_space(8.0);
+                });
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut d.keep_tracks,
+                    "Reprendre les pistes et les entrées actuelles",
+                );
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("Créer").strong())
-                                    .fill(theme::ACCENT_DARK),
-                            )
-                            .clicked()
+                        if w::pill(
+                            ui,
+                            None,
+                            "Créer",
+                            Some(t::ACCENT),
+                            !d.name.trim().is_empty(),
+                        )
+                        .clicked()
                         {
                             create = true;
                         }
-                    })
+                    });
                 });
             });
-        if create && !d.name.trim().is_empty() {
-            self.create_session(ctx, d);
+        if create {
+            self.create_session(d);
             return;
         }
-        if open {
+        if !close {
             self.new_dlg = Some(d);
         }
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|i| i.time);
-        let Some(t) = &self.toast else {
+        let Some(tt) = &self.toast else {
             return;
         };
-        if now > t.until {
+        if self.now > tt.until {
             self.toast = None;
             return;
         }
+        let fade = ((tt.until - self.now) / 0.3).min(1.0) as f32;
         egui::Area::new(egui::Id::unique("toast"))
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -40.0))
-            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -48.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(if t.error {
-                        theme::TOAST_ERR
-                    } else {
-                        theme::TOAST
+                    .fill(t::SURFACE_3.gamma_multiply(fade))
+                    .stroke(egui::Stroke::new(1.0, t::BORDER))
+                    .corner_radius(20)
+                    .inner_margin(egui::Margin::symmetric(18, 10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha((110.0 * fade) as u8),
                     })
-                    .corner_radius(8.0)
-                    .inner_margin(egui::Margin::symmetric(16, 10))
                     .show(ui, |ui| {
-                        ui.set_max_width(600.0);
-                        ui.label(
-                            egui::RichText::new(&t.text)
-                                .color(Color32::WHITE)
-                                .size(14.0),
-                        );
+                        ui.set_max_width(620.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                r.center(),
+                                4.0,
+                                if tt.error { t::REC } else { t::PLAY },
+                            );
+                            ui.label(
+                                egui::RichText::new(&tt.text)
+                                    .font(t::medium(13.0))
+                                    .color(t::TEXT.gamma_multiply(fade)),
+                            );
+                        });
                     });
             });
     }
@@ -1792,266 +1708,58 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.now = ctx.input(|i| i.time);
         self.engine.collect_garbage();
+        if self.cache.poll() {
+            self.sb.midi_dirty = true;
+        }
         self.update_playhead();
         self.update_meters(&ctx);
-        self.handle_keys(&ctx);
+        self.global_keys(&ctx);
         self.update_title(&ctx);
+        if let Some(tch) = self.board_changed
+            && self.now - tch > 1.0
+        {
+            self.save_board_now();
+        }
+        self.soundboard_background(&ctx);
 
-        egui::Panel::top("menu")
+        egui::Panel::top("top")
+            .exact_size(56.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::PANEL_BG)
-                    .inner_margin(egui::Margin::symmetric(8, 4)),
+                    .fill(t::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
             )
-            .show(ui, |ui| {
-                self.menu_bar(ui);
-            });
-        egui::Panel::top("transport")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL_BG)
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
-            )
-            .show(ui, |ui| self.transport_bar(ui));
+            .show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status")
+            .exact_size(26.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::PANEL_BG)
-                    .inner_margin(egui::Margin::symmetric(12, 5)),
+                    .fill(t::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
             )
             .show(ui, |ui| self.status_bar(ui));
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG))
-            .show(ui, |ui| self.tracks_area(ui));
+
+        if self.tab == 0 {
+            self.multitrack_ui(ui);
+        } else {
+            self.soundboard_ui(ui);
+        }
 
         self.audio_dialog(&ctx);
         self.export_dialog(&ctx);
         self.new_session_dialog(&ctx);
         self.toast_ui(&ctx);
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 
     fn on_exit(&mut self) {
-        let ctx = egui::Context::default();
-        self.stop(&ctx);
+        self.stop();
         self.autosave();
-    }
-}
-
-// -------------------------------------------------------------------- widgets
-
-#[derive(Clone, Copy)]
-enum Icon {
-    ToStart,
-    Stop,
-    Play,
-    Record,
-}
-
-fn transport_button(
-    ui: &mut egui::Ui,
-    icon: Icon,
-    active: bool,
-    enabled: bool,
-    tip: &str,
-) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(46.0, 40.0),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    let resp = resp.on_hover_text(tip);
-    let hovered = resp.hovered() && enabled;
-    let (bg, fg) = match (icon, active) {
-        (Icon::Record, true) => (theme::REC, Color32::WHITE),
-        (Icon::Play, true) => (theme::PLAY, Color32::WHITE),
-        _ => (
-            if hovered {
-                theme::BUTTON_HOVER
-            } else {
-                theme::BUTTON
-            },
-            match icon {
-                Icon::Record => theme::REC,
-                Icon::Play => theme::PLAY,
-                _ => theme::TEXT,
-            },
-        ),
-    };
-    let fg = if enabled { fg } else { fg.gamma_multiply(0.35) };
-    let p = ui.painter();
-    p.rect_filled(rect, 7.0, bg);
-    let c = rect.center();
-    match icon {
-        Icon::Play => {
-            let pts = vec![
-                c + vec2(-6.0, -9.0),
-                c + vec2(10.0, 0.0),
-                c + vec2(-6.0, 9.0),
-            ];
-            p.add(egui::Shape::convex_polygon(pts, fg, Stroke::NONE));
-        }
-        Icon::Stop => {
-            p.rect_filled(Rect::from_center_size(c, vec2(15.0, 15.0)), 2.0, fg);
-        }
-        Icon::Record => {
-            p.circle_filled(c, 9.0, fg);
-        }
-        Icon::ToStart => {
-            p.rect_filled(
-                Rect::from_center_size(c + vec2(-8.0, 0.0), vec2(3.0, 16.0)),
-                0.0,
-                fg,
-            );
-            let pts = vec![c + vec2(8.0, -8.0), c + vec2(8.0, 8.0), c + vec2(-5.0, 0.0)];
-            p.add(egui::Shape::convex_polygon(pts, fg, Stroke::NONE));
-        }
-    }
-    resp
-}
-
-fn arm_button(ui: &mut egui::Ui, armed: bool, enabled: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(24.0, 24.0),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    let resp = resp.on_hover_text("Armer la piste pour l'enregistrement");
-    let p = ui.painter();
-    let bg = if armed {
-        theme::REC
-    } else if resp.hovered() && enabled {
-        theme::BUTTON_HOVER
-    } else {
-        theme::BUTTON
-    };
-    p.circle_filled(rect.center(), 11.0, bg);
-    let dot = if armed {
-        Color32::WHITE
-    } else {
-        theme::REC.gamma_multiply(if enabled { 0.9 } else { 0.35 })
-    };
-    p.circle_filled(rect.center(), 4.5, dot);
-    resp
-}
-
-fn draw_meter(p: &egui::Painter, rect: Rect, level: f32, clip: bool) {
-    p.rect_filled(rect, 2.0, theme::METER_BG);
-    let db = if level > 1e-6 {
-        20.0 * level.log10()
-    } else {
-        -120.0
-    };
-    let norm = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-    if norm > 0.0 {
-        let w = rect.width() * norm;
-        let col = if db > -3.0 {
-            theme::REC
-        } else if db > -12.0 {
-            theme::WARN
-        } else {
-            theme::OK
-        };
-        p.rect_filled(
-            Rect::from_min_size(rect.min, vec2(w, rect.height())),
-            2.0,
-            col,
-        );
-    }
-    // Graduations -48, -24, -12, -6 dB
-    for g in [-48.0f32, -24.0, -12.0, -6.0] {
-        let x = rect.left() + rect.width() * (g + 60.0) / 60.0;
-        p.line_segment(
-            [pos2(x, rect.top()), pos2(x, rect.bottom())],
-            Stroke::new(1.0, Color32::from_black_alpha(90)),
-        );
-    }
-    if clip {
-        p.rect_filled(
-            Rect::from_min_max(pos2(rect.right() - 5.0, rect.top()), rect.max),
-            1.0,
-            theme::REC,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_clip(
-    painter: &egui::Painter,
-    rect: Rect,
-    visible: Rect,
-    color: Color32,
-    peaks: Option<&Peaks>,
-    offset: u64,
-    spp: f64,
-    label: Option<&str>,
-) {
-    painter.rect_filled(rect, CornerRadius::same(4), color.gamma_multiply(0.22));
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(4),
-        Stroke::new(1.0, color.gamma_multiply(0.8)),
-        StrokeKind::Inside,
-    );
-    if let Some(peaks) = peaks {
-        let data = peaks.read();
-        let (lvl, per) = if spp >= (PEAK_BLOCK * PEAK_L1 * 2) as f64 {
-            (&data.l1, (PEAK_BLOCK * PEAK_L1) as f64)
-        } else {
-            (&data.l0, PEAK_BLOCK as f64)
-        };
-        if !lvl.is_empty() {
-            let mid = rect.center().y;
-            let half = rect.height() * 0.45;
-            let x0 = rect.left().max(visible.left()).floor();
-            let x1 = rect.right().min(visible.right()).ceil();
-            let mut mesh = Mesh::default();
-            let wcol = color.gamma_multiply(0.95);
-            let mut x = x0;
-            while x < x1 {
-                let s0 = offset as f64 + (x - rect.left()) as f64 * spp;
-                let s1 = s0 + spp;
-                let i0 = (s0 / per) as usize;
-                let i1 = ((s1 / per) as usize).max(i0 + 1).min(lvl.len());
-                if i0 >= lvl.len() {
-                    break;
-                }
-                let (mut mn, mut mx) = (i16::MAX, i16::MIN);
-                for p in &lvl[i0..i1] {
-                    mn = mn.min(p[0]);
-                    mx = mx.max(p[1]);
-                }
-                let top = mid - (mx as f32 / 32767.0) * half;
-                let bot = mid - (mn as f32 / 32767.0) * half;
-                let r = Rect::from_min_max(
-                    pos2(x, top.min(mid - 0.5)),
-                    pos2(x + 1.0, bot.max(mid + 0.5)),
-                );
-                mesh.add_colored_rect(r, wcol);
-                x += 1.0;
-            }
-            painter.add(egui::Shape::mesh(mesh));
-        }
-    }
-    if let Some(label) = label
-        && rect.width() > 60.0
-    {
-        let pos = Pos2::new(rect.left().max(visible.left()) + 5.0, rect.top() + 3.0);
-        painter.text(
-            pos,
-            Align2::LEFT_TOP,
-            label,
-            FontId::proportional(10.5),
-            color.gamma_multiply(1.0),
-        );
+        self.board_changed = Some(0.0);
+        self.save_board_now();
     }
 }
 
@@ -2067,19 +1775,17 @@ pub fn fmt_time(samples: u64, sr: u32) -> String {
     format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
-fn fmt_ruler(t: f64, step: f64) -> String {
-    let total = t.round() as u64;
-    let (m, s) = (total / 60, total % 60);
-    if step < 1.0 {
-        format!("{}:{:04.1}", (t / 60.0).floor() as u64, t % 60.0)
-    } else if m >= 60 {
-        format!("{}:{:02}:{:02}", m / 60, m % 60, s)
+pub fn fmt_time_short(samples: u64, sr: u32) -> String {
+    let secs = samples / sr.max(1) as u64;
+    let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
     }
 }
 
-fn fmt_khz(sr: u32) -> String {
+pub fn fmt_khz(sr: u32) -> String {
     if sr.is_multiple_of(1000) {
         format!("{}", sr / 1000)
     } else {
@@ -2087,7 +1793,7 @@ fn fmt_khz(sr: u32) -> String {
     }
 }
 
-fn fmt_duration(secs: u64) -> String {
+pub fn fmt_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs / 60) % 60;
     if h > 0 {
@@ -2097,7 +1803,17 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-fn open_in_file_manager(path: &Path) {
+pub fn short(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut x: String = s.chars().take(n.saturating_sub(1)).collect();
+        x.push('…');
+        x
+    }
+}
+
+pub fn open_in_file_manager(path: &Path) {
     #[cfg(target_os = "windows")]
     let cmd = "explorer";
     #[cfg(target_os = "macos")]
@@ -2117,5 +1833,7 @@ mod tests {
         assert_eq!(fmt_khz(44100), "44.1");
         assert_eq!(fmt_khz(48000), "48");
         assert_eq!(fmt_duration(3725), "1 h 02");
+        assert_eq!(fmt_time_short(48000 * 3725, 48000), "1:02:05");
+        assert_eq!(short("abcdef", 4), "abc…");
     }
 }
