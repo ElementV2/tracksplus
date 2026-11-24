@@ -550,6 +550,12 @@ pub fn primary_button(ui: &mut Ui, icon: Option<Icon>, label: &str, enabled: boo
 
 /// Onglets de vue en capitales, soulignés en orange (façon « ARRANGE · MIX »).
 pub fn view_tabs(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
+    view_tabs_rects(ui, value, labels).0
+}
+
+/// Comme `view_tabs`, et retourne aussi la zone de chaque onglet (cibles de dépôt).
+pub fn view_tabs_rects(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool, Vec<Rect>) {
+    let mut rects = Vec::new();
     let mut changed = false;
     ui.spacing_mut().item_spacing.x = 2.0;
     let h = ui.available_height();
@@ -558,6 +564,7 @@ pub fn view_tabs(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
             .painter()
             .layout_no_wrap(l.to_string(), t::semibold(11.0), t::TEXT);
         let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 24.0, h), Sense::click());
+        rects.push(rect);
         let sel = *value == i;
         let p = ui.painter();
         if resp.hovered() && !sel {
@@ -593,7 +600,7 @@ pub fn view_tabs(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
             changed = true;
         }
     }
-    changed
+    (changed, rects)
 }
 
 /// Contrôle segmenté plat (choix exclusif court).

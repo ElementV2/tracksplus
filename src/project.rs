@@ -40,6 +40,12 @@ pub struct Clip {
     /// Longueur totale du fichier source (0 = inconnue : on ne peut pas rallonger).
     #[serde(default)]
     pub src_len: u64,
+    /// Fondu d'entrée (en échantillons depuis le début de la prise).
+    #[serde(default)]
+    pub fade_in: u64,
+    /// Fondu de sortie (en échantillons avant la fin de la prise).
+    #[serde(default)]
+    pub fade_out: u64,
 }
 
 /// Longueur minimale d'une prise après rognage ou coupe (en échantillons).
@@ -58,6 +64,32 @@ impl Clip {
             self.offset + self.len
         }
     }
+
+    /// Garde les fondus dans la longueur de la prise.
+    pub fn clamp_fades(&mut self) {
+        self.fade_in = self.fade_in.min(self.len);
+        self.fade_out = self.fade_out.min(self.len - self.fade_in);
+    }
+
+    /// Gain du fondu à la position `t` (timeline) : courbe en S, 1 hors fondus.
+    pub fn fade_gain(&self, t: u64) -> f32 {
+        let mut g = 1.0f32;
+        let rel = t.saturating_sub(self.start);
+        if rel < self.fade_in {
+            g *= s_curve(rel as f32 / self.fade_in as f32);
+        }
+        let to_end = self.end().saturating_sub(t);
+        if to_end < self.fade_out {
+            g *= s_curve(to_end as f32 / self.fade_out as f32);
+        }
+        g
+    }
+}
+
+/// Courbe de fondu douce (sinus²), sans clic aux extrémités.
+pub fn s_curve(x: f32) -> f32 {
+    let s = (x.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).sin();
+    s * s
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -182,14 +214,19 @@ impl Project {
         }
         let left = pos - c.start;
         t.clips[i].len = left;
-        let right = Clip {
+        t.clips[i].fade_out = 0;
+        t.clips[i].clamp_fades();
+        let mut right = Clip {
             id: new_id,
             file: c.file.clone(),
             start: pos,
             offset: c.offset + left,
             len: c.len - left,
             src_len: c.src_len,
+            fade_in: 0,
+            fade_out: c.fade_out,
         };
+        right.clamp_fades();
         // Juste après la moitié gauche : l'ordre de superposition est conservé.
         t.clips.insert(i + 1, right);
         self.next_id += 1;
@@ -381,6 +418,8 @@ mod tests {
             offset: 0,
             len: 100,
             src_len: 100,
+            fade_in: 0,
+            fade_out: 0,
         });
         p.save().unwrap();
         let q = Project::load(&p.file_path()).unwrap();
@@ -401,6 +440,8 @@ mod tests {
             offset: 0,
             len: 10_000,
             src_len: 10_000,
+            fade_in: 500,
+            fade_out: 800,
         });
         (p, t)
     }
@@ -414,9 +455,30 @@ mod tests {
         assert_eq!((c[0].start, c[0].len), (1000, 3000));
         assert_eq!((c[1].start, c[1].offset, c[1].len), (4000, 3000, 7000));
         assert_eq!(c[1].end(), 11_000);
+        // Les fondus restent aux extrémités d'origine.
+        assert_eq!((c[0].fade_in, c[0].fade_out), (500, 0));
+        assert_eq!((c[1].fade_in, c[1].fade_out), (0, 800));
         // Coupe hors prise ou trop près d'un bord : rien.
         assert!(p.split_at(500, None, None).is_empty());
         assert!(p.split_at(1010, None, None).is_empty());
+    }
+
+    #[test]
+    fn fade_gain_shape() {
+        let c = Clip {
+            id: 1,
+            file: String::new(),
+            start: 100,
+            offset: 0,
+            len: 1000,
+            src_len: 1000,
+            fade_in: 100,
+            fade_out: 200,
+        };
+        assert_eq!(c.fade_gain(100), 0.0);
+        assert!((c.fade_gain(150) - 0.5).abs() < 1e-3);
+        assert_eq!(c.fade_gain(500), 1.0);
+        assert!(c.fade_gain(1099) < 0.01);
     }
 
     #[test]

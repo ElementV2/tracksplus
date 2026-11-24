@@ -244,6 +244,8 @@ mod tests {
                 offset: 0,
                 len: 20000,
                 src_len: 20000,
+                fade_in: 0,
+                fade_out: 0,
             });
             let mut r = TrackRenderer::new(&p, 0);
             let mut out = vec![9.0f32; 3000];

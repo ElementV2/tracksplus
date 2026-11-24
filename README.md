@@ -35,6 +35,10 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   contenu d'une plage de temps. **Magnétisme** sur la tête de lecture, les repères, la sélection
   et les bords des autres prises (Maj pour le désactiver). **Annuler / Rétablir** (Ctrl+Z,
   Ctrl+Maj+Z). Le montage est non destructif : les fichiers enregistrés ne sont jamais modifiés.
+- **Fondus sur les prises** : poignées blanches aux coins supérieurs de chaque prise à tirer
+  pour régler le fondu d'entrée et de sortie (courbe en S, sans clic), ou clic droit →
+  fondus 10 ms / 100 ms / 1 s sur la sélection. Deux prises qui se chevauchent avec un fondu
+  font un fondu enchaîné. Les fondus s'appliquent à l'écoute comme à l'export.
 - **Repères** (touche M, même pendant l'enregistrement) : renommer, supprimer, sélectionner
   jusqu'au repère suivant, flèches ← / → pour sauter de repère en repère.
 - **Export** : pistes **choisies une à une** (ou la sélection de la timeline), toute la
@@ -56,6 +60,12 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 - **Contrôleur USB** : choix du port MIDI (ou tous), **MIDI learn** par pad (notes et CC),
   déclenchement direct dans le thread audio : fonctionne même fenêtre réduite.
   **Touches clavier** assignables par pad (pratique aussi avec un Stream Deck).
+- **LED du contrôleur** : les pads associés en MIDI s'allument (couleur du pad sur Launchpad,
+  pulsation pendant la lecture ; jaune / vert clignotant sur APC mini ; on/off sur les
+  autres). Détection automatique du modèle et de la sortie MIDI correspondante, réglable
+  dans le menu « LED ».
+- **Ranger les pads** : bouton « Déplacer » (ou Alt + glisser) puis glisser un pad sur une
+  autre case (échange si elle est occupée) ou sur un onglet de page pour l'y envoyer.
 - **Sortie dédiée** (ex. sorties 3–4 de la Dante), volume général, vumètre stéréo des pads,
   **Tout arrêter** avec fondu (Échap). Le soundboard est sauvegardé automatiquement et peut
   être enregistré / rechargé comme fichier.

@@ -341,6 +341,8 @@ mod tests {
             offset: 0,
             len: frames as u64,
             src_len: frames as u64,
+            fade_in: 0,
+            fade_out: 0,
         });
         p
     }
@@ -438,6 +440,8 @@ mod range_tests {
                 offset: 0,
                 len: 10000,
                 src_len: 10000,
+                fade_in: 0,
+                fade_out: 0,
             });
         }
         let s = ExportSettings {

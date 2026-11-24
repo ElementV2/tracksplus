@@ -155,6 +155,12 @@ pub struct Board {
     /// Mode des nouveaux pads.
     #[serde(default)]
     pub default_mode: PadMode,
+    /// LED du contrôleur.
+    #[serde(default)]
+    pub led_mode: crate::midi::LedMode,
+    /// Port de sortie des LED (`None` = celui du contrôleur choisi).
+    #[serde(default)]
+    pub led_port: Option<String>,
 }
 
 fn default_panic_fade() -> f64 {
@@ -172,6 +178,8 @@ impl Default for Board {
             panic_fade: 1.0,
             midi_port: None,
             default_mode: PadMode::Toggle,
+            led_mode: crate::midi::LedMode::Auto,
+            led_port: None,
         }
     }
 }

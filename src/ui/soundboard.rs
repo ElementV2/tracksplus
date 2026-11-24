@@ -4,8 +4,9 @@ use super::multitrack::master_panel;
 use super::theme as t;
 use super::widgets::{self as w, BtnStyle, Icon};
 use crate::app::{App, short};
-use crate::midi::{ALL_PORTS, list_ports};
-use crate::sampler::{MAX_PAGES, PadCmd, PadMode, SAMPLE_PEAK, SampleData};
+use crate::midi::{ALL_PORTS, LedMode, LedState, list_out_ports, list_ports};
+use crate::sampler::{MAX_PAGES, PADS_PER_PAGE, PadCmd, PadMode, SAMPLE_PEAK, SampleData};
+use crate::soundboard::MidiKey;
 use crate::soundboard::{Board, LoadState, Pad, Page, is_audio_file};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Key, Rect, Sense, Stroke, StrokeKind, UiBuilder, pos2,
@@ -47,6 +48,25 @@ impl App {
             params,
         });
         self.sb.flash.insert(slot, self.now);
+    }
+
+    /// Déplace un pad vers un autre emplacement (échange s'il est occupé).
+    pub fn move_pad(&mut self, src: u16, dst: u16) {
+        if src == dst {
+            return;
+        }
+        self.engine.pad(PadCmd::Stop { slot: src });
+        self.engine.pad(PadCmd::Stop { slot: dst });
+        let a = self.board.pad(src).cloned();
+        let b = self.board.pad(dst).cloned();
+        self.board.set(dst, a);
+        self.board.set(src, b);
+        if self.sb.selected == Some(src) {
+            self.sb.selected = Some(dst);
+        } else if self.sb.selected == Some(dst) {
+            self.sb.selected = Some(src);
+        }
+        self.board_modified();
     }
 
     pub fn release_pad(&mut self, slot: u16) {
@@ -142,6 +162,26 @@ impl App {
                 }
             }
             self.midi.shared.lock().map = map;
+        }
+        // LED du contrôleur : état de chaque pad associé à un contrôle MIDI.
+        if self.board.led_mode != LedMode::Off {
+            let states: Vec<(MidiKey, LedState)> = self
+                .board
+                .all_pads()
+                .filter_map(|(slot, pad)| {
+                    let k = pad.midi?;
+                    let color = (pad.color as usize % t::PALETTE.len()) as u8;
+                    let st = if self.pad_playing(slot).is_some() {
+                        LedState::Playing(color)
+                    } else if self.cache.get(&pad.path).is_some() {
+                        LedState::Loaded(color)
+                    } else {
+                        LedState::Off
+                    };
+                    Some((k, st))
+                })
+                .collect();
+            self.midi.update_leds(self.board.led_mode, &states);
         }
         let _ = ctx;
     }
@@ -293,9 +333,11 @@ impl App {
             let before = ui.cursor().left();
             ui.scope(|ui| {
                 ui.set_height(full.height());
-                if w::view_tabs(ui, &mut page, &refs) {
+                let (changed, rects) = w::view_tabs_rects(ui, &mut page, &refs);
+                if changed {
                     self.sb.page = page;
                 }
+                self.sb.page_tabs = rects;
             });
             // Menu contextuel de la page active (renommer / supprimer).
             let tabs_rect = Rect::from_min_max(pos2(before, full.top()), pos2(ui.cursor().left(), full.bottom()));
@@ -326,7 +368,14 @@ impl App {
                 self.board_modified();
             }
 
-            ui.add_space(16.0);
+            ui.add_space(12.0);
+            if w::tool_button(ui, Some(Icon::Follow), "Déplacer", self.sb.move_mode, true)
+                .on_hover_text("Glisser les pads pour les ranger (sans les déclencher).\nDépôt sur un pad : échange. Dépôt sur un onglet de page : envoi vers cette page.\nAstuce : Alt + glisser fonctionne aussi hors de ce mode.")
+                .clicked()
+            {
+                self.sb.move_mode = !self.sb.move_mode;
+            }
+            ui.add_space(12.0);
             w::section(ui, "Mode");
             let mut mode = self.page_mode().unwrap_or(self.board.default_mode);
             let mixed = self.page_mode().is_none() && self.board.pages[self.sb.page].pads.iter().flatten().next().is_some();
@@ -497,7 +546,10 @@ impl App {
         combo.response.on_hover_text(tip);
         if let Some(c) = choose {
             self.board.midi_port = c.clone();
+            self.midi.leds_off(self.board.led_mode);
             self.midi.connect(c.as_deref());
+            let led_port = self.board.led_port.clone();
+            self.midi.connect_leds(led_port.as_deref());
             self.board_changed = Some(self.now);
             if let Some(e) = self.midi.error.clone() {
                 self.notify(format!("MIDI : {e}"), true);
@@ -513,6 +565,67 @@ impl App {
                 .font(t::caps(10.0))
                 .color(t::TEXT_3),
         );
+        ui.add_space(6.0);
+        // LED du contrôleur
+        let led_on = self.board.led_mode != LedMode::Off && !self.midi.led_ports().is_empty();
+        let led_label = match self.board.led_mode {
+            LedMode::Off => "LED off".to_string(),
+            _ if self.midi.led_ports().is_empty() => "LED —".to_string(),
+            LedMode::Auto => "LED auto".to_string(),
+            _ => "LED on".to_string(),
+        };
+        let mut led_change: Option<(Option<LedMode>, Option<Option<String>>)> = None;
+        let led_combo = egui::ComboBox::from_id_salt("sb_led")
+            .width(74.0)
+            .selected_text(led_label)
+            .show_ui(ui, |ui| {
+                ui.set_min_width(240.0);
+                w::section(ui, "Allumage des LED");
+                for m in LedMode::ALL {
+                    if ui
+                        .selectable_label(self.board.led_mode == m, m.label())
+                        .clicked()
+                    {
+                        led_change = Some((Some(m), None));
+                    }
+                }
+                ui.separator();
+                w::section(ui, "Sortie MIDI des LED");
+                if ui
+                    .selectable_label(
+                        self.board.led_port.is_none(),
+                        "Même contrôleur que l'entrée",
+                    )
+                    .clicked()
+                {
+                    led_change = Some((None, Some(None)));
+                }
+                for p in list_out_ports() {
+                    if ui
+                        .selectable_label(self.board.led_port.as_deref() == Some(&p), &p)
+                        .clicked()
+                    {
+                        led_change = Some((None, Some(Some(p))));
+                    }
+                }
+            });
+        led_combo.response.on_hover_text(if led_on {
+            format!("LED envoyées à : {}", self.midi.led_ports().join(", "))
+        } else {
+            "Aucune sortie LED : choisissez un contrôleur MIDI, ou sa sortie dans ce menu".into()
+        });
+        if let Some((mode, port)) = led_change {
+            self.midi.leds_off(self.board.led_mode);
+            if let Some(m) = mode {
+                self.board.led_mode = m;
+            }
+            if let Some(p) = port {
+                self.board.led_port = p;
+            }
+            let lp = self.board.led_port.clone();
+            self.midi.connect_leds(lp.as_deref());
+            self.board_changed = Some(self.now);
+        }
         ui.add_space(6.0);
 
         let (c, r) = (self.board.cols, self.board.rows);
@@ -578,6 +691,8 @@ impl App {
         let mut drop_slot = None;
         let mut empty_clicked = None;
         let blocked = self.dialog_open() || ui.ctx().any_popup_open();
+        let moving = self.sb.move_mode || ui.input(|i| i.modifiers.alt);
+        let mut pad_rects: Vec<(u16, Rect)> = Vec::new();
 
         for idx in 0..(cols * rows) {
             let (c, r) = (idx % cols, idx / cols);
@@ -589,6 +704,7 @@ impl App {
                 vec2(pw, ph),
             );
             let slot = Board::slot(page, idx);
+            pad_rects.push((slot, rect));
             let resp = ui.interact(
                 rect,
                 ui.make_persistent_id(("pad", slot)),
@@ -643,10 +759,16 @@ impl App {
             };
 
             // Déclenchement à l'appui (pas au relâchement) pour la réactivité.
+            // En mode « déplacer » (ou avec Alt), l'appui sélectionne seulement.
             if !blocked && press_pos.is_some_and(|p| rect.contains(p)) {
-                self.sb.mouse_down = Some(slot);
                 self.sb.selected = Some(slot);
-                self.press_pad(slot);
+                if !moving {
+                    self.sb.mouse_down = Some(slot);
+                    self.press_pad(slot);
+                }
+            }
+            if moving && resp.drag_started() {
+                self.sb.drag_pad = Some(slot);
             }
             resp.context_menu(|ui| {
                 if ui.button("Remplacer le son…").clicked() {
@@ -832,6 +954,57 @@ impl App {
         if let (Some(slot), true) = (self.sb.mouse_down, primary_released) {
             self.release_pad(slot);
             self.sb.mouse_down = None;
+        }
+        // Déplacement d'un pad : cible survolée, fantôme sous le pointeur, dépôt.
+        if let Some(src) = self.sb.drag_pad {
+            let target =
+                pointer.and_then(|pp| pad_rects.iter().find(|(_, r)| r.contains(pp)).copied());
+            let tab_target =
+                pointer.and_then(|pp| self.sb.page_tabs.iter().position(|r| r.contains(pp)));
+            let p = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::unique("pad_drag"),
+            ));
+            if let Some((s, r)) = target
+                && s != src
+            {
+                p.rect_stroke(r, t::R, Stroke::new(2.0, t::ACCENT), StrokeKind::Inside);
+            }
+            if let Some(i) = tab_target
+                && let Some(r) = self.sb.page_tabs.get(i)
+            {
+                p.rect_stroke(*r, t::R, Stroke::new(1.5, t::ACCENT), StrokeKind::Inside);
+            }
+            if let (Some(pp), Some(pad)) = (pointer, self.board.pad(src)) {
+                let color = t::PALETTE[pad.color as usize % t::PALETTE.len()];
+                let g = p.layout_no_wrap(pad.name.clone(), t::semibold(11.0), Color32::BLACK);
+                let r = Rect::from_min_size(pp + vec2(12.0, 8.0), vec2(g.size().x + 16.0, 22.0));
+                p.rect_filled(r, t::R, color);
+                p.galley(
+                    pos2(r.left() + 8.0, r.center().y - g.size().y / 2.0),
+                    g,
+                    Color32::BLACK,
+                );
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if primary_released {
+                self.sb.drag_pad = None;
+                if let Some((dst, _)) = target.filter(|(d, _)| *d != src) {
+                    self.move_pad(src, dst);
+                } else if let Some(pg) = tab_target.filter(|&pg| pg != self.sb.page) {
+                    let free = (0..PADS_PER_PAGE)
+                        .map(|i| Board::slot(pg, i))
+                        .find(|s| self.board.pad(*s).is_none());
+                    match free {
+                        Some(dst) => {
+                            self.move_pad(src, dst);
+                            let name = self.board.pages[pg].name.clone();
+                            self.notify(format!("Pad envoyé vers « {name} »"), false);
+                        }
+                        None => self.notify("Cette page est pleine", true),
+                    }
+                }
+            }
         }
         if !dropped.is_empty() {
             let target = drop_slot.or_else(|| {

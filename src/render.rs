@@ -222,8 +222,77 @@ impl TrackRenderer {
             src.seek(c.offset + (from - c.start));
             self.tmp.resize(n, 0.0);
             let got = src.read(&mut self.tmp[..n]);
-            out[dst_off..dst_off + got].copy_from_slice(&self.tmp[..got]);
-            out[dst_off + got..dst_off + n].fill(0.0);
+            self.tmp[got..n].fill(0.0);
+            if c.fade_in == 0 && c.fade_out == 0 {
+                out[dst_off..dst_off + n].copy_from_slice(&self.tmp[..n]);
+            } else {
+                // Fondu : la prise recouvre ce qui est dessous en proportion de son gain,
+                // ce qui fait un fondu enchaîné naturel entre prises qui se chevauchent.
+                for k in 0..n {
+                    let g = c.fade_gain(from + k as u64);
+                    let o = &mut out[dst_off + k];
+                    *o = *o * (1.0 - g) + self.tmp[k] * g;
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::{Clip, Project};
+
+    #[test]
+    fn fades_and_crossfade() {
+        let dir = std::env::temp_dir().join(format!("tp-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("F".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        for (name, v) in [("a.wav", 1.0f32), ("b.wav", 0.5)] {
+            let mut w = hound::WavWriter::create(p.audio_dir().join(name), spec).unwrap();
+            for _ in 0..2000 {
+                w.write_sample(v).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let t = p.add_track(None, Some(0));
+        let mk = |id, file: &str, start, fade_in, fade_out| Clip {
+            id,
+            file: file.into(),
+            start,
+            offset: 0,
+            len: 2000,
+            src_len: 2000,
+            fade_in,
+            fade_out,
+        };
+        p.track_mut(t)
+            .unwrap()
+            .clips
+            .push(mk(1, "a.wav", 0, 400, 0));
+        // Prise B par-dessus à partir de 1000, avec un fondu d'entrée de 200 : fondu enchaîné.
+        p.track_mut(t)
+            .unwrap()
+            .clips
+            .push(mk(2, "b.wav", 1000, 200, 0));
+        let mut r = TrackRenderer::new(&p, 0);
+        let mut out = vec![0.0f32; 3000];
+        r.render(0, &mut out);
+        assert_eq!(out[0], 0.0);
+        assert!((out[200] - 0.5).abs() < 0.01, "milieu du fondu d'entrée");
+        assert!((out[800] - 1.0).abs() < 1e-6);
+        assert!(
+            (out[1100] - 0.75).abs() < 0.01,
+            "moitié du fondu enchaîné A→B"
+        );
+        assert!((out[1500] - 0.5).abs() < 1e-6);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

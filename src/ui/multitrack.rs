@@ -7,8 +7,8 @@ use crate::audio;
 use crate::project::{Clip, MIN_CLIP};
 use crate::render::{PEAK_BLOCK, PEAK_L1, Peaks};
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Key, Rect, Sense, Stroke, StrokeKind, UiBuilder, pos2,
-    vec2,
+    self, Align2, Color32, CornerRadius, Key, Mesh, Rect, Sense, Stroke, StrokeKind, UiBuilder,
+    pos2, vec2,
 };
 use std::collections::HashSet;
 
@@ -24,6 +24,8 @@ pub enum DragMode {
     Move,
     TrimLeft,
     TrimRight,
+    FadeIn,
+    FadeOut,
 }
 
 /// Glisser-déposer d'une ou plusieurs prises.
@@ -784,6 +786,23 @@ impl App {
                         c.start = ns as u64;
                         c.offset = (m.offset as i64 + (ns - m.start as i64)) as u64;
                         c.len = m.end() - ns as u64;
+                        c.clamp_fades();
+                    }
+                }
+                DragMode::FadeIn | DragMode::FadeOut => {
+                    let max_in = m.len.saturating_sub(m.fade_out) as i64;
+                    let max_out = m.len.saturating_sub(m.fade_in) as i64;
+                    if let Some((ti, _)) = self.project.find_clip(m.id)
+                        && let Some(c) = self.project.tracks[ti]
+                            .clips
+                            .iter_mut()
+                            .find(|c| c.id == m.id)
+                    {
+                        if drag.mode == DragMode::FadeIn {
+                            c.fade_in = (m.fade_in as i64 + d).clamp(0, max_in) as u64;
+                        } else {
+                            c.fade_out = (m.fade_out as i64 - d).clamp(0, max_out) as u64;
+                        }
                     }
                 }
                 DragMode::TrimRight => {
@@ -800,6 +819,7 @@ impl App {
                             .find(|c| c.id == m.id)
                     {
                         c.len = (ne - m.start as i64) as u64;
+                        c.clamp_fades();
                     }
                 }
             }
@@ -823,9 +843,13 @@ impl App {
             _ => None,
         };
         let unchanged = drag.origs.iter().all(|(_, o)| {
-            self.project
-                .find_clip(o.id)
-                .is_some_and(|(_, c)| c.start == o.start && c.len == o.len && c.offset == o.offset)
+            self.project.find_clip(o.id).is_some_and(|(_, c)| {
+                c.start == o.start
+                    && c.len == o.len
+                    && c.offset == o.offset
+                    && c.fade_in == o.fade_in
+                    && c.fade_out == o.fade_out
+            })
         }) && moved_track.is_none();
         if unchanged {
             self.undo.pop();
@@ -1168,6 +1192,7 @@ impl App {
                         pos2(x1.max(x0 + 2.0), inner.bottom()),
                     );
                     let sel = self.sel_clips.contains(&c.id);
+                    let hov = pointer.is_some_and(|pp| crect.contains(pp));
                     draw_clip(
                         &lp,
                         crect,
@@ -1178,21 +1203,37 @@ impl App {
                         self.view.spp,
                         Some(&c.file),
                         sel,
+                        (c.fade_in, c.fade_out),
+                        (sel || hov) && editable,
                     );
                     let hit = |pp: egui::Pos2| -> Option<(Clip, DragMode)> {
                         if !(crect.contains(pp) && lane.contains(pp)) {
                             return None;
                         }
-                        let mode =
-                            if crect.width() > 3.0 * EDGE_GRAB && pp.x - crect.left() < EDGE_GRAB {
-                                DragMode::TrimLeft
-                            } else if crect.width() > 3.0 * EDGE_GRAB
-                                && crect.right() - pp.x < EDGE_GRAB
-                            {
-                                DragMode::TrimRight
-                            } else {
-                                DragMode::Move
-                            };
+                        // Bandeau du haut : poignées de fondu ; corps : bords = rognage.
+                        let fx_in = crect.left() + (c.fade_in as f64 / self.view.spp) as f32;
+                        let fx_out = crect.right() - (c.fade_out as f64 / self.view.spp) as f32;
+                        let in_head = pp.y < crect.top() + CLIP_HEADER + 1.0;
+                        let mode = if in_head
+                            && (pp.x - fx_in).abs() < EDGE_GRAB
+                            && crect.width() > 3.0 * EDGE_GRAB
+                        {
+                            DragMode::FadeIn
+                        } else if in_head
+                            && (pp.x - fx_out).abs() < EDGE_GRAB
+                            && crect.width() > 3.0 * EDGE_GRAB
+                        {
+                            DragMode::FadeOut
+                        } else if crect.width() > 3.0 * EDGE_GRAB && pp.x - crect.left() < EDGE_GRAB
+                        {
+                            DragMode::TrimLeft
+                        } else if crect.width() > 3.0 * EDGE_GRAB
+                            && crect.right() - pp.x < EDGE_GRAB
+                        {
+                            DragMode::TrimRight
+                        } else {
+                            DragMode::Move
+                        };
                         Some((c.clone(), mode))
                     };
                     // Les prises dessinées ensuite sont au-dessus : la dernière touchée gagne.
@@ -1222,6 +1263,8 @@ impl App {
                         self.view.spp,
                         Some("Enregistrement…"),
                         false,
+                        (0, 0),
+                        false,
                     );
                 }
 
@@ -1233,7 +1276,10 @@ impl App {
                 );
                 if self.clip_drag.is_none() && resp.hovered() && editable {
                     match hovered_clip.as_ref().map(|h| h.1) {
-                        Some(DragMode::TrimLeft) | Some(DragMode::TrimRight) => {
+                        Some(DragMode::TrimLeft)
+                        | Some(DragMode::TrimRight)
+                        | Some(DragMode::FadeIn)
+                        | Some(DragMode::FadeOut) => {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal)
                         }
                         Some(DragMode::Move) => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
@@ -1333,6 +1379,25 @@ impl App {
                             self.split_at_playhead();
                             ui.close();
                         }
+                        ui.separator();
+                        for (label, ms) in [
+                            ("Fondus courts (10 ms)", 10u64),
+                            ("Fondus 100 ms", 100),
+                            ("Fondus 1 s", 1000),
+                        ] {
+                            if ui.add_enabled(editable, egui::Button::new(label)).clicked() {
+                                self.set_clip_fades(Some(ms));
+                                ui.close();
+                            }
+                        }
+                        if ui
+                            .add_enabled(editable, egui::Button::new("Retirer les fondus"))
+                            .clicked()
+                        {
+                            self.set_clip_fades(None);
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui.button("Sélectionner la plage de la prise").clicked() {
                             if let Some((_, cl)) = self.project.find_clip(c) {
                                 self.selection = Some((cl.start, cl.end()));
@@ -1641,6 +1706,8 @@ pub fn draw_clip(
     spp: f64,
     label: Option<&str>,
     selected: bool,
+    fades: (u64, u64),
+    handles: bool,
 ) {
     let cr = CornerRadius::same(t::R);
     let body = if selected {
@@ -1697,6 +1764,56 @@ pub fn draw_clip(
                 Some((mn as f32 / 32767.0, mx as f32 / 32767.0))
             });
             painter.add(egui::Shape::mesh(mesh));
+        }
+    }
+    // Fondus : zone au-dessus de la courbe assombrie, courbe claire, poignées.
+    let body_top = head.bottom();
+    let x_of = |samples: u64| (samples as f64 / spp) as f32;
+    let fi_x = rect.left() + x_of(fades.0);
+    let fo_x = rect.right() - x_of(fades.1);
+    let h = rect.bottom() - body_top;
+    let mut shade = Mesh::default();
+    let mut draw_fade = |x0: f32, x1: f32, rising: bool| {
+        if x1 - x0 < 1.0 {
+            return;
+        }
+        let mut pts = Vec::new();
+        let n = ((x1 - x0) as usize).clamp(2, 400);
+        for k in 0..=n {
+            let u = k as f32 / n as f32;
+            let g = crate::project::s_curve(if rising { u } else { 1.0 - u });
+            let x = x0 + (x1 - x0) * u;
+            let y = rect.bottom() - g * h;
+            pts.push(pos2(x, y));
+            if k > 0 && x >= visible.left() && x <= visible.right() {
+                shade.add_colored_rect(
+                    Rect::from_min_max(pos2(x - (x1 - x0) / n as f32, body_top), pos2(x, y)),
+                    Color32::from_black_alpha(120),
+                );
+            }
+        }
+        painter.add(egui::Shape::line(
+            pts,
+            Stroke::new(1.0, Color32::from_white_alpha(170)),
+        ));
+    };
+    if fades.0 > 0 {
+        draw_fade(rect.left(), fi_x, true);
+    }
+    if fades.1 > 0 {
+        draw_fade(fo_x, rect.right(), false);
+    }
+    painter.add(egui::Shape::mesh(shade));
+    if handles && rect.width() > 3.0 * EDGE_GRAB {
+        for x in [fi_x.max(rect.left() + 3.0), fo_x.min(rect.right() - 3.0)] {
+            let r = Rect::from_center_size(pos2(x, head.center().y), vec2(7.0, 7.0));
+            painter.rect_filled(r, 1.0, Color32::WHITE);
+            painter.rect_stroke(
+                r,
+                1.0,
+                Stroke::new(1.0, Color32::BLACK),
+                StrokeKind::Outside,
+            );
         }
     }
     if selected {

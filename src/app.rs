@@ -12,7 +12,7 @@ use crate::sampler::PadCmd;
 use crate::soundboard::{Board, SampleCache, db_to_gain};
 use crate::ui::theme as t;
 use crate::ui::widgets::{self as w, BtnStyle, Icon, MeterState};
-use eframe::egui::{self, Align2, Color32, Key, vec2};
+use eframe::egui::{self, Align2, Color32, Key, Rect, vec2};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -124,6 +124,12 @@ pub struct SbState {
     pub midi_last: Option<String>,
     pub midi_dirty: bool,
     pub flash: HashMap<u16, f64>,
+    /// Mode « déplacer » : les pads se glissent au lieu de se déclencher.
+    pub move_mode: bool,
+    /// Pad en cours de déplacement.
+    pub drag_pad: Option<u16>,
+    /// Zones des onglets de page (cibles de dépôt d'un pad).
+    pub page_tabs: Vec<Rect>,
 }
 
 pub struct App {
@@ -255,6 +261,8 @@ impl App {
         app.midi.shared.lock().ctx = Some(cc.egui_ctx.clone());
         let port = app.board.midi_port.clone();
         app.midi.connect(port.as_deref());
+        let led_port = app.board.led_port.clone();
+        app.midi.connect_leds(led_port.as_deref());
         app.sync_engine_to_board();
         let paths: Vec<PathBuf> = app.board.all_pads().map(|(_, p)| p.path.clone()).collect();
         for p in paths {
@@ -490,6 +498,8 @@ impl App {
                             offset: 0,
                             len: r.frames,
                             src_len: r.frames,
+                            fade_in: 0,
+                            fade_out: 0,
                         });
                     }
                 }
@@ -658,6 +668,26 @@ impl App {
         // La sélection suit la partie droite (pratique pour supprimer la fin).
         if !self.sel_clips.is_empty() {
             self.sel_clips = pairs.iter().map(|p| p.1).collect();
+        }
+        self.edited();
+    }
+
+    /// Fondus d'entrée et de sortie identiques sur les prises sélectionnées (`None` = retirer).
+    pub fn set_clip_fades(&mut self, ms: Option<u64>) {
+        if self.sel_clips.is_empty() || self.is_recording() {
+            return;
+        }
+        self.checkpoint();
+        let len = ms.map_or(0, |ms| self.sr() as u64 * ms / 1000);
+        for tr in &mut self.project.tracks {
+            for c in tr
+                .clips
+                .iter_mut()
+                .filter(|c| self.sel_clips.contains(&c.id))
+            {
+                c.fade_in = len.min(c.len / 2);
+                c.fade_out = len.min(c.len / 2);
+            }
         }
         self.edited();
     }
@@ -1332,6 +1362,8 @@ impl App {
                     }
                     let port = self.board.midi_port.clone();
                     self.midi.connect(port.as_deref());
+                    let led_port = self.board.led_port.clone();
+                    self.midi.connect_leds(led_port.as_deref());
                     self.sync_engine_to_board();
                 }
                 Err(e) => self.notify(format!("{e:#}"), true),
@@ -2027,6 +2059,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.midi.leds_off(self.board.led_mode);
         self.stop();
         self.autosave();
         self.board_changed = Some(0.0);
