@@ -50,6 +50,9 @@ pub fn fmt_db(db: f32) -> String {
     }
 }
 
+/// Vitesse de retour des vumètres (dB par seconde).
+pub const METER_FALL_DB_S: f32 = 24.0;
+
 /// État d'affichage d'un vumètre : chute progressive, crête maintenue, saturation.
 #[derive(Clone, Copy, Default)]
 pub struct MeterState {
@@ -66,15 +69,18 @@ pub struct MeterState {
 
 impl MeterState {
     /// `peak` = crête mesurée depuis la dernière image.
+    /// `dt` = temps réel écoulé depuis la mise à jour précédente (s).
     pub fn update(&mut self, peak: f32, now: f64, dt: f32) {
-        // Retour : 13,3 dB/s environ (IEC type II).
-        let fall = 10f32.powf(-13.3 * dt / 20.0);
+        // Balistique de crête numérique (consoles, stations audio) : attaque instantanée
+        // (crête lue depuis le dernier affichage, rien n'est manqué), retour 24 dB/s.
+        let fall = 10f32.powf(-METER_FALL_DB_S * dt / 20.0);
         self.level = peak.max(self.level * fall);
+        // Maintien de crête 1,5 s, puis retombée rapide.
         if peak >= self.hold {
             self.hold = peak;
-            self.hold_until = now + 1.8;
+            self.hold_until = now + 1.5;
         } else if now > self.hold_until {
-            self.hold *= 10f32.powf(-20.0 * dt / 20.0);
+            self.hold *= 10f32.powf(-48.0 * dt / 20.0);
         }
         self.max = self.max.max(peak);
         if peak >= 0.999 {
@@ -247,10 +253,11 @@ pub enum Icon {
     Speaker,
     Split,
     Snap,
-    Hold,
     Undo,
     /// Réglages (curseurs).
     Settings,
+    /// Casque (monitoring direct).
+    Headphones,
 }
 
 pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
@@ -392,19 +399,24 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
             p.line_segment([c + vec2(-r, 0.05 * s), c + vec2(-r, -0.75 * s)], w);
             p.line_segment([c + vec2(r, 0.05 * s), c + vec2(r, -0.75 * s)], w);
         }
-        Icon::Hold => {
-            p.rect_filled(
-                Rect::from_center_size(c + vec2(0.0, -0.55) * s, vec2(1.3, 0.22) * s),
-                0.0,
-                col,
-            );
-            p.line_segment([c + vec2(0.0, -0.3) * s, c + vec2(0.0, 0.5) * s], st);
-            let pts = vec![
-                c + vec2(-0.35, 0.3) * s,
-                c + vec2(0.35, 0.3) * s,
-                c + vec2(0.0, 0.8) * s,
-            ];
-            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
+        Icon::Headphones => {
+            // Arceau en demi-cercle et deux écouteurs.
+            let r = 0.62 * s;
+            let cy = c.y + 0.1 * s;
+            let pts: Vec<Pos2> = (0..=12)
+                .map(|k| {
+                    let a = std::f32::consts::PI * (1.0 + k as f32 / 12.0);
+                    pos2(c.x + r * a.cos(), cy + r * a.sin())
+                })
+                .collect();
+            p.add(Shape::line(pts, st));
+            for x in [c.x - r, c.x + r] {
+                p.rect_filled(
+                    Rect::from_center_size(pos2(x, cy + 0.32 * s), vec2(0.42 * s, 0.7 * s)),
+                    CornerRadius::same(1),
+                    col,
+                );
+            }
         }
         Icon::Settings => {
             // Trois curseurs horizontaux avec leur bouton, décalés.
@@ -778,6 +790,42 @@ pub fn tag_button(
     resp
 }
 
+/// Petit bouton carré à icône, même gabarit que `tag_button` (M, S…).
+pub fn icon_tag_button(
+    ui: &mut Ui,
+    icon: Icon,
+    on: bool,
+    on_color: Color32,
+    enabled: bool,
+    tip: &str,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(20.0, 18.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let resp = resp.on_hover_text(tip);
+    let hovered = resp.hovered() && enabled;
+    let (bg, fg) = if on {
+        (on_color, Color32::BLACK)
+    } else {
+        (if hovered { t::SURFACE_4 } else { t::SURFACE_3 }, t::TEXT_2)
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(t::R), bg);
+    paint_icon(
+        p,
+        icon,
+        rect.center(),
+        6.0,
+        if enabled { fg } else { t::TEXT_3 },
+    );
+    resp
+}
+
 /// Bouton d'armement d'une piste (carré, pastille rouge).
 pub fn arm_button(ui: &mut Ui, armed: bool, enabled: bool, bright: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(
@@ -899,6 +947,23 @@ pub fn vline(p: &Painter, x: f32, y0: f32, y1: f32, c: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retour du vumètre : 24 dB en 1 s, quelle que soit la cadence d'affichage.
+    #[test]
+    fn meter_fall_independent_of_frame_rate() {
+        for fps in [30usize, 60, 144] {
+            let mut m = MeterState::default();
+            let dt = 1.0 / fps as f32;
+            m.update(1.0, 0.0, dt);
+            for k in 1..=fps {
+                m.update(0.0, k as f64 * dt as f64, dt);
+            }
+            let db = to_db(m.level);
+            assert!((db + 24.0).abs() < 0.1, "{fps} img/s : {db} dB");
+            // Maintien de crête encore à 0 dB juste avant 1,5 s.
+            assert!((to_db(m.hold)).abs() < 0.01);
+        }
+    }
 
     #[test]
     fn deflection_is_monotonic() {

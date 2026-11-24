@@ -32,9 +32,43 @@ pub struct AudioPrefs {
     /// Premier canal de sortie (0-based) de la paire stéréo d'écoute.
     #[serde(default)]
     pub out_left: u16,
+    /// Sortie du soundboard (`None` = même périphérique que l'écoute multipiste).
+    #[serde(default)]
+    pub pad_output: Option<String>,
+    /// Premier canal de la paire du soundboard.
+    #[serde(default)]
+    pub pad_left: u16,
+    /// Sortie du monitoring direct des entrées (`None` = même périphérique que l'écoute).
+    #[serde(default)]
+    pub monitor_output: Option<String>,
+    /// Premier canal de la paire de monitoring.
+    #[serde(default)]
+    pub monitor_left: u16,
 }
 
 impl AudioPrefs {
+    /// Sortie du soundboard pour le moteur.
+    /// « Comme le multipiste » (`None`) : même périphérique et même paire que l'écoute.
+    pub fn pad_out(&self) -> PadOut {
+        PadOut {
+            device: self.pad_output.clone(),
+            left: if self.pad_output.is_some() {
+                self.pad_left
+            } else {
+                self.out_left
+            },
+        }
+    }
+
+    /// Paire de monitoring ; « Comme le multipiste » suit la paire de l'écoute.
+    pub fn monitor_pair(&self) -> u16 {
+        if self.monitor_output.is_some() {
+            self.monitor_left
+        } else {
+            self.out_left
+        }
+    }
+
     fn path() -> Option<std::path::PathBuf> {
         dirs::config_dir().map(|d| d.join("TracksPlus").join("audio.json"))
     }
@@ -186,6 +220,13 @@ pub struct Shared {
     pub master_play: [AtomicU32; 2],
     /// Crêtes L/R du soundboard (bits f32).
     pub master_pad: [AtomicU32; 2],
+    /// Crêtes L/R du monitoring direct des entrées (bits f32).
+    pub master_mon: [AtomicU32; 2],
+    /// Monitoring direct, par canal d'entrée : 0 = non écouté, 1 = au centre (piste mono),
+    /// 2 = à gauche, 3 = à droite (piste stéréo).
+    pub monitor: Vec<std::sync::atomic::AtomicU8>,
+    /// Au moins un canal est écouté (évite tout calcul sinon).
+    pub monitor_on: AtomicBool,
     /// Position de lecture de chaque pad (+1, 0 = arrêté).
     pub pad_pos: Vec<AtomicU64>,
 }
@@ -205,6 +246,11 @@ impl Shared {
             last_error: Mutex::new(None),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
+            master_mon: [AtomicU32::new(0), AtomicU32::new(0)],
+            monitor: (0..MAX_INPUTS)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
+            monitor_on: AtomicBool::new(false),
             pad_pos: (0..MAX_PADS).map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -287,6 +333,10 @@ pub struct EngineStatus {
     pub pad_output: Option<String>,
     /// Canaux du périphérique où joue le soundboard.
     pub pad_out_channels: u16,
+    /// Sortie du monitoring quand elle est sur un périphérique à part.
+    pub monitor_output: Option<String>,
+    /// Le monitoring a bien une sortie active.
+    pub monitor_ok: bool,
     pub buffer: Option<u32>,
     pub in_format: Option<SampleFormat>,
 }
@@ -306,6 +356,8 @@ pub struct Engine {
     _output: Option<cpal::Stream>,
     /// Second flux de sortie, seulement si le soundboard joue sur un autre périphérique.
     _pad_output: Option<cpal::Stream>,
+    /// Flux de sortie dédié au monitoring, s'il est sur un périphérique à part.
+    _mon_output: Option<cpal::Stream>,
     in_tx: Option<Sender<InCmd>>,
     out_tx: Option<Sender<OutCmd>>,
     /// Commandes du soundboard (clonable pour le thread MIDI).
@@ -331,6 +383,7 @@ impl Engine {
             _input: None,
             _output: None,
             _pad_output: None,
+            _mon_output: None,
             in_tx: None,
             out_tx: None,
             pad_tx: None,
@@ -368,12 +421,6 @@ impl Engine {
         };
         let in_dev = find(&prefs.input, true);
         let out_dev = find(&prefs.output, false);
-        if in_dev.is_none() && out_dev.is_none() {
-            bail!("Aucune carte son trouvée sur le pilote {host_name}");
-        }
-        if let (Some(name), None) = (&prefs.input, &in_dev) {
-            bail!("Entrée « {name} » introuvable (carte débranchée ?)");
-        }
 
         // Fréquence : celle demandée, sinon celle par défaut de l'entrée.
         let sample_rate = prefs
@@ -407,6 +454,12 @@ impl Engine {
             ..Default::default()
         };
 
+        // Monitoring direct : l'entrée envoie le mix stéréo des canaux écoutés vers la
+        // sortie de monitoring par un ring buffer (aucune allocation dans les callbacks).
+        let (mon_prod, mon_cons) = rtrb::RingBuffer::<f32>::new(MON_RING * 2);
+        let mut mon_prod = Some(mon_prod);
+        let mut mon_cons = Some(mon_cons);
+
         let mut input = None;
         let mut in_tx = None;
         if let Some(dev) = &in_dev {
@@ -423,6 +476,7 @@ impl Engine {
                 targets: Vec::with_capacity(MAX_INPUTS),
                 garbage: in_garbage_tx,
                 shared: shared.clone(),
+                monitor: mon_prod.take(),
             };
             let stream = match fmt {
                 SampleFormat::F32 => build_input::<f32>(dev, cfg, st),
@@ -461,6 +515,31 @@ impl Engine {
             }
             None => None,
         };
+        // Monitoring : sur le flux d'écoute, sur celui du soundboard, ou sur un flux à part.
+        let pad_name = pad_dev.as_ref().map(|d| d.to_string());
+        let mon_name = prefs.monitor_output.clone().or_else(|| out_name.clone());
+        let mon_on_main = mon_name == out_name;
+        let mon_on_pads = !mon_on_main && pad_name.is_some() && mon_name == pad_name;
+        let mon_dev = match (&mon_name, mon_on_main || mon_on_pads) {
+            (Some(n), false) => {
+                let d = host
+                    .output_devices()
+                    .ok()
+                    .and_then(|mut it| it.find(|d| &d.to_string() == n));
+                if d.is_none() {
+                    *shared.last_error.lock() =
+                        Some(format!("Sortie monitoring « {n} » introuvable"));
+                }
+                d
+            }
+            _ => None,
+        };
+        let mon_left = prefs.monitor_pair() as usize;
+        let main_mon = if mon_on_main { mon_cons.take() } else { None };
+        let pads_mon = if mon_on_pads { mon_cons.take() } else { None };
+        let main_has_mon = main_mon.is_some();
+        let pads_has_mon = pads_mon.is_some();
+
         // Les commandes des pads vont au flux qui porte le soundboard ; l'autre reçoit un
         // canal vide (son lecteur de pads reste muet).
         let (ptx, prx) = bounded(256);
@@ -489,6 +568,7 @@ impl Engine {
                     sh,
                     Sampler::new(main_pads, sgt, (pad.left as usize).min(last), sample_rate),
                 )
+                .with_monitor(main_mon, mon_left)
             });
             match res {
                 Ok((s, channels)) => {
@@ -498,6 +578,7 @@ impl Engine {
                     output = Some(s);
                     out_tx = Some(tx);
                     pads_ok = sep_pads.is_none();
+                    status.monitor_ok |= main_has_mon;
                 }
                 Err(e) => *shared.last_error.lock() = Some(format!("Sortie : {e:#}")),
             }
@@ -505,6 +586,8 @@ impl Engine {
         let mut pad_output = None;
         if let (Some(dev), Some(prx)) = (&pad_dev, sep_pads) {
             let sh = shared.clone();
+            let gt = garbage_tx.clone();
+            let sgt = sample_garbage_tx.clone();
             let res = start_output(dev, sample_rate, buffer, move |channels| {
                 let last = channels.saturating_sub(1) as usize;
                 // Pas de lecture multipiste sur ce flux : canal de commandes vide.
@@ -512,15 +595,11 @@ impl Engine {
                     channels as usize,
                     0,
                     bounded::<OutCmd>(1).1,
-                    garbage_tx,
+                    gt,
                     sh,
-                    Sampler::new(
-                        prx,
-                        sample_garbage_tx,
-                        (pad.left as usize).min(last),
-                        sample_rate,
-                    ),
+                    Sampler::new(prx, sgt, (pad.left as usize).min(last), sample_rate),
                 )
+                .with_monitor(pads_mon, mon_left)
             });
             match res {
                 Ok((s, channels)) => {
@@ -528,12 +607,38 @@ impl Engine {
                     status.pad_out_channels = channels;
                     pad_output = Some(s);
                     pads_ok = true;
+                    status.monitor_ok |= pads_has_mon;
                 }
                 Err(e) => *shared.last_error.lock() = Some(format!("Sortie soundboard : {e:#}")),
             }
         }
         if pads_ok {
             pad_tx = Some(ptx);
+        }
+        let mut mon_output = None;
+        if let (Some(dev), Some(cons)) = (&mon_dev, mon_cons.take()) {
+            let sh = shared.clone();
+            let gt = garbage_tx.clone();
+            let res = start_output(dev, sample_rate, buffer, move |channels| {
+                // Flux sans lecture ni pads : canaux de commandes vides.
+                OutState::new(
+                    channels as usize,
+                    0,
+                    bounded::<OutCmd>(1).1,
+                    gt,
+                    sh,
+                    Sampler::new(bounded::<PadCmd>(1).1, sample_garbage_tx, 0, sample_rate),
+                )
+                .with_monitor(Some(cons), mon_left)
+            });
+            match res {
+                Ok((s, _)) => {
+                    status.monitor_output = Some(dev.to_string());
+                    status.monitor_ok = true;
+                    mon_output = Some(s);
+                }
+                Err(e) => *shared.last_error.lock() = Some(format!("Sortie monitoring : {e:#}")),
+            }
         }
 
         Ok(Self {
@@ -542,6 +647,7 @@ impl Engine {
             _input: input,
             _output: output,
             _pad_output: pad_output,
+            _mon_output: mon_output,
             in_tx,
             out_tx,
             pad_tx,
@@ -663,6 +769,8 @@ struct InState {
     /// Les listes de cibles remplacées sont rendues à l'interface pour y être libérées.
     garbage: Sender<Vec<RecTarget>>,
     shared: Arc<Shared>,
+    /// Vers la sortie de monitoring (mix stéréo entrelacé des canaux écoutés).
+    monitor: Option<Producer<f32>>,
 }
 
 impl InState {
@@ -710,6 +818,42 @@ where
                     peak = peak.max(data[f * ch + c].to_sample::<f32>().abs());
                 }
                 sh.meters[c].fetch_max(peak.to_bits(), Ordering::Relaxed);
+            }
+
+            // Monitoring direct : mix stéréo des canaux écoutés vers la sortie.
+            if sh.monitor_on.load(Ordering::Relaxed)
+                && let Some(mp) = st.monitor.as_mut()
+            {
+                // Canaux écoutés, relevés une fois par bloc (tableau sur la pile).
+                let mut act = [(0usize, 0u8); MAX_INPUTS];
+                let mut na = 0;
+                for c in 0..ch.min(MAX_INPUTS) {
+                    let m = sh.monitor[c].load(Ordering::Relaxed);
+                    if m != 0 {
+                        act[na] = (c, m);
+                        na += 1;
+                    }
+                }
+                let n = frames.min(mp.slots() / 2);
+                if n > 0
+                    && let Ok(chunk) = mp.write_chunk_uninit(n * 2)
+                {
+                    chunk.fill_from_iter((0..n).flat_map(|f| {
+                        let (mut l, mut r) = (0f32, 0f32);
+                        for &(c, m) in &act[..na] {
+                            let s = data[f * ch + c].to_sample::<f32>();
+                            match m {
+                                2 => l += s,
+                                3 => r += s,
+                                _ => {
+                                    l += s;
+                                    r += s;
+                                }
+                            }
+                        }
+                        [l, r]
+                    }));
+                }
             }
 
             if !st.targets.is_empty() {
@@ -768,6 +912,8 @@ fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize, usize) -
 }
 
 const MAX_BLOCK: usize = 4096;
+/// Capacité du tampon de monitoring (trames stéréo).
+const MON_RING: usize = 16384;
 
 struct OutState {
     channels: usize,
@@ -780,6 +926,137 @@ struct OutState {
     mix: Vec<f32>,
     play: Vec<f32>,
     pads: Vec<f32>,
+    /// Monitoring direct des entrées joué par ce flux.
+    monitor: Option<MonitorOut>,
+    mon: Vec<f32>,
+}
+
+/// Réception du monitoring dans un flux de sortie.
+struct MonitorOut {
+    cons: Consumer<f32>,
+    left: usize,
+    /// Le tampon a assez d'avance pour jouer sans trou.
+    primed: bool,
+    /// Réserve moyenne (trames), lissée : sert à compenser la dérive des horloges.
+    avg: f32,
+    /// Fondu d'entrée à appliquer au prochain bloc (reprise après un trou).
+    fade_in: bool,
+    /// Bloc lu avant ré-échantillonnage (alloué hors du thread audio).
+    tmp: Vec<f32>,
+}
+
+/// Fondu appliqué autour d'un trou de monitoring (trames).
+const MON_FADE: usize = 64;
+
+impl MonitorOut {
+    fn new(cons: Consumer<f32>, left: usize) -> Self {
+        Self {
+            cons,
+            left,
+            primed: false,
+            avg: 0.0,
+            fade_in: false,
+            tmp: vec![0.0; (MAX_BLOCK + 2) * 2],
+        }
+    }
+
+    /// Remplit `out` (`frames` trames stéréo entrelacées) avec le monitoring.
+    /// `in_block` = taille des paquets livrés par l'entrée.
+    ///
+    /// L'entrée et la sortie n'ont pas la même horloge et livrent par paquets, parfois
+    /// par rafales : on garde une réserve d'environ deux paquets, et on ramène doucement
+    /// la réserve vers cette cible en lisant un échantillon de plus ou de moins par bloc,
+    /// ré-échantillonné (inaudible, 0,2 % au plus). Jamais de saut ni de coupure sèche.
+    fn render(&mut self, out: &mut [f32], frames: usize, in_block: usize) {
+        out.fill(0.0);
+        if frames == 0 {
+            return;
+        }
+        let blk = frames.max(in_block).max(32);
+        let target = 2 * blk + 64;
+        let mut avail = self.cons.slots() / 2;
+        // Énorme avance (après un blocage du système) : retour à la cible d'un coup,
+        // avec un fondu d'entrée. Rare.
+        if avail > target * 4 + frames {
+            let skip = avail - target;
+            if let Ok(c) = self.cons.read_chunk(skip * 2) {
+                c.commit_all();
+            }
+            avail = target;
+            self.avg = target as f32;
+            self.fade_in = true;
+        }
+        if !self.primed {
+            if avail < target {
+                return;
+            }
+            self.primed = true;
+            self.fade_in = true;
+            self.avg = avail as f32;
+        }
+        if avail < frames {
+            // Trou inévitable : on joue la fin de la réserve en fondu de sortie, puis on
+            // attend qu'elle se reconstitue (pas de coupure sèche, donc pas de clic).
+            if let Ok(chunk) = self.cons.read_chunk(avail * 2) {
+                let (a, b) = chunk.as_slices();
+                out[..a.len()].copy_from_slice(a);
+                out[a.len()..a.len() + b.len()].copy_from_slice(b);
+                chunk.commit_all();
+            }
+            let n = MON_FADE.min(avail);
+            for k in 0..n {
+                let g = (n - k) as f32 / (n + 1) as f32;
+                let f = avail - n + k;
+                out[f * 2] *= g;
+                out[f * 2 + 1] *= g;
+            }
+            self.primed = false;
+            return;
+        }
+        // Dérive : réserve moyenne au-dessus de la cible → lire un échantillon de plus ;
+        // en dessous → un de moins. Zone morte d'un quart de paquet (pas d'oscillation).
+        self.avg += (avail as f32 - self.avg) * 0.05;
+        let dead = (blk / 4) as f32;
+        let take = if self.avg > target as f32 + dead && avail > frames {
+            frames + 1
+        } else if self.avg < target as f32 - dead && frames > 2 {
+            frames - 1
+        } else {
+            frames
+        }
+        .min(avail);
+        let tmp = &mut self.tmp[..take * 2];
+        if let Ok(chunk) = self.cons.read_chunk(take * 2) {
+            let (a, b) = chunk.as_slices();
+            tmp[..a.len()].copy_from_slice(a);
+            tmp[a.len()..a.len() + b.len()].copy_from_slice(b);
+            chunk.commit_all();
+        }
+        if take == frames {
+            out[..frames * 2].copy_from_slice(tmp);
+        } else {
+            // Ré-échantillonnage linéaire de `take` trames vers `frames` trames.
+            let ratio = (take - 1) as f32 / (frames - 1).max(1) as f32;
+            for j in 0..frames {
+                let pos = j as f32 * ratio;
+                let i0 = (pos as usize).min(take - 1);
+                let i1 = (i0 + 1).min(take - 1);
+                let fr = pos - i0 as f32;
+                for c in 0..2 {
+                    out[j * 2 + c] = tmp[i0 * 2 + c] * (1.0 - fr) + tmp[i1 * 2 + c] * fr;
+                }
+            }
+        }
+        if self.fade_in {
+            self.fade_in = false;
+            let n = MON_FADE.min(frames);
+            for k in 0..n {
+                let g = (k + 1) as f32 / (n + 1) as f32;
+                out[k * 2] *= g;
+                out[k * 2 + 1] *= g;
+            }
+        }
+    }
 }
 
 impl OutState {
@@ -802,7 +1079,16 @@ impl OutState {
             mix: vec![0.0; MAX_BLOCK * channels],
             play: vec![0.0; MAX_BLOCK * 2],
             pads: vec![0.0; MAX_BLOCK * 2],
+            monitor: None,
+            mon: vec![0.0; MAX_BLOCK * 2],
         }
+    }
+
+    /// Ce flux joue aussi le monitoring, sur la paire `left`, `left + 1`.
+    fn with_monitor(mut self, cons: Option<Consumer<f32>>, left: usize) -> Self {
+        let last = self.channels.saturating_sub(1);
+        self.monitor = cons.map(|cons| MonitorOut::new(cons, left.min(last)));
+        self
     }
 
     fn release(&mut self) {
@@ -858,6 +1144,15 @@ impl OutState {
         };
         route(mix, play, self.left, &sh.master_play);
         route(mix, pads, self.sampler.left, &sh.master_pad);
+
+        // Monitoring direct : latence courte, sans trous ni sauts (voir MonitorOut).
+        if let Some(m) = self.monitor.as_mut() {
+            let in_block = sh.in_block.load(Ordering::Relaxed) as usize;
+            m.render(&mut self.mon[..frames * 2], frames, in_block);
+            let left = m.left;
+            let mon = &self.mon[..frames * 2];
+            route(mix, mon, left, &sh.master_mon);
+        }
     }
 }
 
@@ -956,6 +1251,95 @@ mod tests {
         assert!(got[80..100].iter().all(|&x| x == 2.0));
         assert!(got[100..130].iter().all(|&x| x == 0.0));
         assert!(got[130..].iter().all(|&x| x == 3.0));
+    }
+
+    fn monitor_state(channels: usize, left: usize) -> (OutState, Producer<f32>) {
+        let (prod, cons) = rtrb::RingBuffer::new(MON_RING * 2);
+        let (gt, _gr) = bounded(1);
+        let (sgt, _sgr) = bounded(1);
+        let st = OutState::new(
+            channels,
+            0,
+            bounded::<OutCmd>(1).1,
+            gt,
+            Arc::new(Shared::new()),
+            Sampler::new(bounded::<PadCmd>(1).1, sgt, 0, 48000),
+        )
+        .with_monitor(Some(cons), left);
+        (st, prod)
+    }
+
+    /// Monitoring : le mix stéréo arrive sur la paire choisie, sans trou au démarrage.
+    #[test]
+    fn monitor_routes_to_its_pair() {
+        let (mut st, mut prod) = monitor_state(4, 2);
+        // Pas encore assez de réserve : silence.
+        for _ in 0..100 {
+            prod.push(0.5).unwrap();
+            prod.push(-0.25).unwrap();
+        }
+        st.process(128);
+        assert!(st.mix[..128 * 4].iter().all(|&x| x == 0.0));
+        for _ in 0..400 {
+            prod.push(0.5).unwrap();
+            prod.push(-0.25).unwrap();
+        }
+        st.process(128);
+        // Après le fondu d'entrée, le signal est intact, sur les sorties 3-4.
+        let f: Vec<&[f32]> = st.mix[..128 * 4].chunks(4).collect();
+        assert!(
+            f[MON_FADE..].iter().all(|fr| fr == &[0.0, 0.0, 0.5, -0.25]),
+            "{:?}",
+            f[100]
+        );
+    }
+
+    /// Simulation : l'entrée livre des paquets de 480 trames, parfois par rafales, et son
+    /// horloge dérive par rapport à la sortie (dans un sens puis dans l'autre). Aucun trou,
+    /// aucun saut, et une latence qui reste bornée.
+    #[test]
+    fn monitor_survives_jitter_and_drift() {
+        for drift in [-1i64, 1] {
+            let mut m = {
+                let (prod, cons) = rtrb::RingBuffer::new(MON_RING * 2);
+                (MonitorOut::new(cons, 0), prod)
+            };
+            let (mon, prod) = (&mut m.0, &mut m.1);
+            let mut out = vec![0.0f32; 480 * 2];
+            let mut next = 0u64; // valeur du prochain échantillon (rampe)
+            let mut played = Vec::new();
+            for call in 0..3000u64 {
+                // Rafales : deux paquets d'un coup un appel sur trois, rien au suivant.
+                let packets = match call % 3 {
+                    0 => 2,
+                    1 => 0,
+                    _ => 1,
+                };
+                for _ in 0..packets {
+                    // Dérive : un échantillon de plus (ou de moins) tous les 20 paquets.
+                    let extra = if call % 20 == 0 { drift } else { 0 };
+                    for _ in 0..(480 + extra) {
+                        // Rampe de 0,1 à 1,1, jamais nulle : un zéro joué serait un trou.
+                        let v = 0.1 + (next % 100_000) as f32 * 1e-5;
+                        prod.push(v).unwrap();
+                        prod.push(v).unwrap();
+                        next += 1;
+                    }
+                }
+                mon.render(&mut out, 480, 480);
+                if call > 20 {
+                    played.extend(out.iter().step_by(2).copied());
+                    assert!(mon.cons.slots() / 2 < 4 * 1024, "latence qui grandit");
+                }
+            }
+            // Pas de trou : jamais de zéro une fois lancé.
+            let holes = played.iter().filter(|&&v| v == 0.0).count();
+            assert!(holes == 0, "dérive {drift} : {holes} trous");
+            // Pas de saut : des échantillons perdus feraient avancer la rampe d'un coup.
+            // (Les retours au début de la rampe, vers le bas, ne comptent pas.)
+            let jumps = played.windows(2).filter(|w| w[1] - w[0] > 3e-5).count();
+            assert!(jumps == 0, "dérive {drift} : {jumps} sauts");
+        }
     }
 
     /// Les décrochages du pilote ne comptent que pendant une prise ou une lecture.

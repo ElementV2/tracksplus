@@ -107,6 +107,10 @@ pub struct Track {
     pub mute: bool,
     #[serde(default)]
     pub solo: bool,
+    /// Monitoring direct : l'entrée de la piste est envoyée en temps réel sur la sortie
+    /// de monitoring.
+    #[serde(default)]
+    pub monitor: bool,
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
     pub clips: Vec<Clip>,
 }
@@ -211,6 +215,7 @@ impl Project {
             armed: input.is_some(),
             mute: false,
             solo: false,
+            monitor: false,
             clips: Vec::new(),
         });
         self.dirty = true;

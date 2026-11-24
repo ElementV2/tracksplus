@@ -13,6 +13,8 @@ use eframe::egui::{
 use std::collections::HashSet;
 
 const HEADER_W: f32 = 284.0;
+/// Hauteur du panneau de réglages d'une piste dépliée.
+const INSPECTOR_H: f32 = 104.0;
 const RULER_H: f32 = 24.0;
 const SCROLLBAR_H: f32 = 12.0;
 const CLIP_HEADER: f32 = 13.0;
@@ -232,6 +234,30 @@ impl App {
         if del {
             self.delete_selection();
         }
+        // Touches 1 à 9 : aller au repère 1 à 9 (dans l'ordre de la timeline).
+        let digit = ctx.input_mut(|i| {
+            [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+                Key::Num9,
+            ]
+            .iter()
+            .position(|&k| i.consume_key(none, k))
+        });
+        if let Some(n) = digit
+            && !self.is_recording()
+        {
+            match self.project.markers.get(n).map(|m| m.pos) {
+                Some(p) => self.seek(p),
+                None => self.notify(format!("Pas de repère {}", n + 1), false),
+            }
+        }
         if (left || right) && !self.is_recording() {
             let ph = self.playhead;
             let target = if left {
@@ -366,36 +392,18 @@ impl App {
         {
             self.open_export();
         }
-        // Ajouter une piste : mono ou stéréo, puis l'entrée (un clic = piste créée).
-        let in_ch = self.engine.status.in_channels;
-        let resp = w::tool_button(
+        // Ajouter des pistes : dialogue « Nouvelles pistes » (nombre, type, entrées).
+        if w::tool_button(
             &mut child,
             Some(Icon::Plus),
-            "Ajouter une piste",
+            "Ajouter des pistes",
             false,
             stopped,
-        );
-        let mut stereo = self.add_stereo;
-        let mut add: Option<Option<u16>> = None;
-        egui::Popup::menu(&resp)
-            .width(picker_width(stereo))
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| {
-                w::segmented(
-                    ui,
-                    "addmode",
-                    &mut stereo,
-                    &[(false, "Mono"), (true, "Stéréo")],
-                );
-                ui.add_space(6.0);
-                add = input_picker(ui, None, stereo, in_ch, &self.project.tracks, None);
-                if add.is_some() {
-                    ui.close();
-                }
-            });
-        self.add_stereo = stereo;
-        if let Some(input) = add {
-            self.add_track_on(input, stereo);
+        )
+        .on_hover_text("Une ou plusieurs pistes, mono ou stéréo, sur des entrées qui se suivent")
+        .clicked()
+        {
+            self.open_new_tracks();
         }
     }
 
@@ -462,9 +470,10 @@ impl App {
 
     fn ruler_step(&self) -> f64 {
         let px_per_sec = self.sr() as f64 / self.view.spp;
+        // Jusqu'à la milliseconde : plus on zoome, plus la grille est fine.
         let steps = [
-            0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
-            1800.0, 3600.0,
+            0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0,
+            30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
         ];
         steps
             .iter()
@@ -650,34 +659,63 @@ impl App {
     }
 
     /// Clic = déplacer la tête ; glisser = sélection de temps.
+    /// Règle : attraper la tête de lecture et la tirer ; ailleurs, glisser = sélection de
+    /// temps, clic = aller à cet endroit. Tout est aimanté à la grille (Maj : libre).
     fn time_select(&mut self, resp: &egui::Response, left: f32) {
+        let free = resp.ctx.input(|i| i.modifiers.shift);
+        let ph_x = self.x_of(left, self.playhead);
+        let near_head = |x: f32| (x - ph_x).abs() <= 7.0;
+        if (self.playhead_drag || resp.hover_pos().is_some_and(|h| near_head(h.x)))
+            && !self.is_recording()
+        {
+            resp.ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
         if resp.drag_started() {
             let origin = resp.ctx.input(|i| i.pointer.press_origin());
             if let Some(p) = origin.or(resp.interact_pointer_pos()) {
-                self.ruler_anchor = Some(self.sample_at(left, p.x));
+                if near_head(p.x) && !self.is_recording() {
+                    self.playhead_drag = true;
+                } else {
+                    let a = self.snap_pos(self.sample_at(left, p.x), free, false);
+                    self.ruler_anchor = Some(a);
+                }
             }
         }
         if resp.dragged()
-            && let (Some(a), Some(p)) = (self.ruler_anchor, resp.interact_pointer_pos())
+            && let Some(p) = resp.interact_pointer_pos()
         {
-            let b = self.sample_at(left, p.x);
-            if (b as f64 - a as f64).abs() / self.view.spp > 3.0 {
-                self.selection = Some((a.min(b), a.max(b)));
+            if self.playhead_drag {
+                let s = self.snap_pos(self.sample_at(left, p.x), free, true);
+                self.scrub_to(s);
+            } else if let Some(a) = self.ruler_anchor {
+                let b = self.snap_pos(self.sample_at(left, p.x), free, false);
+                if (b as f64 - a as f64).abs() / self.view.spp > 3.0 {
+                    self.selection = Some((a.min(b), a.max(b)));
+                }
             }
         }
         if resp.drag_stopped() {
-            self.ruler_anchor = None;
-            if let Some((a, _)) = self.selection
-                && self.is_stopped()
-            {
-                self.playhead = a;
+            if self.playhead_drag {
+                self.playhead_drag = false;
+                // Position finale exacte, aussi en lecture.
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let s = self.snap_pos(self.sample_at(left, p.x), free, true);
+                    self.seek(s);
+                }
+            } else {
+                self.ruler_anchor = None;
+                if let Some((a, _)) = self.selection
+                    && self.is_stopped()
+                {
+                    self.playhead = a;
+                }
             }
         }
         if resp.clicked()
             && !self.is_recording()
             && let Some(p) = resp.interact_pointer_pos()
         {
-            let s = self.sample_at(left, p.x);
+            let s = self.snap_pos(self.sample_at(left, p.x), free, true);
             self.seek(s);
         }
     }
@@ -735,7 +773,17 @@ impl App {
         v
     }
 
+    /// Pas de la grille de temps (échantillons) : la subdivision de la règle (quart de
+    /// graduation), de plus en plus fine quand on zoome.
+    pub fn grid_step(&self) -> u64 {
+        ((self.ruler_step() / 4.0) * self.sr() as f64)
+            .round()
+            .max(1.0) as u64
+    }
+
     /// Décalage à appliquer pour aimanter l'une des positions `edges` (déjà décalées).
+    /// Priorité aux objets proches (repères, bords de prises, tête, sélection) ; sinon
+    /// la position se cale sur le cran de grille le plus proche.
     fn snap_delta(&self, edges: &[i64], points: &[u64]) -> i64 {
         let tol = (SNAP_PX as f64 * self.view.spp) as i64;
         let mut best: Option<i64> = None;
@@ -747,7 +795,40 @@ impl App {
                 }
             }
         }
+        if best.is_none() {
+            let g = self.grid_step() as i64;
+            for &e in edges {
+                let d = (e as f64 / g as f64).round() as i64 * g - e;
+                if best.is_none_or(|b| d.abs() < b.abs()) {
+                    best = Some(d);
+                }
+            }
+        }
         best.unwrap_or(0)
+    }
+
+    /// Position aimantée (magnétisme actif et Maj relâchée). `moving_playhead` : la tête
+    /// elle-même ne sert pas d'aimant (elle resterait collée à sa position).
+    fn snap_pos(&self, s: u64, no_snap: bool, moving_playhead: bool) -> u64 {
+        if !self.snap || no_snap {
+            return s;
+        }
+        let mut pts = self.snap_points(&HashSet::new());
+        if moving_playhead {
+            pts.retain(|&p| p != self.playhead);
+        }
+        (s as i64 + self.snap_delta(&[s as i64], &pts)).max(0) as u64
+    }
+
+    /// Déplace la tête pendant qu'on la tire. En lecture, le son suit (au plus 12 fois
+    /// par seconde : on ne relance pas la lecture disque à chaque image).
+    fn scrub_to(&mut self, s: u64) {
+        if self.is_stopped() {
+            self.playhead = s;
+        } else if self.now - self.scrub_at > 0.08 {
+            self.scrub_at = self.now;
+            self.seek(s);
+        }
     }
 
     fn begin_clip_drag(
@@ -790,6 +871,33 @@ impl App {
             target: None,
             changed: false,
         });
+    }
+
+    /// Met à jour le rectangle : sont sélectionnées les prises qu'il touche (en temps sur
+    /// leur durée, en hauteur sur leur piste), en plus de la sélection d'origine.
+    fn update_marquee(&mut self, cur: (u64, f32)) {
+        let Some(m) = self.marquee.as_mut() else {
+            return;
+        };
+        m.cur = cur;
+        let (s0, s1) = (m.sample.min(cur.0), m.sample.max(cur.0));
+        let (y0, y1) = (m.y.min(cur.1), m.y.max(cur.1));
+        let mut sel = m.base.clone();
+        for (i, t) in self.project.tracks.iter().enumerate() {
+            let Some(&(a, b)) = self.view.row_spans.get(i) else {
+                continue;
+            };
+            if b <= y0 || a >= y1 {
+                continue;
+            }
+            sel.extend(
+                t.clips
+                    .iter()
+                    .filter(|c| c.start < s1 && c.end() > s0)
+                    .map(|c| c.id),
+            );
+        }
+        self.sel_clips = sel;
     }
 
     fn update_clip_drag(&mut self, sample: u64, target_row: Option<usize>, no_snap: bool) {
@@ -1018,13 +1126,21 @@ impl App {
         // Grille verticale (repères de la règle).
         let step = self.ruler_step();
         let sr = self.sr() as f64;
-        let grid_x: Vec<f32> = {
+        // Lignes de la règle, et crans de la grille (plus discrets) quand le magnétisme
+        // est actif : on voit où la tête, les coupes et les prises vont se caler.
+        let grid_x: Vec<(f32, bool)> = {
             let t0 = self.view.scroll / sr;
             let t1 = t0 + tl_width as f64 * self.view.spp / sr;
             let mut v = Vec::new();
             let mut tt = (t0 / step).floor() * step;
             while tt <= t1 {
-                v.push(self.x_of(tl_left, (tt * sr) as u64));
+                v.push((self.x_of(tl_left, (tt * sr) as u64), true));
+                if self.snap {
+                    for k in 1..4 {
+                        let tk = tt + step * k as f64 / 4.0;
+                        v.push((self.x_of(tl_left, (tk * sr) as u64), false));
+                    }
+                }
                 tt += step;
             }
             v
@@ -1054,16 +1170,20 @@ impl App {
                     );
                     ui.label(
                         egui::RichText::new(
-                            "Ajoutez une piste ou créez-en une par entrée de la carte.",
+                            "« Ajouter des pistes » : une ou plusieurs d'un coup, sur les entrées de votre choix.",
                         )
                         .color(t::TEXT_3),
                     );
                 });
             }
+            let mut spans = Vec::with_capacity(ntracks);
             for idx in 0..ntracks {
-                let (row, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), track_h), Sense::hover());
                 let tid = self.project.tracks[idx].id;
+                let expanded = self.expanded_tracks.contains(&tid);
+                let row_h = track_h + if expanded { INSPECTOR_H } else { 0.0 };
+                let (row, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::hover());
+                spans.push((row.top() - lanes_top, row.bottom() - lanes_top));
                 let dragging_here = self
                     .clip_drag
                     .as_ref()
@@ -1079,16 +1199,26 @@ impl App {
                 let p = ui.painter().clone();
                 p.rect_filled(lane, 0.0, if idx % 2 == 0 { t::LANE_A } else { t::LANE_B });
                 let lp = ui.painter_at(lane);
-                for &gx in &grid_x {
-                    w::vline(&lp, gx, lane.top(), lane.bottom(), t::GRID);
+                for &(gx, major) in &grid_x {
+                    let col = if major { t::GRID } else { t::GRID.gamma_multiply(0.45) };
+                    w::vline(&lp, gx, lane.top(), lane.bottom(), col);
                 }
                 p.rect_filled(
                     header,
                     0.0,
                     if selected { t::SURFACE_3 } else { t::SURFACE },
                 );
+                // Panneau déplié : fond un peu différent, sous l'en-tête.
+                let panel = Rect::from_min_max(
+                    pos2(row.left(), header.bottom()),
+                    pos2(row.left() + HEADER_W, row.bottom()),
+                );
+                if expanded {
+                    p.rect_filled(panel, 0.0, t::SURFACE_2);
+                    w::hline(&p, panel.left() + 3.0, panel.right(), panel.top(), t::LINE);
+                }
                 p.rect_filled(
-                    Rect::from_min_size(header.min, vec2(3.0, track_h)),
+                    Rect::from_min_size(header.min, vec2(3.0, row_h)),
                     0.0,
                     if rec_live { t::REC } else { color },
                 );
@@ -1119,7 +1249,19 @@ impl App {
                 }
                 // Clic droit n'importe où sur la carte (le nom n'est plus un champ de saisie
                 // permanent : il ne capture plus le clic droit).
+                let mut toggle_panel = false;
                 hresp.context_menu(|ui| {
+                    if ui
+                        .button(if expanded {
+                            "Masquer les réglages de la piste"
+                        } else {
+                            "Entrée et réglages de la piste…"
+                        })
+                        .clicked()
+                    {
+                        toggle_panel = true;
+                        ui.close();
+                    }
                     if ui
                         .add_enabled(
                             stopped,
@@ -1160,6 +1302,22 @@ impl App {
                 let mut name_rect = Rect::NOTHING;
                 let track = &mut self.project.tracks[idx];
                 hdr.horizontal(|ui| {
+                    // Flèche : déplier le panneau de réglages (entrée, type, monitoring…).
+                    let (ar, aresp) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::click());
+                    let acol = if aresp.hovered() { t::TEXT } else { t::TEXT_2 };
+                    let c = ar.center();
+                    let tri = if expanded {
+                        vec![pos2(c.x - 4.0, c.y - 2.0), pos2(c.x + 4.0, c.y - 2.0), pos2(c.x, c.y + 3.0)]
+                    } else {
+                        vec![pos2(c.x - 2.0, c.y - 4.0), pos2(c.x + 3.0, c.y), pos2(c.x - 2.0, c.y + 4.0)]
+                    };
+                    ui.painter().add(egui::Shape::convex_polygon(tri, acol, Stroke::NONE));
+                    if aresp
+                        .on_hover_text("Réglages de la piste : entrée, mono / stéréo, monitoring")
+                        .clicked()
+                    {
+                        toggle_panel = true;
+                    }
                     if w::arm_button(
                         ui,
                         track.armed,
@@ -1177,7 +1335,7 @@ impl App {
                     if self.renaming_track == Some(tid) && stopped {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut track.name)
-                                .desired_width(178.0)
+                                .desired_width(136.0)
                                 .font(t::medium(12.0))
                                 .margin(egui::Margin::symmetric(2, 1)),
                         );
@@ -1202,7 +1360,7 @@ impl App {
                         }
                         name_rect = r.rect;
                     } else {
-                        let (nr, _) = ui.allocate_exact_size(vec2(182.0, 18.0), Sense::hover());
+                        let (nr, _) = ui.allocate_exact_size(vec2(140.0, 18.0), Sense::hover());
                         let font = t::medium(12.0);
                         let shown = w::fit_text(ui, &track.name, &font, nr.width() - 4.0);
                         ui.painter().text(
@@ -1213,6 +1371,20 @@ impl App {
                             t::TEXT,
                         );
                         name_rect = nr;
+                    }
+                    // Monitoring direct : écouter en temps réel ce qui entre dans la piste.
+                    if w::icon_tag_button(
+                        ui,
+                        Icon::Headphones,
+                        track.monitor,
+                        t::PLAY,
+                        track.input.is_some(),
+                        "Monitoring : écouter l'entrée en direct (sortie « Monitoring » des réglages de la carte son)",
+                    )
+                    .clicked()
+                    {
+                        track.monitor = !track.monitor;
+                        self.project.dirty = true;
                     }
                     if w::tag_button(ui, "M", track.mute, t::ORANGE, true, "Muet (lecture)")
                         .clicked()
@@ -1253,9 +1425,11 @@ impl App {
                     .collect();
                 let mut new_input: Option<Option<u16>> = None;
                 let mut new_stereo: Option<bool> = None;
+                let (mut arm_toggle, mut monitor_toggle) = (false, false);
                 hdr.horizontal(|ui| {
+                    // Étiquette d'entrée présentée en liste déroulante (« IN 1 ▾ »).
                     let (r, resp) = ui.allocate_exact_size(
-                        vec2(48.0, 18.0),
+                        vec2(58.0, 18.0),
                         if stopped {
                             Sense::click()
                         } else {
@@ -1265,13 +1439,21 @@ impl App {
                     let hov = resp.hovered() && stopped;
                     ui.painter()
                         .rect_filled(r, t::R, if hov { t::SURFACE_4 } else { t::INSET });
+                    let fg = if input.is_some() { t::TEXT } else { t::TEXT_3 };
                     ui.painter().text(
-                        r.center(),
-                        Align2::CENTER_CENTER,
+                        pos2(r.left() + 6.0, r.center().y),
+                        Align2::LEFT_CENTER,
                         label,
                         t::medium(10.0),
-                        if input.is_some() { t::TEXT } else { t::TEXT_3 },
+                        fg,
                     );
+                    let cx = r.right() - 8.0;
+                    let cy = r.center().y;
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        vec![pos2(cx - 3.0, cy - 1.5), pos2(cx + 3.0, cy - 1.5), pos2(cx, cy + 2.0)],
+                        if stopped { t::TEXT_2 } else { t::TEXT_3 },
+                        Stroke::NONE,
+                    ));
                     let resp = resp.on_hover_text("Mono / stéréo et entrée de la carte");
                     egui::Popup::menu(&resp)
                         .width(picker_width(stereo))
@@ -1295,7 +1477,7 @@ impl App {
                                 ui.close();
                             }
                         });
-                    let (mr, _) = ui.allocate_exact_size(vec2(162.0, 18.0), Sense::hover());
+                    let (mr, _) = ui.allocate_exact_size(vec2(152.0, 18.0), Sense::hover());
                     if ms.len() == 2 {
                         // Stéréo : gauche en haut, droite en bas.
                         for (k, m) in ms.iter().enumerate() {
@@ -1334,6 +1516,64 @@ impl App {
                         }
                     }
                 });
+                if expanded {
+                    let mut pui = ui.new_child(
+                        UiBuilder::new().max_rect(panel.shrink2(vec2(13.0, 8.0)).translate(vec2(2.0, 0.0))),
+                    );
+                    let track = &self.project.tracks[idx];
+                    let (stereo, input, armed, monitor) =
+                        (track.stereo, track.input, track.armed, track.monitor);
+                    egui::Grid::new(("track_panel", tid))
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(&mut pui, |ui| {
+                            ui.label(egui::RichText::new("Type").font(t::regular(11.5)).color(t::TEXT_2));
+                            let mut s = stereo;
+                            ui.add_enabled_ui(stopped, |ui| {
+                                if w::segmented(ui, &format!("tp_type{tid}"), &mut s, &[(false, "Mono"), (true, "Stéréo")]) {
+                                    new_stereo = Some(s);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label(egui::RichText::new("Entrée").font(t::regular(11.5)).color(t::TEXT_2));
+                            let mut cur = input.map(|i| if s { i & !1 } else { i });
+                            ui.add_enabled_ui(stopped, |ui| {
+                                if input_combo(ui, &format!("tp_in{tid}"), 186.0, &mut cur, s, in_ch, &self.project.tracks, Some(tid)) {
+                                    new_input = Some(cur);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                if w::tool_button(ui, Some(Icon::Record), "Armée", armed, stopped && input.is_some())
+                                    .on_hover_text("Enregistrer cette piste à la prochaine prise")
+                                    .clicked()
+                                {
+                                    arm_toggle = true;
+                                }
+                                if w::tool_button(ui, Some(Icon::Headphones), "Monitoring", monitor, input.is_some())
+                                    .on_hover_text("Écouter l'entrée en direct (sortie « Monitoring »)")
+                                    .clicked()
+                                {
+                                    monitor_toggle = true;
+                                }
+                            });
+                            ui.end_row();
+                        });
+                }
+                if arm_toggle || monitor_toggle {
+                    let track = &mut self.project.tracks[idx];
+                    if arm_toggle {
+                        track.armed = !track.armed;
+                    }
+                    if monitor_toggle {
+                        track.monitor = !track.monitor;
+                    }
+                    self.project.dirty = true;
+                }
+                if toggle_panel && !self.expanded_tracks.remove(&tid) {
+                    self.expanded_tracks.insert(tid);
+                }
                 if new_stereo.is_some() || new_input.is_some() {
                     let track = &mut self.project.tracks[idx];
                     if let Some(s) = new_stereo {
@@ -1479,7 +1719,20 @@ impl App {
                             self.begin_clip_drag(tid, &c, *mode, s, command);
                         }
                         _ => {
-                            self.ruler_anchor = Some(s);
+                            // Zone vide : rectangle de sélection des prises (la sélection de
+                            // temps se fait en glissant sur la règle).
+                            let y = pp.y - lanes_top;
+                            let base = if command || shift {
+                                self.sel_clips.clone()
+                            } else {
+                                HashSet::new()
+                            };
+                            self.marquee = Some(Marquee {
+                                sample: s,
+                                y,
+                                base,
+                                cur: (s, y),
+                            });
                         }
                     }
                 }
@@ -1488,27 +1741,27 @@ impl App {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                         if let Some(pp) = resp.interact_pointer_pos() {
                             let s = self.sample_at(lane.left(), pp.x);
-                            let row_f = (pp.y - lanes_top) / track_h;
-                            let target = (row_f >= 0.0).then_some(row_f as usize);
+                            // Piste sous le pointeur, d'après les vraies hauteurs (dépliées ou non).
+                            let y = pp.y - lanes_top;
+                            let target = self
+                                .view
+                                .row_spans
+                                .iter()
+                                .position(|&(a, b)| y >= a && y < b);
                             self.update_clip_drag(s, target, shift);
                         }
-                    } else if let (Some(a), Some(pp)) =
-                        (self.ruler_anchor, resp.interact_pointer_pos())
+                    } else if self.marquee.is_some()
+                        && let Some(pp) = resp.interact_pointer_pos()
                     {
-                        let b = self.sample_at(lane.left(), pp.x);
-                        if (b as f64 - a as f64).abs() / self.view.spp > 3.0 {
-                            self.selection = Some((a.min(b), a.max(b)));
-                        }
+                        let cur = (self.sample_at(lane.left(), pp.x), pp.y - lanes_top);
+                        self.update_marquee(cur);
                     }
                 }
                 if resp.drag_stopped() {
                     if self.clip_drag.is_some() {
                         self.end_clip_drag();
                     } else {
-                        self.ruler_anchor = None;
-                        if let (Some((a, _)), true) = (self.selection, self.is_stopped()) {
-                            self.playhead = a;
-                        }
+                        self.marquee = None;
                     }
                 }
                 if resp.clicked() {
@@ -1529,6 +1782,7 @@ impl App {
                                 && let Some(pp) = resp.interact_pointer_pos()
                             {
                                 let s = self.sample_at(lane.left(), pp.x);
+                                let s = self.snap_pos(s, shift, true);
                                 self.seek(s);
                             }
                         }
@@ -1597,6 +1851,18 @@ impl App {
                         ui.label(egui::RichText::new("Aucune prise ici").color(t::TEXT_3));
                     }
                 });
+            }
+            self.view.row_spans = spans;
+            if let Some(m) = &self.marquee {
+                let x0 = self.x_of(tl_left, m.sample);
+                let x1 = self.x_of(tl_left, m.cur.0);
+                let r = Rect::from_two_pos(
+                    pos2(x0.max(tl_left), lanes_top + m.y),
+                    pos2(x1.max(tl_left), lanes_top + m.cur.1),
+                );
+                let p = ui.painter();
+                p.rect_filled(r, 0.0, t::ACCENT.gamma_multiply(0.10));
+                p.rect_stroke(r, 0.0, Stroke::new(1.0, t::ACCENT.gamma_multiply(0.8)), StrokeKind::Inside);
             }
             ui.add_space(50.0);
         });
@@ -1818,6 +2084,83 @@ impl App {
                 });
             });
     }
+}
+
+/// Rectangle de sélection des prises : point de départ en temps (échantillon) et en
+/// hauteur dans la liste des pistes (indépendant du défilement), et sélection d'origine
+/// (Ctrl / Maj : on ajoute à la sélection existante).
+pub struct Marquee {
+    pub sample: u64,
+    pub y: f32,
+    pub base: HashSet<u64>,
+    /// Coin opposé courant (échantillon, hauteur).
+    pub cur: (u64, f32),
+}
+
+/// Liste déroulante d'entrée (ou de paire en stéréo : 1-2, 3-4…). Les entrées déjà prises
+/// par d'autres pistes sont signalées avec le nom de ces pistes. `me` = piste réglée.
+/// Retourne `true` si le choix a changé.
+#[allow(clippy::too_many_arguments)]
+pub fn input_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    width: f32,
+    value: &mut Option<u16>,
+    stereo: bool,
+    in_ch: u16,
+    tracks: &[crate::project::Track],
+    me: Option<u64>,
+) -> bool {
+    let mut users: std::collections::HashMap<u16, Vec<&str>> = std::collections::HashMap::new();
+    for t in tracks.iter().filter(|t| Some(t.id) != me) {
+        for c in t.inputs() {
+            users.entry(c).or_default().push(t.name.as_str());
+        }
+    }
+    let step: u16 = if stereo { 2 } else { 1 };
+    let label = |i: u16| {
+        if stereo {
+            format!("Entrées {}-{}", i + 1, i + 2)
+        } else {
+            format!("Entrée {}", i + 1)
+        }
+    };
+    let cur = value.map_or("Aucune entrée".to_string(), label);
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .height(340.0)
+        .selected_text(cur)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(value.is_none(), "Aucune entrée")
+                .clicked()
+            {
+                *value = None;
+                changed = true;
+            }
+            if in_ch == 0 {
+                ui.label(egui::RichText::new("Aucune carte son").color(t::TEXT_3));
+            }
+            let mut i = 0u16;
+            while i + step <= in_ch {
+                let by: Vec<&str> = (i..i + step)
+                    .flat_map(|c| users.get(&c).cloned().unwrap_or_default())
+                    .collect();
+                let text = if by.is_empty() {
+                    egui::RichText::new(label(i))
+                } else {
+                    egui::RichText::new(format!("{}   · {}", label(i), by.join(", ")))
+                        .color(t::TEXT_3)
+                };
+                if ui.selectable_label(*value == Some(i), text).clicked() {
+                    *value = Some(i);
+                    changed = true;
+                }
+                i += step;
+            }
+        });
+    changed
 }
 
 /// Largeur du menu de choix d'entrée (8 colonnes).
@@ -2070,10 +2413,38 @@ fn fmt_ruler(tt: f64, step: f64) -> String {
     let total = tt.round() as u64;
     let (m, s) = (total / 60, total % 60);
     if step < 1.0 {
-        format!("{}:{:04.1}", (tt / 60.0).floor() as u64, tt % 60.0)
+        // Décimales selon la finesse de la graduation (dixièmes … millièmes).
+        let prec = if step < 0.01 {
+            3
+        } else if step < 0.1 {
+            2
+        } else {
+            1
+        };
+        format!(
+            "{}:{:0width$.prec$}",
+            (tt / 60.0).floor() as u64,
+            tt % 60.0,
+            width = 3 + prec,
+            prec = prec
+        )
     } else if m >= 60 {
         format!("{}:{:02}:{:02}", m / 60, m % 60, s)
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_ruler;
+
+    /// Graduations : décimales selon la finesse (zoom), jusqu'à la milliseconde.
+    #[test]
+    fn ruler_labels_follow_zoom() {
+        assert_eq!(fmt_ruler(65.5, 0.5), "1:05.5");
+        assert_eq!(fmt_ruler(1.25, 0.05), "0:01.25");
+        assert_eq!(fmt_ruler(1.125, 0.005), "0:01.125");
+        assert_eq!(fmt_ruler(125.0, 5.0), "2:05");
     }
 }

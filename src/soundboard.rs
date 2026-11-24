@@ -88,7 +88,8 @@ impl Pad {
             end: None,
             fade_in: 0.0,
             fade_out: 0.0,
-            mode: PadMode::Toggle,
+            // Nouveau pad : chaque appui relance le son depuis le début.
+            mode: PadMode::Retrigger,
             looped: false,
             key: None,
             midi: None,
@@ -142,10 +143,11 @@ pub struct Board {
     pub cols: usize,
     pub rows: usize,
     pub pages: Vec<Page>,
-    /// Premier canal de sortie du soundboard (0-based).
+    /// Ancien emplacement de la sortie du soundboard (désormais dans les réglages audio,
+    /// `AudioPrefs::pad_output` / `pad_left`) : lu une fois pour reprendre le réglage.
     #[serde(default)]
     pub out_left: u16,
-    /// Périphérique de sortie du soundboard (`None` = le même que l'écoute multipiste).
+    /// Ancien emplacement, voir `out_left`.
     #[serde(default)]
     pub out_device: Option<String>,
     #[serde(default)]
@@ -155,7 +157,8 @@ pub struct Board {
     pub panic_fade: f64,
     #[serde(default)]
     pub midi_port: Option<String>,
-    /// Mode des nouveaux pads.
+    /// Ancien « mode de la page » (le mode se règle maintenant pad par pad) : conservé
+    /// pour relire les anciens fichiers, sans effet.
     #[serde(default)]
     pub default_mode: PadMode,
     /// LED du contrôleur.
@@ -164,6 +167,23 @@ pub struct Board {
     /// Port de sortie des LED (`None` = celui du contrôleur choisi).
     #[serde(default)]
     pub led_port: Option<String>,
+    /// Disposition : calquée sur la grille du contrôleur quand il en a une (chaque case à
+    /// l'écran = le pad physique au même endroit), sinon MIDI learn pad par pad.
+    #[serde(default)]
+    pub layout: PadLayout,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PadLayout {
+    /// Grille du contrôleur dès qu'un contrôleur à grille reconnu est branché (le MIDI
+    /// appartient à la case, la page affichée est jouée, la colonne de droite change de
+    /// page) ; sinon grille libre avec MIDI learn.
+    // Anciennes valeurs (« Free » était le défaut) : on repasse en automatique.
+    #[default]
+    #[serde(alias = "Free", alias = "Controller")]
+    Auto,
+    /// Toujours le MIDI learn pad par pad, même avec un contrôleur à grille.
+    Manual,
 }
 
 fn default_panic_fade() -> f64 {
@@ -184,19 +204,12 @@ impl Default for Board {
             default_mode: PadMode::Toggle,
             led_mode: crate::midi::LedMode::Auto,
             led_port: None,
+            layout: PadLayout::Auto,
         }
     }
 }
 
 impl Board {
-    /// Sortie du soundboard pour le moteur audio.
-    pub fn pad_out(&self) -> crate::audio::PadOut {
-        crate::audio::PadOut {
-            device: self.out_device.clone(),
-            left: self.out_left,
-        }
-    }
-
     pub fn default_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("TracksPlus").join("soundboard.json"))
     }
@@ -518,6 +531,17 @@ pub fn is_audio_file(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_layouts_become_automatic() {
+        for old in ["\"Free\"", "\"Controller\"", "\"Auto\""] {
+            let l: PadLayout = serde_json::from_str(old).unwrap();
+            assert_eq!(l, PadLayout::Auto, "{old}");
+        }
+        let l: PadLayout = serde_json::from_str("\"Manual\"").unwrap();
+        assert_eq!(l, PadLayout::Manual);
+        assert_eq!(Board::default().layout, PadLayout::Auto);
+    }
 
     #[test]
     fn load_and_resample_wav() {

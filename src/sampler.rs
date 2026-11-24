@@ -36,6 +36,8 @@ pub enum PadMode {
     Toggle,
     /// Le son joue tant que le pad est maintenu et s'arrête au relâchement.
     Gate,
+    /// Chaque appui relance le son depuis le début (même s'il joue déjà).
+    Retrigger,
 }
 
 /// Paramètres de lecture d'un pad, en trames.
@@ -160,6 +162,17 @@ impl Sampler {
                     PadMode::Gate if active => {
                         self.dispose(sample);
                         return;
+                    }
+                    PadMode::Retrigger if active => {
+                        // Le son en cours s'efface en 10 ms (pas de clic) pendant que le
+                        // nouveau repart du début.
+                        for v in self
+                            .voices
+                            .iter_mut()
+                            .filter(|v| v.slot == slot && v.release.is_none())
+                        {
+                            v.release(quick);
+                        }
                     }
                     _ => {}
                 }
@@ -345,6 +358,42 @@ mod tests {
         }
         assert!(out.iter().all(|&x| x == 0.0));
         assert_eq!(pos[2].load(Ordering::Relaxed), 0);
+    }
+
+    /// Relancer : un second appui repart du début, l'ancien son s'efface sans clic.
+    #[test]
+    fn retrigger_restarts_from_start() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        let smp = sample(48000);
+        let press = |tx: &crossbeam_channel::Sender<PadCmd>| {
+            tx.send(PadCmd::Press {
+                slot: 3,
+                sample: smp.clone(),
+                params: params(PadMode::Retrigger, 48000),
+            })
+            .unwrap();
+        };
+        press(&tx);
+        let mut out = vec![0.0; 2048];
+        for _ in 0..8 {
+            s.render(&mut out, 1024, &pos);
+        }
+        assert!(pos[3].load(Ordering::Relaxed) > 8000);
+        press(&tx);
+        s.render(&mut out, 1024, &pos);
+        // Reparti du début : position d'environ un bloc, pas 9 blocs.
+        let p = pos[3].load(Ordering::Relaxed);
+        assert!((1000..1100).contains(&p), "position {p}");
+        // L'ancien son est en fondu puis disparaît : une seule voix reste ensuite.
+        for _ in 0..2 {
+            s.render(&mut out, 1024, &pos);
+        }
+        assert_eq!(s.voices.len(), 1);
+        // Le son continue (pas d'arrêt comme en Lecture-Stop).
+        assert!(out.iter().any(|&x| x != 0.0));
     }
 
     #[test]

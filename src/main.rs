@@ -113,7 +113,7 @@ fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("TracksPlus")
         .with_inner_size([1440.0, 880.0])
-        .with_min_inner_size([1100.0, 620.0])
+        .with_min_inner_size([1280.0, 720.0])
         .with_drag_and_drop(true);
     // Icône de la fenêtre et de la barre des tâches.
     if let Ok(icon) =
