@@ -1,6 +1,8 @@
 # TracksPlus
 
-Enregistreur **multipiste** et **soundboard** dans une seule application, sobre et épurée.
+Enregistreur **multipiste** et **soundboard** dans une seule application. Interface sombre,
+plate et dense, dans l'esprit des stations audio modernes (Bitwig) : gris anthracite, accent
+orange, angles quasi droits, couleurs de pistes désaturées.
 Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), ASIO, CoreAudio.
 
 | Multipiste | Soundboard |
@@ -27,6 +29,12 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
   automatiquement (y compris verticalement sur les pistes en cours d'enregistrement).
   Clic sur la règle / une piste = se déplacer (même en lecture), glisser = sélectionner une
   plage, double-clic sur une prise = sélectionner la prise, barre de défilement horizontale.
+- **Montage** : cliquer une prise pour la sélectionner (Ctrl pour en ajouter), la **glisser**
+  pour la déplacer (y compris vers une autre piste), **rogner** en tirant ses bords,
+  **couper** à la tête de lecture (S), **supprimer** (Suppr) les prises sélectionnées ou tout le
+  contenu d'une plage de temps. **Magnétisme** sur la tête de lecture, les repères, la sélection
+  et les bords des autres prises (Maj pour le désactiver). **Annuler / Rétablir** (Ctrl+Z,
+  Ctrl+Maj+Z). Le montage est non destructif : les fichiers enregistrés ne sont jamais modifiés.
 - **Repères** (touche M, même pendant l'enregistrement) : renommer, supprimer, sélectionner
   jusqu'au repère suivant, flèches ← / → pour sauter de repère en repère.
 - **Export** : pistes **choisies une à une** (ou la sélection de la timeline), toute la
@@ -38,8 +46,11 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 - **Pads** en grille (4×2 à 8×8), jusqu'à 8 pages. Glissez-déposez des fichiers (WAV, AIFF,
   MP3, AAC/M4A, FLAC, OGG) ou cliquez sur un pad vide. Déclenchement à l'appui (pas au
   relâchement) pour la réactivité.
-- **Modes** : One shot (relance), Play / Stop, Maintien (joue tant que le pad est tenu),
-  lecture en boucle.
+- **Deux modes**, réglables pour toute la page en un clic ou pad par pad :
+  - **Lecture-Stop** : un appui lance le son, un nouvel appui l'arrête (icône ■ sur le pad) ;
+  - **Maintenir** : le son joue tant que le pad (souris, touche ou pad MIDI) est tenu et
+    s'arrête au relâchement.
+  Option de lecture en boucle.
 - **Éditeur** : forme d'onde zoomable, poignées **début / fin**, poignées de **fondu d'entrée
   et de sortie** (courbes douces), gain en dB, couleur, nom.
 - **Contrôleur USB** : choix du port MIDI (ou tous), **MIDI learn** par pad (notes et CC),
@@ -59,7 +70,10 @@ Pensé pour le live : Dante Virtual Soundcard (jusqu'à 64 entrées et plus), AS
 | ← / → | Repère précédent / suivant | |
 | Origine / Entrée | Début (ou début de la sélection) | |
 | F | Tout afficher | |
-| Échap | Effacer la sélection | Tout arrêter |
+| S | Couper à la tête de lecture | |
+| Suppr | Supprimer la sélection | |
+| Ctrl + Z / Ctrl + Maj + Z | Annuler / Rétablir | |
+| Échap | Effacer les sélections | Tout arrêter |
 | Ctrl + molette | Zoom | Zoom de l'éditeur |
 | Maj + molette | Défiler dans le temps | |
 | Ctrl + 1 / Ctrl + 2 | Changer d'onglet | Changer d'onglet |

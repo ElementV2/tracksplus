@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub const PROJECT_EXT: &str = "tracksplus";
@@ -36,11 +37,26 @@ pub struct Clip {
     pub offset: u64,
     /// Longueur (en échantillons).
     pub len: u64,
+    /// Longueur totale du fichier source (0 = inconnue : on ne peut pas rallonger).
+    #[serde(default)]
+    pub src_len: u64,
 }
+
+/// Longueur minimale d'une prise après rognage ou coupe (en échantillons).
+pub const MIN_CLIP: u64 = 64;
 
 impl Clip {
     pub fn end(&self) -> u64 {
         self.start + self.len
+    }
+
+    /// Fin du fichier source, en échantillons depuis le début du fichier.
+    pub fn src_end(&self) -> u64 {
+        if self.src_len > 0 {
+            self.src_len
+        } else {
+            self.offset + self.len
+        }
     }
 }
 
@@ -153,6 +169,83 @@ impl Project {
         self.markers.sort_by_key(|m| m.pos);
         self.dirty = true;
         id
+    }
+
+    /// Coupe une prise en deux à `pos`. Retourne l'identifiant de la nouvelle moitié droite.
+    pub fn split_clip(&mut self, track_id: u64, clip_id: u64, pos: u64) -> Option<u64> {
+        let new_id = self.next_id;
+        let t = self.tracks.iter_mut().find(|t| t.id == track_id)?;
+        let i = t.clips.iter().position(|c| c.id == clip_id)?;
+        let c = t.clips[i].clone();
+        if pos < c.start + MIN_CLIP || pos + MIN_CLIP > c.end() {
+            return None;
+        }
+        let left = pos - c.start;
+        t.clips[i].len = left;
+        let right = Clip {
+            id: new_id,
+            file: c.file.clone(),
+            start: pos,
+            offset: c.offset + left,
+            len: c.len - left,
+            src_len: c.src_len,
+        };
+        // Juste après la moitié gauche : l'ordre de superposition est conservé.
+        t.clips.insert(i + 1, right);
+        self.next_id += 1;
+        self.dirty = true;
+        Some(new_id)
+    }
+
+    /// Coupe à `pos` toutes les prises concernées. `clips` limite aux prises données,
+    /// `tracks` aux pistes données. Retourne les couples (ancienne, nouvelle) prise.
+    pub fn split_at(
+        &mut self,
+        pos: u64,
+        tracks: Option<&HashSet<u64>>,
+        clips: Option<&HashSet<u64>>,
+    ) -> Vec<(u64, u64)> {
+        let targets: Vec<(u64, u64)> = self
+            .tracks
+            .iter()
+            .filter(|t| tracks.is_none_or(|s| s.contains(&t.id)))
+            .flat_map(|t| {
+                t.clips
+                    .iter()
+                    .filter(|c| c.start < pos && pos < c.end())
+                    .filter(|c| clips.is_none_or(|s| s.contains(&c.id)))
+                    .map(move |c| (t.id, c.id))
+            })
+            .collect();
+        targets
+            .into_iter()
+            .filter_map(|(t, c)| self.split_clip(t, c, pos).map(|n| (c, n)))
+            .collect()
+    }
+
+    /// Efface le contenu entre `a` et `b` (sans décaler la suite).
+    pub fn delete_range(
+        &mut self,
+        a: u64,
+        b: u64,
+        tracks: Option<&HashSet<u64>>,
+    ) -> Vec<(u64, u64)> {
+        let mut pairs = self.split_at(a, tracks, None);
+        pairs.extend(self.split_at(b, tracks, None));
+        for t in &mut self.tracks {
+            if tracks.is_none_or(|s| s.contains(&t.id)) {
+                t.clips.retain(|c| !(c.start >= a && c.end() <= b));
+            }
+        }
+        self.dirty = true;
+        pairs
+    }
+
+    pub fn find_clip(&self, clip_id: u64) -> Option<(usize, &Clip)> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| t.clips.iter().find(|c| c.id == clip_id).map(|c| (i, c)))
     }
 
     pub fn has_audio(&self) -> bool {
@@ -287,6 +380,7 @@ mod tests {
             start: 10,
             offset: 0,
             len: 100,
+            src_len: 100,
         });
         p.save().unwrap();
         let q = Project::load(&p.file_path()).unwrap();
@@ -294,6 +388,45 @@ mod tests {
         assert_eq!(q.end(), 110);
         assert_eq!(q.dir, dir);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn clip_project() -> (Project, u64) {
+        let mut p = Project::new("E".into(), std::env::temp_dir(), 48000);
+        let t = p.add_track(None, Some(0));
+        let id = p.alloc_id();
+        p.track_mut(t).unwrap().clips.push(Clip {
+            id,
+            file: "a.wav".into(),
+            start: 1000,
+            offset: 0,
+            len: 10_000,
+            src_len: 10_000,
+        });
+        (p, t)
+    }
+
+    #[test]
+    fn split_keeps_audio_continuous() {
+        let (mut p, t) = clip_project();
+        let pairs = p.split_at(4000, None, None);
+        assert_eq!(pairs.len(), 1);
+        let c = &p.track_mut(t).unwrap().clips;
+        assert_eq!((c[0].start, c[0].len), (1000, 3000));
+        assert_eq!((c[1].start, c[1].offset, c[1].len), (4000, 3000, 7000));
+        assert_eq!(c[1].end(), 11_000);
+        // Coupe hors prise ou trop près d'un bord : rien.
+        assert!(p.split_at(500, None, None).is_empty());
+        assert!(p.split_at(1010, None, None).is_empty());
+    }
+
+    #[test]
+    fn delete_range_removes_middle() {
+        let (mut p, t) = clip_project();
+        p.delete_range(3000, 5000, None);
+        let c = &p.track_mut(t).unwrap().clips;
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].end(), 3000);
+        assert_eq!((c[1].start, c[1].offset), (5000, 4000));
     }
 
     #[test]

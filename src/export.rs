@@ -340,6 +340,7 @@ mod tests {
             start: 100,
             offset: 0,
             len: frames as u64,
+            src_len: frames as u64,
         });
         p
     }
@@ -436,6 +437,7 @@ mod range_tests {
                 start: 0,
                 offset: 0,
                 len: 10000,
+                src_len: 10000,
             });
         }
         let s = ExportSettings {

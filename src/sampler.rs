@@ -30,24 +30,12 @@ pub const SAMPLE_PEAK: usize = 256;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PadMode {
-    /// Chaque appui relance le son depuis le début.
+    /// Un appui lance le son, un nouvel appui l'arrête.
     #[default]
-    OneShot,
-    /// Un appui lance, un autre arrête.
+    #[serde(alias = "OneShot")]
     Toggle,
-    /// Le son joue tant que le pad est maintenu.
+    /// Le son joue tant que le pad est maintenu et s'arrête au relâchement.
     Gate,
-}
-
-impl PadMode {
-    pub const ALL: [PadMode; 3] = [PadMode::OneShot, PadMode::Toggle, PadMode::Gate];
-    pub fn label(self) -> &'static str {
-        match self {
-            PadMode::OneShot => "One shot",
-            PadMode::Toggle => "Play / Stop",
-            PadMode::Gate => "Maintien",
-        }
-    }
 }
 
 /// Paramètres de lecture d'un pad, en trames.
@@ -173,11 +161,7 @@ impl Sampler {
                         self.dispose(sample);
                         return;
                     }
-                    _ => {
-                        for v in self.voices.iter_mut().filter(|v| v.slot == slot) {
-                            v.release(quick);
-                        }
-                    }
+                    _ => {}
                 }
                 if self.voices.len() >= MAX_VOICES || params.start >= params.end {
                     self.dispose(sample);
@@ -198,7 +182,7 @@ impl Sampler {
                     .iter_mut()
                     .filter(|v| v.slot == slot && v.p.mode == PadMode::Gate)
                 {
-                    let f = v.p.fade_out.max(quick);
+                    let f = v.p.fade_out.min(quick * 50).max(quick);
                     v.release(f);
                 }
             }
@@ -321,7 +305,7 @@ mod tests {
         tx.send(PadCmd::Press {
             slot: 1,
             sample: sample(100),
-            params: params(PadMode::OneShot, 100),
+            params: params(PadMode::Toggle, 100),
         })
         .unwrap();
         let mut out = vec![0.0; 128];
@@ -337,6 +321,30 @@ mod tests {
             grx.try_recv().is_ok(),
             "le son doit être rendu à l'interface"
         );
+    }
+
+    #[test]
+    fn gate_stops_on_release() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        tx.send(PadCmd::Press {
+            slot: 2,
+            sample: sample(48000),
+            params: params(PadMode::Gate, 48000),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 2048];
+        s.render(&mut out, 1024, &pos);
+        assert!(pos[2].load(Ordering::Relaxed) > 0);
+        tx.send(PadCmd::Release { slot: 2 }).unwrap();
+        for _ in 0..2 {
+            out.fill(0.0);
+            s.render(&mut out, 1024, &pos);
+        }
+        assert!(out.iter().all(|&x| x == 0.0));
+        assert_eq!(pos[2].load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::render::{self, PeakData, Peaks};
 use crate::sampler::PadCmd;
 use crate::soundboard::{Board, SampleCache, db_to_gain};
 use crate::ui::theme as t;
-use crate::ui::widgets::{self as w, BtnStyle, Icon, MeterState, sq};
-use eframe::egui::{self, Align2, Color32, Key, Vec2, vec2};
+use crate::ui::widgets::{self as w, BtnStyle, Icon, MeterState};
+use eframe::egui::{self, Align2, Color32, Key, vec2};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -164,6 +164,19 @@ pub struct App {
     pub midi: Midi,
     pub midi_ports: Vec<String>,
     pub sb: SbState,
+    // Montage
+    pub undo: Vec<Snapshot>,
+    pub redo: Vec<Snapshot>,
+    pub sel_clips: HashSet<u64>,
+    pub snap: bool,
+    pub clip_drag: Option<crate::ui::multitrack::ClipDrag>,
+}
+
+/// État restaurable par Annuler / Rétablir.
+#[derive(Clone)]
+pub struct Snapshot {
+    tracks: Vec<project::Track>,
+    markers: Vec<project::Marker>,
 }
 
 impl App {
@@ -199,7 +212,7 @@ impl App {
             view: View {
                 spp: 1200.0,
                 scroll: 0.0,
-                track_h: 76.0,
+                track_h: 62.0,
                 follow: true,
                 nav_until: 0.0,
                 want_scroll_y: None,
@@ -233,6 +246,11 @@ impl App {
                 midi_dirty: true,
                 ..Default::default()
             },
+            undo: Vec::new(),
+            redo: Vec::new(),
+            sel_clips: HashSet::new(),
+            snap: true,
+            clip_drag: None,
         };
         app.midi.shared.lock().ctx = Some(cc.egui_ctx.clone());
         let port = app.board.midi_port.clone();
@@ -471,6 +489,7 @@ impl App {
                             start,
                             offset: 0,
                             len: r.frames,
+                            src_len: r.frames,
                         });
                     }
                 }
@@ -547,16 +566,142 @@ impl App {
         self.notify(format!("Repère {n} · {}", fmt_time(pos, self.sr())), false);
     }
 
+    // ---------------------------------------------------------------- montage
+
+    /// Mémorise l'état avant une modification (pour Annuler).
+    pub fn checkpoint(&mut self) {
+        self.undo.push(Snapshot {
+            tracks: self.project.tracks.clone(),
+            markers: self.project.markers.clone(),
+        });
+        if self.undo.len() > 200 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// À appeler après une modification du montage.
+    pub fn edited(&mut self) {
+        self.project.dirty = true;
+        if matches!(self.transport, Transport::Playing { .. }) {
+            // Relance la lecture pour entendre le nouveau montage.
+            self.seek(self.playhead);
+        }
+    }
+
+    fn restore(&mut self, snap: Snapshot) -> Snapshot {
+        let cur = Snapshot {
+            tracks: std::mem::replace(&mut self.project.tracks, snap.tracks),
+            markers: std::mem::replace(&mut self.project.markers, snap.markers),
+        };
+        let ids: HashSet<u64> = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.id))
+            .collect();
+        self.sel_clips.retain(|c| ids.contains(c));
+        self.edited();
+        cur
+    }
+
+    pub fn undo(&mut self) {
+        if !self.is_recording()
+            && let Some(s) = self.undo.pop()
+        {
+            let cur = self.restore(s);
+            self.redo.push(cur);
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if !self.is_recording()
+            && let Some(s) = self.redo.pop()
+        {
+            let cur = self.restore(s);
+            self.undo.push(cur);
+        }
+    }
+
+    /// Les nouvelles prises issues d'une coupe partagent la forme d'onde de l'originale.
+    fn share_peaks(&mut self, pairs: &[(u64, u64)]) {
+        for (old, new) in pairs {
+            if let Some(p) = self.peaks.get(old).cloned() {
+                self.peaks.insert(*new, p);
+            }
+        }
+    }
+
+    /// Coupe à la tête de lecture : les prises sélectionnées, sinon celles des pistes
+    /// sélectionnées, sinon toutes celles sous la tête.
+    pub fn split_at_playhead(&mut self) {
+        if self.is_recording() {
+            return;
+        }
+        let pos = self.playhead;
+        self.checkpoint();
+        let pairs = if !self.sel_clips.is_empty() {
+            let sel = self.sel_clips.clone();
+            self.project.split_at(pos, None, Some(&sel))
+        } else if !self.selected_tracks.is_empty() {
+            let tr = self.selected_tracks.clone();
+            self.project.split_at(pos, Some(&tr), None)
+        } else {
+            self.project.split_at(pos, None, None)
+        };
+        if pairs.is_empty() {
+            self.undo.pop();
+            self.notify("Aucune prise sous la tête de lecture", true);
+            return;
+        }
+        self.share_peaks(&pairs);
+        // La sélection suit la partie droite (pratique pour supprimer la fin).
+        if !self.sel_clips.is_empty() {
+            self.sel_clips = pairs.iter().map(|p| p.1).collect();
+        }
+        self.edited();
+    }
+
+    /// Supprime les prises sélectionnées, ou le contenu de la plage de temps sélectionnée.
+    pub fn delete_selection(&mut self) {
+        if self.is_recording() {
+            return;
+        }
+        if !self.sel_clips.is_empty() {
+            self.checkpoint();
+            let sel = std::mem::take(&mut self.sel_clips);
+            for tr in &mut self.project.tracks {
+                tr.clips.retain(|c| !sel.contains(&c.id));
+            }
+            self.edited();
+        } else if let Some((a, b)) = self.selection {
+            self.checkpoint();
+            let tracks = (!self.selected_tracks.is_empty()).then(|| self.selected_tracks.clone());
+            let pairs = self.project.delete_range(a, b, tracks.as_ref());
+            self.share_peaks(&pairs);
+            self.edited();
+        }
+    }
+
     // ---------------------------------------------------------------- session
 
     fn load_peaks(&mut self) {
         self.peaks.clear();
+        // Une seule analyse par fichier, partagée par toutes les prises qui en viennent.
+        let mut by_file: HashMap<String, Peaks> = HashMap::new();
         for tr in &self.project.tracks {
             for c in &tr.clips {
-                let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
-                self.peaks.insert(c.id, p.clone());
-                let path = self.project.clip_path(c);
-                std::thread::spawn(move || render::compute_peaks(&path, &p));
+                let p = by_file
+                    .entry(c.file.clone())
+                    .or_insert_with(|| {
+                        let p: Peaks = Arc::new(RwLock::new(PeakData::default()));
+                        let path = self.project.clip_path(c);
+                        let p2 = p.clone();
+                        std::thread::spawn(move || render::compute_peaks(&path, &p2));
+                        p
+                    })
+                    .clone();
+                self.peaks.insert(c.id, p);
             }
         }
     }
@@ -577,6 +722,9 @@ impl App {
     }
 
     fn reset_view_for_session(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.sel_clips.clear();
         self.playhead = 0;
         self.view.scroll = 0.0;
         self.view.want_scroll_y = Some(0.0);
@@ -811,6 +959,21 @@ impl App {
             }
             return;
         }
+        if !ctx.egui_wants_keyboard_input() {
+            let shift_cmd = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+            let (redo, undo) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(shift_cmd, Key::Z)
+                        || i.consume_key(egui::Modifiers::COMMAND, Key::Y),
+                    i.consume_key(egui::Modifiers::COMMAND, Key::Z),
+                )
+            });
+            if redo {
+                self.redo();
+            } else if undo {
+                self.undo();
+            }
+        }
         let (save, export, tab1, tab2) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::COMMAND, Key::S),
@@ -872,50 +1035,56 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
-        ui.horizontal_centered(|ui| {
-            ui.add_space(4.0);
-            let more = w::icon_button(ui, Icon::More, sq(30.0), BtnStyle::Ghost, true, "Menu");
-            egui::Popup::menu(&more)
-                .width(250.0)
-                .show(|ui| self.main_menu(ui));
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                ui.add_space(10.0);
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.label(
-                    egui::RichText::new(short(&self.project.name, 34))
-                        .font(t::semibold(13.5))
-                        .color(t::TEXT),
-                );
-                let sub = if self.project.dirty {
-                    "Modifications non enregistrées"
-                } else {
-                    "Enregistrée"
-                };
-                ui.label(
-                    egui::RichText::new(sub)
-                        .font(t::regular(11.0))
-                        .color(t::TEXT_3),
-                );
-            });
-        });
+        let p = ui.painter().clone();
+        w::hline(&p, full.left(), full.right(), full.bottom() - 1.0, t::LINE);
 
-        // Onglets centrés.
-        let seg_w = 130.0;
-        let r = egui::Rect::from_center_size(full.center(), vec2(seg_w * 2.0 + 6.0, 34.0));
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
-        let mut tab = self.tab;
-        if w::segmented(
-            &mut child,
-            &mut tab,
-            &["Multipiste", "Soundboard"],
-            seg_w,
-            34.0,
-        ) {
-            self.tab = tab;
+        // Gauche : menu + session.
+        let left =
+            egui::Rect::from_min_max(full.min, egui::pos2(full.left() + 360.0, full.bottom()));
+        let mut lui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(left)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        lui.add_space(6.0);
+        let more = w::icon_button(&mut lui, Icon::More, 28.0, BtnStyle::Ghost, true, "Menu");
+        egui::Popup::menu(&more)
+            .width(250.0)
+            .show(|ui| self.main_menu(ui));
+        lui.add_space(6.0);
+        lui.label(
+            egui::RichText::new(short(&self.project.name, 36))
+                .font(t::semibold(12.0))
+                .color(t::TEXT),
+        );
+        if self.project.dirty {
+            lui.label(
+                egui::RichText::new("●")
+                    .font(t::regular(9.0))
+                    .color(t::TEXT_3),
+            )
+            .on_hover_text("Modifications non enregistrées (Ctrl+S)");
         }
 
-        // Carte son à droite.
+        // Centre : transport (visible dans les deux onglets : on peut enregistrer en lançant des pads).
+        let tw = 4.0 * 30.0 + 12.0 + 168.0;
+        let center = egui::Rect::from_center_size(full.center(), vec2(tw, full.height()));
+        let mut cui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(center)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        self.transport_controls(&mut cui);
+
+        // Droite : onglets de vue + carte son.
+        let right =
+            egui::Rect::from_min_max(egui::pos2(full.right() - 560.0, full.top()), full.max);
+        let mut rui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(right)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        rui.add_space(8.0);
         let st = &self.engine.status;
         let ok = st.input.is_some() || st.output.is_some();
         let dev = st
@@ -925,9 +1094,9 @@ impl App {
             .unwrap_or_else(|| "Aucune carte son".into());
         let label = if ok {
             format!(
-                "{}  ·  {}  ·  {} kHz  ·  {} in / {} out",
+                "{} · {} · {} kHz · {}/{}",
                 st.host,
-                short(&dev, 28),
+                short(&dev, 26),
                 fmt_khz(st.sample_rate),
                 st.in_channels,
                 st.out_channels
@@ -935,41 +1104,145 @@ impl App {
         } else {
             dev
         };
-        let font = t::medium(12.0);
-        let gal = ui.painter().layout_no_wrap(label, font, t::TEXT_2);
-        let pw = gal.size().x + 44.0;
-        let pr = egui::Rect::from_min_size(
-            egui::pos2(full.right() - pw - 8.0, full.center().y - 15.0),
-            vec2(pw, 30.0),
-        );
-        let resp = ui.interact(
-            pr,
-            ui.make_persistent_id("device_pill"),
-            egui::Sense::click(),
-        );
-        let p = ui.painter();
-        p.rect_filled(
-            pr,
-            15.0,
-            if resp.hovered() {
-                t::SURFACE_3
-            } else {
-                t::SURFACE_2
-            },
-        );
-        p.circle_filled(
-            egui::pos2(pr.left() + 16.0, pr.center().y),
-            4.0,
+        let gal = rui
+            .painter()
+            .layout_no_wrap(label, t::regular(11.0), t::TEXT_2);
+        let (pr, resp) =
+            rui.allocate_exact_size(vec2(gal.size().x + 26.0, 24.0), egui::Sense::click());
+        let pp = rui.painter();
+        if resp.hovered() {
+            pp.rect_filled(pr, t::R, t::SURFACE_3);
+        }
+        pp.rect_filled(
+            egui::Rect::from_center_size(
+                egui::pos2(pr.left() + 10.0, pr.center().y),
+                vec2(6.0, 6.0),
+            ),
+            1.0,
             if ok { t::PLAY } else { t::REC },
         );
-        p.galley(
-            egui::pos2(pr.left() + 28.0, pr.center().y - gal.size().y / 2.0),
+        pp.galley(
+            egui::pos2(pr.left() + 19.0, pr.center().y - gal.size().y / 2.0),
             gal,
             t::TEXT_2,
         );
         if resp.on_hover_text("Réglages de la carte son").clicked() {
             self.open_audio();
         }
+        rui.add_space(10.0);
+        let mut tabs = egui::Rect::from_min_max(
+            egui::pos2(rui.cursor().left() - 230.0, full.top()),
+            egui::pos2(rui.cursor().left(), full.bottom() - 1.0),
+        );
+        tabs.set_left(tabs.left().max(center.right() + 10.0));
+        let mut tui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(tabs)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let mut tab = self.tab;
+        if w::view_tabs(&mut tui, &mut tab, &["MULTIPISTE", "SOUNDBOARD"]) {
+            self.tab = tab;
+        }
+    }
+
+    fn transport_controls(&mut self, ui: &mut egui::Ui) {
+        let recording = self.is_recording();
+        let playing = matches!(self.transport, Transport::Playing { .. });
+        let stopped = self.is_stopped();
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if w::icon_button(
+            ui,
+            Icon::ToStart,
+            30.0,
+            BtnStyle::Ghost,
+            !recording,
+            "Début (Origine)",
+        )
+        .clicked()
+        {
+            self.seek(0);
+            self.view.scroll = 0.0;
+        }
+        if w::icon_button(
+            ui,
+            Icon::Stop,
+            30.0,
+            BtnStyle::Ghost,
+            !stopped,
+            "Stop (Espace)",
+        )
+        .clicked()
+        {
+            self.stop();
+        }
+        let play_style = if playing {
+            BtnStyle::Active(t::PLAY)
+        } else {
+            BtnStyle::Ghost
+        };
+        if w::icon_button(
+            ui,
+            Icon::Play,
+            30.0,
+            play_style,
+            !recording,
+            "Lecture (Espace)",
+        )
+        .clicked()
+        {
+            if playing {
+                self.stop();
+            } else {
+                self.play();
+            }
+        }
+        let blink = (self.now * 1.6).fract() < 0.55;
+        let rec_style = if recording {
+            BtnStyle::Active(if blink {
+                t::REC
+            } else {
+                t::mix(t::REC, t::SURFACE, 0.4)
+            })
+        } else {
+            BtnStyle::Tinted(t::REC)
+        };
+        if w::icon_button(ui, Icon::Record, 30.0, rec_style, true, "Enregistrer (R)").clicked() {
+            if recording {
+                self.stop();
+            } else {
+                self.record();
+            }
+        }
+        ui.add_space(10.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(168.0, 30.0), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, t::R, t::INSET);
+        let col = if recording { t::REC } else { t::TEXT };
+        w::counter(
+            p,
+            egui::pos2(rect.left() + 62.0, rect.center().y),
+            &fmt_time(self.playhead, self.sr()),
+            t::medium(14.0),
+            col,
+        );
+        let sub = match self.transport {
+            Transport::Recording { start } => format!(
+                "REC {}",
+                fmt_time_short(self.playhead.saturating_sub(start), self.sr())
+            ),
+            _ => match self.selection {
+                Some((a, b)) => format!("SÉL {}", fmt_time_short(b - a, self.sr())),
+                None => fmt_time_short(self.project.end(), self.sr()),
+            },
+        };
+        p.text(
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            sub,
+            t::medium(9.5),
+            if recording { t::REC } else { t::TEXT_3 },
+        );
     }
 
     fn main_menu(&mut self, ui: &mut egui::Ui) {
@@ -1159,12 +1432,16 @@ impl App {
     fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
         let mut close = false;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(title).font(t::semibold(17.0)));
+            ui.label(
+                egui::RichText::new(title.to_uppercase())
+                    .font(t::semibold(11.5))
+                    .color(t::TEXT),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = w::icon_button(
                     ui,
                     Icon::Close,
-                    sq(26.0),
+                    22.0,
                     BtnStyle::Ghost,
                     true,
                     "Fermer (Échap)",
@@ -1172,18 +1449,21 @@ impl App {
                 .clicked();
             });
         });
-        ui.add_space(10.0);
+        let r = ui.available_rect_before_wrap();
+        w::hline(
+            ui.painter(),
+            r.left() - 16.0,
+            r.right() + 16.0,
+            r.top() + 2.0,
+            t::LINE,
+        );
+        ui.add_space(12.0);
         close
     }
 
     fn section(ui: &mut egui::Ui, title: &str) {
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(title.to_uppercase())
-                .font(t::semibold(10.5))
-                .color(t::TEXT_3),
-        );
-        ui.add_space(2.0);
+        ui.add_space(8.0);
+        w::section(ui, title);
     }
 
     fn audio_dialog(&mut self, ctx: &egui::Context) {
@@ -1328,7 +1608,7 @@ impl App {
                         dlg.refresh();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if w::pill(ui, None, "Appliquer", Some(t::ACCENT), true).clicked() {
+                        if w::primary_button(ui, None, "Appliquer", true).clicked() {
                             apply = true;
                         }
                     });
@@ -1564,14 +1844,8 @@ impl App {
                         egui::RichText::new(format!("{n_files} fichier(s){conv}")).color(t::TEXT_3),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if w::pill(
-                            ui,
-                            Some(Icon::Export),
-                            "Exporter",
-                            Some(t::ACCENT),
-                            n_files > 0,
-                        )
-                        .clicked()
+                        if w::primary_button(ui, Some(Icon::Export), "Exporter", n_files > 0)
+                            .clicked()
                         {
                             go = true;
                         }
@@ -1636,14 +1910,7 @@ impl App {
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if w::pill(
-                            ui,
-                            None,
-                            "Créer",
-                            Some(t::ACCENT),
-                            !d.name.trim().is_empty(),
-                        )
-                        .clicked()
+                        if w::primary_button(ui, None, "Créer", !d.name.trim().is_empty()).clicked()
                         {
                             create = true;
                         }
@@ -1673,34 +1940,42 @@ impl App {
             .order(egui::Order::Tooltip)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::new()
+                let col = if tt.error { t::REC } else { t::ACCENT };
+                let resp = egui::Frame::new()
                     .fill(t::SURFACE_3.gamma_multiply(fade))
-                    .stroke(egui::Stroke::new(1.0, t::BORDER))
-                    .corner_radius(20)
-                    .inner_margin(egui::Margin::symmetric(18, 10))
+                    .stroke(egui::Stroke::new(1.0, t::LINE))
+                    .corner_radius(t::R)
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 14,
+                        top: 8,
+                        bottom: 8,
+                    })
                     .shadow(egui::Shadow {
-                        offset: [0, 6],
-                        blur: 24,
+                        offset: [0, 4],
+                        blur: 16,
                         spread: 0,
-                        color: Color32::from_black_alpha((110.0 * fade) as u8),
+                        color: Color32::from_black_alpha((140.0 * fade) as u8),
                     })
                     .show(ui, |ui| {
                         ui.set_max_width(620.0);
-                        ui.horizontal(|ui| {
-                            let (r, _) =
-                                ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
-                            ui.painter().circle_filled(
-                                r.center(),
-                                4.0,
-                                if tt.error { t::REC } else { t::PLAY },
-                            );
-                            ui.label(
-                                egui::RichText::new(&tt.text)
-                                    .font(t::medium(13.0))
-                                    .color(t::TEXT.gamma_multiply(fade)),
-                            );
-                        });
+                        ui.label(
+                            egui::RichText::new(&tt.text)
+                                .font(t::medium(12.0))
+                                .color(t::TEXT.gamma_multiply(fade)),
+                        );
                     });
+                let r = resp.response.rect;
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(r.min, egui::pos2(r.left() + 3.0, r.bottom())),
+                    egui::CornerRadius {
+                        nw: t::R,
+                        sw: t::R,
+                        ne: 0,
+                        se: 0,
+                    },
+                    col.gamma_multiply(fade),
+                );
             });
     }
 }
@@ -1725,19 +2000,15 @@ impl eframe::App for App {
         self.soundboard_background(&ctx);
 
         egui::Panel::top("top")
-            .exact_size(56.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(t::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(10, 0)),
-            )
+            .exact_size(44.0)
+            .frame(egui::Frame::new().fill(t::SURFACE))
             .show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status")
-            .exact_size(26.0)
+            .exact_size(22.0)
             .frame(
                 egui::Frame::new()
                     .fill(t::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(14, 0)),
+                    .inner_margin(egui::Margin::symmetric(12, 0)),
             )
             .show(ui, |ui| self.status_bar(ui));
 

@@ -88,7 +88,7 @@ impl Pad {
             end: None,
             fade_in: 0.0,
             fade_out: 0.0,
-            mode: PadMode::OneShot,
+            mode: PadMode::Toggle,
             looped: false,
             key: None,
             midi: None,
@@ -152,6 +152,9 @@ pub struct Board {
     pub panic_fade: f64,
     #[serde(default)]
     pub midi_port: Option<String>,
+    /// Mode des nouveaux pads.
+    #[serde(default)]
+    pub default_mode: PadMode,
 }
 
 fn default_panic_fade() -> f64 {
@@ -168,6 +171,7 @@ impl Default for Board {
             master_db: 0.0,
             panic_fade: 1.0,
             midi_port: None,
+            default_mode: PadMode::Toggle,
         }
     }
 }

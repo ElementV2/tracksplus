@@ -1,4 +1,6 @@
-//! Thème : sombre, doux et épuré (inspiration Apple / Resolume), police Inter.
+//! Direction artistique : sombre, plate et dense, inspirée des stations audio modernes
+//! (Bitwig). Gris anthracite neutres, séparateurs fins, angles presque droits,
+//! un seul accent orange, couleurs de pistes désaturées.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke,
@@ -6,52 +8,66 @@ use eframe::egui::{
 };
 use std::sync::Arc;
 
-pub const BG: Color32 = Color32::from_rgb(0x0d, 0x0e, 0x10);
-pub const SURFACE: Color32 = Color32::from_rgb(0x15, 0x16, 0x19);
-pub const SURFACE_2: Color32 = Color32::from_rgb(0x1c, 0x1d, 0x21);
-pub const SURFACE_3: Color32 = Color32::from_rgb(0x25, 0x26, 0x2b);
-pub const SURFACE_4: Color32 = Color32::from_rgb(0x30, 0x31, 0x37);
-pub const BORDER: Color32 = Color32::from_rgb(0x26, 0x27, 0x2c);
-pub const LANE_A: Color32 = Color32::from_rgb(0x11, 0x12, 0x14);
-pub const LANE_B: Color32 = Color32::from_rgb(0x13, 0x14, 0x17);
+// Fonds, du plus profond au plus clair.
+pub const BG: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
+pub const SURFACE: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
+pub const SURFACE_2: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
+pub const SURFACE_3: Color32 = Color32::from_rgb(0x30, 0x30, 0x30);
+pub const SURFACE_4: Color32 = Color32::from_rgb(0x3b, 0x3b, 0x3b);
+/// Trait sombre entre les zones.
+pub const LINE: Color32 = Color32::from_rgb(0x0a, 0x0a, 0x0a);
+pub const LANE_A: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
+pub const LANE_B: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1c);
+pub const GRID: Color32 = Color32::from_rgb(0x24, 0x24, 0x24);
+pub const INSET: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
 
-pub const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf4);
-pub const TEXT_2: Color32 = Color32::from_rgb(0xa1, 0xa1, 0xaa);
-pub const TEXT_3: Color32 = Color32::from_rgb(0x63, 0x63, 0x6c);
+pub const TEXT: Color32 = Color32::from_rgb(0xdc, 0xdc, 0xdc);
+pub const TEXT_2: Color32 = Color32::from_rgb(0x9c, 0x9c, 0x9c);
+pub const TEXT_3: Color32 = Color32::from_rgb(0x66, 0x66, 0x66);
 
-pub const ACCENT: Color32 = Color32::from_rgb(0x0a, 0x84, 0xff);
-pub const REC: Color32 = Color32::from_rgb(0xff, 0x45, 0x3a);
-pub const PLAY: Color32 = Color32::from_rgb(0x30, 0xd1, 0x58);
-pub const YELLOW: Color32 = Color32::from_rgb(0xff, 0xd6, 0x0a);
-pub const ORANGE: Color32 = Color32::from_rgb(0xff, 0x9f, 0x0a);
-pub const PLAYHEAD: Color32 = Color32::from_rgb(0xf5, 0xf5, 0xf7);
-pub const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(0x0a, 0x84, 0xff, 0x22);
+pub const ACCENT: Color32 = Color32::from_rgb(0xff, 0x8a, 0x1f);
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x5a, 0x35, 0x12);
+pub const REC: Color32 = Color32::from_rgb(0xe8, 0x45, 0x3c);
+pub const PLAY: Color32 = Color32::from_rgb(0x5f, 0xc8, 0x5c);
+pub const YELLOW: Color32 = Color32::from_rgb(0xe6, 0xc2, 0x3a);
+pub const ORANGE: Color32 = Color32::from_rgb(0xf0, 0x9a, 0x2e);
+pub const PLAYHEAD: Color32 = Color32::from_rgb(0xf0, 0xf0, 0xf0);
+pub const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x12);
+pub const MARKER: Color32 = Color32::from_rgb(0xc9, 0xa2, 0x4a);
 
-pub const METER_OFF: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x1f);
-pub const METER_GREEN: Color32 = Color32::from_rgb(0x30, 0xd1, 0x58);
-pub const METER_YELLOW: Color32 = Color32::from_rgb(0xff, 0xd6, 0x0a);
-pub const METER_RED: Color32 = Color32::from_rgb(0xff, 0x45, 0x3a);
+pub const METER_OFF: Color32 = Color32::from_rgb(0x0e, 0x0e, 0x0e);
+pub const METER_GREEN: Color32 = Color32::from_rgb(0x57, 0xc0, 0x4f);
+pub const METER_YELLOW: Color32 = Color32::from_rgb(0xdc, 0xbd, 0x37);
+pub const METER_RED: Color32 = Color32::from_rgb(0xe8, 0x45, 0x3c);
 
-pub const PALETTE: [Color32; 10] = [
-    Color32::from_rgb(0x0a, 0x84, 0xff),
-    Color32::from_rgb(0x30, 0xd1, 0x58),
-    Color32::from_rgb(0x5e, 0x5c, 0xe6),
-    Color32::from_rgb(0xff, 0x9f, 0x0a),
-    Color32::from_rgb(0xff, 0x37, 0x5f),
-    Color32::from_rgb(0x64, 0xd2, 0xff),
-    Color32::from_rgb(0xbf, 0x5a, 0xf2),
-    Color32::from_rgb(0xff, 0xd6, 0x0a),
-    Color32::from_rgb(0x63, 0xe6, 0xe2),
-    Color32::from_rgb(0xac, 0x8e, 0x68),
+/// Couleurs de pistes et de pads, désaturées pour rester lisibles sur fond sombre.
+pub const PALETTE: [Color32; 12] = [
+    Color32::from_rgb(0xd9, 0x5e, 0x45),
+    Color32::from_rgb(0xe0, 0x8a, 0x35),
+    Color32::from_rgb(0xcf, 0xb5, 0x41),
+    Color32::from_rgb(0x8f, 0xb4, 0x45),
+    Color32::from_rgb(0x4c, 0xa9, 0x6b),
+    Color32::from_rgb(0x3f, 0xa8, 0x9f),
+    Color32::from_rgb(0x46, 0x9a, 0xd0),
+    Color32::from_rgb(0x6f, 0x80, 0xd6),
+    Color32::from_rgb(0x95, 0x72, 0xcc),
+    Color32::from_rgb(0xc0, 0x63, 0xa6),
+    Color32::from_rgb(0x9a, 0x8a, 0x78),
+    Color32::from_rgb(0x8a, 0x93, 0x9b),
 ];
 
 pub fn color(i: usize) -> Color32 {
-    PALETTE[i % PALETTE.len()]
+    PALETTE[(i + 6) % PALETTE.len()]
 }
 
-pub const R_SMALL: u8 = 6;
-pub const R: u8 = 10;
-pub const R_LARGE: u8 = 14;
+pub fn mix(a: Color32, b: Color32, k: f32) -> Color32 {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k).round() as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// Rayons : presque droits.
+pub const R: u8 = 2;
+pub const R_PANEL: u8 = 3;
 
 pub fn medium(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("medium".into()))
@@ -65,17 +81,22 @@ pub fn regular(size: f32) -> FontId {
     FontId::proportional(size)
 }
 
+/// Libellé de section en petites capitales.
+pub fn caps(size: f32) -> FontId {
+    semibold(size)
+}
+
 pub fn window_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(SURFACE_2)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(R_LARGE)
-        .inner_margin(egui::Margin::same(20))
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(R_PANEL)
+        .inner_margin(egui::Margin::same(16))
         .shadow(Shadow {
-            offset: [0, 12],
-            blur: 40,
+            offset: [0, 8],
+            blur: 24,
             spread: 0,
-            color: Color32::from_black_alpha(140),
+            color: Color32::from_black_alpha(160),
         })
 }
 
@@ -124,58 +145,63 @@ pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.global_style()).clone();
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
-    v.window_fill = SURFACE_2;
-    v.extreme_bg_color = SURFACE;
+    v.window_fill = SURFACE;
+    v.extreme_bg_color = INSET;
     v.faint_bg_color = SURFACE_2;
-    v.code_bg_color = SURFACE;
+    v.code_bg_color = INSET;
     v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = ACCENT;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.selection.bg_fill = ACCENT_DIM;
+    v.selection.stroke = Stroke::new(1.0, ACCENT);
     v.hyperlink_color = ACCENT;
-    v.window_corner_radius = CornerRadius::same(R_LARGE);
-    v.window_stroke = Stroke::new(1.0, BORDER);
-    v.menu_corner_radius = CornerRadius::same(R);
+    v.window_corner_radius = CornerRadius::same(R_PANEL);
+    v.window_stroke = Stroke::new(1.0, LINE);
+    v.menu_corner_radius = CornerRadius::same(R_PANEL);
     v.popup_shadow = Shadow {
-        offset: [0, 8],
-        blur: 28,
+        offset: [0, 4],
+        blur: 14,
         spread: 0,
-        color: Color32::from_black_alpha(120),
+        color: Color32::from_black_alpha(150),
     };
     v.window_shadow = v.popup_shadow;
+    v.text_cursor.stroke = Stroke::new(1.5, ACCENT);
     let w = &mut v.widgets;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    w.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
     w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_2);
-    w.noninteractive.corner_radius = CornerRadius::same(R_SMALL);
+    w.noninteractive.corner_radius = CornerRadius::same(R);
+    w.noninteractive.bg_fill = SURFACE;
     for (s, fill) in [
         (&mut w.inactive, SURFACE_3),
         (&mut w.hovered, SURFACE_4),
         (&mut w.active, SURFACE_4),
         (&mut w.open, SURFACE_4),
     ] {
-        s.corner_radius = CornerRadius::same(R_SMALL + 2);
+        s.corner_radius = CornerRadius::same(R);
         s.bg_fill = fill;
         s.weak_bg_fill = fill;
         s.bg_stroke = Stroke::NONE;
         s.expansion = 0.0;
     }
     w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    w.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    w.active.fg_stroke = Stroke::new(1.0, TEXT);
+    w.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    w.hovered.bg_stroke = Stroke::new(1.0, SURFACE_4);
     v.slider_trailing_fill = true;
     v.striped = false;
+    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.6 };
     style.visuals = v;
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.interact_size.y = 28.0;
-    style.spacing.menu_margin = egui::Margin::same(6);
-    style.spacing.window_margin = egui::Margin::same(20);
-    style.spacing.slider_rail_height = 4.0;
-    style.text_styles.insert(TextStyle::Body, regular(13.5));
-    style.text_styles.insert(TextStyle::Button, medium(13.0));
-    style.text_styles.insert(TextStyle::Small, regular(11.0));
-    style.text_styles.insert(TextStyle::Heading, semibold(18.0));
+    style.spacing.button_padding = egui::vec2(9.0, 4.0);
+    style.spacing.item_spacing = egui::vec2(6.0, 6.0);
+    style.spacing.interact_size.y = 22.0;
+    style.spacing.menu_margin = egui::Margin::same(4);
+    style.spacing.window_margin = egui::Margin::same(0);
+    style.spacing.slider_rail_height = 3.0;
+    style.spacing.combo_height = 320.0;
+    style.text_styles.insert(TextStyle::Body, regular(12.0));
+    style.text_styles.insert(TextStyle::Button, regular(12.0));
+    style.text_styles.insert(TextStyle::Small, regular(10.5));
+    style.text_styles.insert(TextStyle::Heading, semibold(14.0));
     style
         .text_styles
-        .insert(TextStyle::Monospace, FontId::monospace(12.5));
+        .insert(TextStyle::Monospace, FontId::monospace(11.5));
     ctx.set_global_style(style);
 }

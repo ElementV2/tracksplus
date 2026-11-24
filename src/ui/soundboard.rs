@@ -2,7 +2,7 @@
 
 use super::multitrack::master_panel;
 use super::theme as t;
-use super::widgets::{self as w, BtnStyle, Icon, sq};
+use super::widgets::{self as w, BtnStyle, Icon};
 use crate::app::{App, short};
 use crate::midi::{ALL_PORTS, list_ports};
 use crate::sampler::{MAX_PAGES, PadCmd, PadMode, SAMPLE_PEAK, SampleData};
@@ -86,6 +86,7 @@ impl App {
             let color = (slot % t::PALETTE.len()) as u8;
             let old = self.board.pad(slot as u16).cloned();
             let mut pad = Pad::new(f.clone(), color);
+            pad.mode = self.board.default_mode;
             if let Some(o) = old {
                 // On garde les réglages de déclenchement du pad remplacé.
                 pad.color = o.color;
@@ -217,15 +218,15 @@ impl App {
             self.sb.page = 0;
         }
         egui::Panel::top("sb_head")
-            .exact_size(64.0)
+            .exact_size(36.0)
             .frame(
                 egui::Frame::new()
-                    .fill(t::BG)
-                    .inner_margin(egui::Margin::symmetric(16, 0)),
+                    .fill(t::SURFACE_2)
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show(ui, |ui| self.sb_header(ui));
         egui::Panel::right("sb_master")
-            .exact_size(104.0)
+            .exact_size(86.0)
             .frame(egui::Frame::new().fill(t::SURFACE))
             .show(ui, |ui| {
                 let mut m = self.master_pad;
@@ -235,52 +236,76 @@ impl App {
         if self.sb.selected.and_then(|s| self.board.pad(s)).is_some() {
             egui::Panel::bottom("sb_editor")
                 .resizable(true)
-                .default_size(340.0)
-                .min_size(260.0)
+                .default_size(300.0)
+                .min_size(240.0)
                 .max_size(520.0)
                 .frame(
                     egui::Frame::new()
                         .fill(t::SURFACE)
-                        .inner_margin(egui::Margin::same(16)),
+                        .inner_margin(egui::Margin::same(12)),
                 )
-                .show(ui, |ui| self.pad_editor(ui));
+                .show(ui, |ui| {
+                    let r = ui.max_rect();
+                    w::hline(
+                        ui.painter(),
+                        r.left() - 12.0,
+                        r.right() + 12.0,
+                        r.top() - 12.0,
+                        t::LINE,
+                    );
+                    self.pad_editor(ui)
+                });
         }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(t::BG)
-                    .inner_margin(egui::Margin::symmetric(16, 8)),
+                    .inner_margin(egui::Margin::same(6)),
             )
             .show(ui, |ui| self.pad_grid(ui));
     }
 
+    /// Mode commun aux pads de la page (None si mélangé).
+    fn page_mode(&self) -> Option<PadMode> {
+        let mut modes = self.board.pages[self.sb.page]
+            .pads
+            .iter()
+            .flatten()
+            .map(|p| p.mode);
+        let first = modes.next()?;
+        modes.all(|m| m == first).then_some(first)
+    }
+
     fn sb_header(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
+        w::hline(
+            ui.painter(),
+            full.left() - 10.0,
+            full.right() + 10.0,
+            full.bottom() - 1.0,
+            t::LINE,
+        );
         ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let mut remove_page = None;
-            for i in 0..self.board.pages.len() {
-                let active = i == self.sb.page;
-                let name = self.board.pages[i].name.clone();
-                let r = w::pill(
-                    ui,
-                    None,
-                    &name,
-                    if active { Some(t::SURFACE_4) } else { None },
-                    true,
-                );
-                if r.clicked() {
-                    self.sb.page = i;
+            // Pages
+            let mut page = self.sb.page;
+            let names: Vec<String> = self.board.pages.iter().map(|p| p.name.to_uppercase()).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let before = ui.cursor().left();
+            ui.scope(|ui| {
+                ui.set_height(full.height());
+                if w::view_tabs(ui, &mut page, &refs) {
+                    self.sb.page = page;
                 }
-                r.context_menu(|ui| {
+            });
+            // Menu contextuel de la page active (renommer / supprimer).
+            let tabs_rect = Rect::from_min_max(pos2(before, full.top()), pos2(ui.cursor().left(), full.bottom()));
+            let mut remove_page = None;
+            ui.interact(tabs_rect, ui.make_persistent_id("page_tabs_ctx"), Sense::click())
+                .on_hover_text("Clic droit : renommer ou supprimer la page")
+                .context_menu(|ui| {
+                    let i = self.sb.page;
                     ui.set_width(200.0);
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.board.pages[i].name)
-                                .desired_width(180.0),
-                        )
-                        .changed()
-                    {
+                    if ui.add(egui::TextEdit::singleline(&mut self.board.pages[i].name).desired_width(180.0)).changed() {
                         self.board_changed = Some(self.now);
                     }
                     if self.board.pages.len() > 1 && ui.button("Supprimer la page").clicked() {
@@ -288,66 +313,94 @@ impl App {
                         ui.close();
                     }
                 });
-            }
             if let Some(i) = remove_page {
                 self.board.pages.remove(i);
                 self.sb.page = self.sb.page.min(self.board.pages.len() - 1);
                 self.sb.selected = None;
                 self.board_modified();
             }
-            if self.board.pages.len() < MAX_PAGES
-                && w::icon_button(
-                    ui,
-                    Icon::Plus,
-                    sq(30.0),
-                    BtnStyle::Ghost,
-                    true,
-                    "Nouvelle page",
-                )
-                .clicked()
-            {
+            if self.board.pages.len() < MAX_PAGES && w::icon_button(ui, Icon::Plus, 22.0, BtnStyle::Ghost, true, "Nouvelle page").clicked() {
                 let n = self.board.pages.len() + 1;
                 self.board.pages.push(Page::new(format!("Page {n}")));
                 self.sb.page = self.board.pages.len() - 1;
                 self.board_modified();
             }
+
+            ui.add_space(16.0);
+            w::section(ui, "Mode");
+            let mut mode = self.page_mode().unwrap_or(self.board.default_mode);
+            let mixed = self.page_mode().is_none() && self.board.pages[self.sb.page].pads.iter().flatten().next().is_some();
+            let r = ui.scope(|ui| {
+                w::segmented(ui, "pagemode", &mut mode, &[(PadMode::Toggle, "▶ / ■  Lecture-Stop"), (PadMode::Gate, "Maintenir")])
+            });
+            r.response.on_hover_text(
+                "Lecture-Stop : un appui lance, un nouvel appui arrête.\nMaintenir : le son joue tant que le pad est tenu, et s'arrête au relâchement.\nS'applique à tous les pads de la page et aux nouveaux pads.",
+            );
+            if r.inner {
+                self.board.default_mode = mode;
+                for p in self.board.pages[self.sb.page].pads.iter_mut().flatten() {
+                    p.mode = mode;
+                }
+                self.board_modified();
+            }
+            if mixed {
+                ui.label(egui::RichText::new("mixte").font(t::regular(10.5)).color(t::TEXT_3));
+            }
         });
 
-        let right = Rect::from_min_max(pos2(full.right() - 760.0, full.top()), full.max);
+        let right = Rect::from_min_max(pos2(full.right() - 700.0, full.top()), full.max);
         let mut child = ui.new_child(
             UiBuilder::new()
                 .max_rect(right)
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         let ui = &mut child;
-        ui.spacing_mut().item_spacing.x = 8.0;
-        if w::pill(
-            ui,
-            Some(Icon::Stop),
-            "Tout arrêter",
-            Some(t::REC.gamma_multiply(0.85)),
-            true,
-        )
-        .on_hover_text(format!(
-            "Fondu de sortie {:.1} s sur tous les pads (Échap)",
-            self.board.panic_fade
-        ))
-        .clicked()
+        ui.spacing_mut().item_spacing.x = 6.0;
         {
-            self.stop_all_pads();
+            let g = ui
+                .painter()
+                .layout_no_wrap("Tout arrêter".into(), t::semibold(11.5), t::TEXT);
+            let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 34.0, 24.0), Sense::click());
+            let bg = if resp.hovered() {
+                t::REC
+            } else {
+                t::mix(t::REC, t::SURFACE_2, 0.45)
+            };
+            ui.painter().rect_filled(r, t::R, bg);
+            w::paint_icon(
+                ui.painter(),
+                Icon::Stop,
+                pos2(r.left() + 13.0, r.center().y),
+                4.5,
+                Color32::BLACK,
+            );
+            ui.painter().galley(
+                pos2(r.left() + 23.0, r.center().y - g.size().y / 2.0),
+                g,
+                Color32::BLACK,
+            );
+            if resp
+                .on_hover_text(format!(
+                    "Arrêt de tous les pads en fondu de {:.1} s (Échap)",
+                    self.board.panic_fade
+                ))
+                .clicked()
+            {
+                self.stop_all_pads();
+            }
         }
 
-        // Volume général des pads
         let mut db = self.board.master_db;
-        let r = ui.add(
+        ui.label(
+            egui::RichText::new(format!("{} dB", w::fmt_db(db)))
+                .font(t::medium(10.5))
+                .color(t::TEXT_2),
+        );
+        let r = ui.add_sized(
+            [110.0, 20.0],
             egui::Slider::new(&mut db, -40.0..=6.0)
                 .show_value(false)
                 .trailing_fill(true),
-        );
-        ui.label(
-            egui::RichText::new(format!("{} dB", w::fmt_db(db)))
-                .font(t::medium(11.5))
-                .color(t::TEXT_2),
         );
         if r.changed() {
             self.board.master_db = db;
@@ -360,14 +413,14 @@ impl App {
             self.board.master_db = 0.0;
             self.engine.pad(PadCmd::SetMaster { gain: 1.0 });
         }
-        let (ir, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-        w::paint_icon(ui.painter(), Icon::Speaker, ir.center(), 6.5, t::TEXT_2);
+        let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+        w::paint_icon(ui.painter(), Icon::Speaker, ir.center(), 5.5, t::TEXT_2);
+        ui.add_space(6.0);
 
-        // Sorties
         let out_ch = self.engine.status.out_channels.max(2);
         let l = self.board.out_left;
         egui::ComboBox::from_id_salt("sb_out")
-            .width(118.0)
+            .width(104.0)
             .height(320.0)
             .selected_text(format!("Sorties {} – {}", l + 1, l + 2))
             .show_ui(ui, |ui| {
@@ -385,7 +438,6 @@ impl App {
                 }
             });
 
-        // Contrôleur MIDI
         let active = self.now - self.sb.midi_seen < 0.15;
         let cur = self
             .board
@@ -394,7 +446,7 @@ impl App {
             .unwrap_or_else(|| "Aucun contrôleur".into());
         let mut choose: Option<Option<String>> = None;
         let combo = egui::ComboBox::from_id_salt("sb_midi")
-            .width(170.0)
+            .width(160.0)
             .selected_text(short(&cur, 22))
             .show_ui(ui, |ui| {
                 if ui
@@ -424,15 +476,19 @@ impl App {
         if combo.response.clicked() {
             self.midi_ports = list_ports();
         }
-        let (dr, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+        let (dr, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
         let dot = if active {
             t::PLAY
         } else if self.midi.connected.is_empty() {
             t::SURFACE_4
         } else {
-            t::PLAY.gamma_multiply(0.35)
+            t::mix(t::PLAY, t::SURFACE_2, 0.6)
         };
-        ui.painter().circle_filled(dr.center(), 4.0, dot);
+        ui.painter().rect_filled(
+            Rect::from_center_size(dr.center(), vec2(6.0, 6.0)),
+            1.0,
+            dot,
+        );
         let tip = match (&self.midi.error, &self.sb.midi_last) {
             (Some(e), _) => format!("Erreur MIDI : {e}"),
             (None, Some(l)) => format!("Dernier message : {l}"),
@@ -452,11 +508,16 @@ impl App {
                 );
             }
         }
+        ui.label(
+            egui::RichText::new("MIDI")
+                .font(t::caps(10.0))
+                .color(t::TEXT_3),
+        );
+        ui.add_space(6.0);
 
-        // Taille de la grille
         let (c, r) = (self.board.cols, self.board.rows);
         egui::ComboBox::from_id_salt("sb_grid")
-            .width(76.0)
+            .width(64.0)
             .selected_text(format!("{c} × {r}"))
             .show_ui(ui, |ui| {
                 for (cc, rr) in [(4, 2), (4, 4), (5, 3), (6, 4), (8, 4), (8, 6), (8, 8)] {
@@ -475,10 +536,10 @@ impl App {
     fn pad_grid(&mut self, ui: &mut egui::Ui) {
         let area = ui.available_rect_before_wrap();
         let (cols, rows) = (self.board.cols, self.board.rows);
-        let gap = 10.0;
+        let gap = 4.0;
         let pw = ((area.width() - gap * (cols as f32 - 1.0)) / cols as f32).max(40.0);
         let ph =
-            ((area.height() - gap * (rows as f32 - 1.0)) / rows as f32).clamp(40.0, pw.max(90.0));
+            ((area.height() - gap * (rows as f32 - 1.0)) / rows as f32).clamp(40.0, pw.max(80.0));
         let page = self.sb.page;
         let pointer = ui.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()));
         let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
@@ -538,31 +599,42 @@ impl App {
                 drop_slot = Some(slot);
             }
             let p = ui.painter();
+            let cr = CornerRadius::same(t::R);
             let Some(pad) = self.board.pad(slot).cloned() else {
-                let col = if hovered_drop {
-                    t::ACCENT
-                } else if resp.hovered() {
-                    t::TEXT_3
-                } else {
-                    t::SURFACE_4
-                };
                 p.rect_filled(
                     rect,
-                    CornerRadius::same(t::R_LARGE),
-                    if hovered_drop {
-                        t::ACCENT.gamma_multiply(0.12)
+                    cr,
+                    if resp.hovered() {
+                        t::SURFACE_2
                     } else {
                         t::SURFACE
                     },
                 );
-                w::dashed_rect(p, rect.shrink(6.0), col);
-                w::paint_icon(p, Icon::Plus, rect.center() - vec2(0.0, 8.0), 7.0, col);
+                if hovered_drop {
+                    p.rect_stroke(rect, cr, Stroke::new(1.0, t::ACCENT), StrokeKind::Inside);
+                }
+                if resp.hovered() || hovered_drop {
+                    w::paint_icon(
+                        p,
+                        Icon::Plus,
+                        rect.center() - vec2(0.0, 6.0),
+                        5.0,
+                        t::TEXT_3,
+                    );
+                    p.text(
+                        rect.center() + vec2(0.0, 10.0),
+                        Align2::CENTER_CENTER,
+                        "Déposer un son",
+                        t::regular(10.0),
+                        t::TEXT_3,
+                    );
+                }
                 p.text(
-                    rect.center() + vec2(0.0, 14.0),
-                    Align2::CENTER_CENTER,
-                    "Glisser un son",
-                    t::regular(11.0),
-                    col,
+                    rect.right_bottom() + vec2(-6.0, -6.0),
+                    Align2::RIGHT_BOTTOM,
+                    format!("{}", idx + 1),
+                    t::regular(9.0),
+                    t::SURFACE_4,
                 );
                 if resp.clicked() {
                     empty_clicked = Some(slot);
@@ -598,69 +670,89 @@ impl App {
                 }
             });
 
-            let color = t::color(pad.color as usize);
+            let color = t::PALETTE[pad.color as usize % t::PALETTE.len()];
             let playing = self.pad_playing(slot);
             let flash = self
                 .sb
                 .flash
                 .get(&slot)
-                .is_some_and(|&f| self.now - f < 0.12);
+                .is_some_and(|&f| self.now - f < 0.10);
             let selected = self.sb.selected == Some(slot);
-            let cr = CornerRadius::same(t::R_LARGE);
             let sample = self.cache.get(&pad.path).cloned();
+            let p = ui.painter();
 
-            if playing.is_some() {
-                p.rect_filled(
-                    rect.expand(3.0),
-                    CornerRadius::same(t::R_LARGE + 3),
-                    color.gamma_multiply(0.18),
-                );
-            }
-            let base = if playing.is_some() || flash {
-                blend(t::SURFACE_2, color, 0.30)
+            let body = if playing.is_some() {
+                t::mix(t::SURFACE, color, 0.62)
+            } else if flash {
+                t::mix(t::SURFACE, color, 0.45)
             } else if resp.hovered() {
-                blend(t::SURFACE_2, color, 0.12)
+                t::mix(t::SURFACE, color, 0.26)
             } else {
-                blend(t::SURFACE_2, color, 0.07)
+                t::mix(t::SURFACE, color, 0.18)
             };
-            p.rect_filled(rect, cr, base);
-            let border = if hovered_drop {
-                Stroke::new(2.0, t::ACCENT)
-            } else if selected {
-                Stroke::new(1.5, t::TEXT.gamma_multiply(0.85))
-            } else if playing.is_some() {
-                Stroke::new(1.5, color)
-            } else {
-                Stroke::new(1.0, color.gamma_multiply(0.28))
-            };
-            p.rect_stroke(rect, cr, border, StrokeKind::Inside);
-
-            // Pastille de couleur + numéro
-            p.circle_filled(pos2(rect.left() + 16.0, rect.top() + 16.0), 4.5, color);
-            p.text(
-                pos2(rect.right() - 12.0, rect.top() + 16.0),
-                Align2::RIGHT_CENTER,
-                format!("{}", idx + 1),
-                t::medium(10.0),
-                t::TEXT_3,
+            p.rect_filled(rect, cr, body);
+            p.rect_filled(
+                Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 3.0)),
+                CornerRadius {
+                    nw: t::R,
+                    ne: t::R,
+                    sw: 0,
+                    se: 0,
+                },
+                color,
             );
-            // Nom (2 lignes max)
+            let fg = if playing.is_some() {
+                Color32::from_black_alpha(230)
+            } else {
+                t::TEXT
+            };
+            let fg2 = if playing.is_some() {
+                Color32::from_black_alpha(170)
+            } else {
+                t::TEXT_2
+            };
+
+            // Icône d'état : ▶ (prêt), ■ (en lecture, appuyer pour arrêter), main (maintien).
+            let ic = pos2(rect.left() + 13.0, rect.top() + 17.0);
+            let icon = match (pad.mode, playing.is_some()) {
+                (PadMode::Gate, _) => Icon::Hold,
+                (PadMode::Toggle, true) => Icon::Stop,
+                (PadMode::Toggle, false) => Icon::Play,
+            };
+            w::paint_icon(
+                p,
+                icon,
+                ic,
+                4.5,
+                if playing.is_some() {
+                    Color32::BLACK
+                } else {
+                    color
+                },
+            );
+            p.text(
+                rect.right_top() + vec2(-7.0, 9.0),
+                Align2::RIGHT_TOP,
+                format!("{}", idx + 1),
+                t::regular(9.0),
+                fg2,
+            );
+
             let name_rect = Rect::from_min_max(
-                pos2(rect.left() + 14.0, rect.top() + 28.0),
-                pos2(rect.right() - 12.0, rect.bottom() - 26.0),
+                pos2(rect.left() + 24.0, rect.top() + 10.0),
+                pos2(rect.right() - 20.0, rect.bottom() - 22.0),
             );
             let mut job = egui::text::LayoutJob::simple(
                 pad.name.clone(),
-                t::semibold(14.0),
-                t::TEXT,
+                t::semibold(12.0),
+                fg,
                 name_rect.width(),
             );
-            job.wrap.max_rows = if ph > 100.0 { 3 } else { 2 };
+            job.wrap.max_rows = if ph > 90.0 { 3 } else { 2 };
             let gal = p.layout_job(job);
-            p.galley(name_rect.min, gal, t::TEXT);
+            p.galley(name_rect.min, gal, fg);
 
-            // Bas du pad : durée / état, badges.
-            let by = rect.bottom() - 15.0;
+            let by = rect.bottom() - 11.0;
             let (status, scol) = match self.cache.map.get(&pad.path) {
                 Some(LoadState::Ready(s)) => {
                     let pr = pad.params(s);
@@ -668,71 +760,72 @@ impl App {
                     match playing {
                         Some(pos) => {
                             let rem = (pr.end as f64 - pos as f64).max(0.0) / s.sample_rate as f64;
-                            (format!("−{}", fmt_secs(rem)), t::TEXT)
+                            (format!("−{}", fmt_secs(rem)), fg)
                         }
-                        None => (fmt_secs(len), t::TEXT_2),
+                        None => (fmt_secs(len), fg2),
                     }
                 }
                 Some(LoadState::Failed(_)) => ("Fichier illisible".into(), t::REC),
                 _ => ("Chargement…".into(), t::TEXT_3),
             };
             p.text(
-                pos2(rect.left() + 14.0, by),
+                pos2(rect.left() + 8.0, by),
                 Align2::LEFT_CENTER,
                 status,
-                t::medium(11.0),
+                t::medium(10.0),
                 scol,
             );
-            let mut bx = rect.right() - 10.0;
-            let mut badge = |txt: String, col: Color32| {
-                let g = p.layout_no_wrap(txt, t::semibold(9.5), col);
+            let mut bx = rect.right() - 6.0;
+            let mut badge = |txt: String| {
+                let g = p.layout_no_wrap(txt, t::semibold(9.0), t::TEXT_2);
                 let r = Rect::from_min_size(
-                    pos2(bx - g.size().x - 10.0, by - 8.0),
-                    vec2(g.size().x + 10.0, 16.0),
+                    pos2(bx - g.size().x - 8.0, by - 7.0),
+                    vec2(g.size().x + 8.0, 14.0),
                 );
-                p.rect_filled(r, 5.0, Color32::from_black_alpha(70));
+                p.rect_filled(r, t::R, Color32::from_black_alpha(110));
                 p.galley(
-                    pos2(r.left() + 5.0, r.center().y - g.size().y / 2.0),
+                    pos2(r.left() + 4.0, r.center().y - g.size().y / 2.0),
                     g,
-                    col,
+                    t::TEXT_2,
                 );
-                bx = r.left() - 4.0;
+                bx = r.left() - 3.0;
             };
             if let Some(m) = pad.midi {
-                badge(m.label(), t::TEXT_2);
+                badge(m.label());
             }
             if let Some(k) = &pad.key {
-                badge(k.clone(), t::TEXT_2);
+                badge(k.clone());
             }
             if pad.looped {
-                badge("BOUCLE".into(), color);
+                badge("BOUCLE".into());
             }
-            match pad.mode {
-                PadMode::Toggle => badge("PLAY/STOP".into(), t::TEXT_3),
-                PadMode::Gate => badge("MAINTIEN".into(), t::TEXT_3),
-                PadMode::OneShot => {}
-            }
-            // Progression
             if let (Some(pos), Some(s)) = (playing, sample) {
                 let pr = pad.params(&s);
                 let f = ((pos as f64 - pr.start as f64) / (pr.end - pr.start).max(1) as f64)
                     .clamp(0.0, 1.0) as f32;
-                let bar = Rect::from_min_max(
-                    pos2(rect.left() + 10.0, rect.bottom() - 5.0),
-                    pos2(rect.right() - 10.0, rect.bottom() - 3.0),
-                );
-                p.rect_filled(bar, 1.0, Color32::from_black_alpha(80));
+                let bar = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max);
+                p.rect_filled(bar, 0.0, Color32::from_black_alpha(90));
                 p.rect_filled(
                     Rect::from_min_size(bar.min, vec2(bar.width() * f, bar.height())),
-                    1.0,
-                    color,
+                    0.0,
+                    Color32::from_black_alpha(220),
                 );
             }
-            if self.sb.learn_midi == Some(slot) || self.sb.learn_key == Some(slot) {
-                let blink = (self.now * 3.0).fract() < 0.5;
-                if blink {
-                    p.rect_stroke(rect, cr, Stroke::new(2.0, t::ACCENT), StrokeKind::Inside);
-                }
+            if selected {
+                p.rect_stroke(
+                    rect,
+                    cr,
+                    Stroke::new(1.0, Color32::WHITE),
+                    StrokeKind::Inside,
+                );
+            }
+            if hovered_drop {
+                p.rect_stroke(rect, cr, Stroke::new(1.5, t::ACCENT), StrokeKind::Inside);
+            }
+            if (self.sb.learn_midi == Some(slot) || self.sb.learn_key == Some(slot))
+                && (self.now * 3.0).fract() < 0.5
+            {
+                p.rect_stroke(rect, cr, Stroke::new(2.0, t::ACCENT), StrokeKind::Inside);
             }
         }
 
@@ -813,11 +906,15 @@ impl App {
                 }
             }
         });
-        ua.horizontal(|ui| {
-            for m in PadMode::ALL {
-                ui.selectable_value(&mut pad.mode, m, m.label());
-            }
-        });
+        w::segmented(
+            &mut ua,
+            "padmode",
+            &mut pad.mode,
+            &[
+                (PadMode::Toggle, "▶ / ■  Lecture-Stop"),
+                (PadMode::Gate, "Maintenir pour jouer"),
+            ],
+        );
         ua.checkbox(&mut pad.looped, "Lecture en boucle");
         ua.horizontal(|ui| {
             ui.label(egui::RichText::new("Gain").color(t::TEXT_2));
@@ -829,10 +926,10 @@ impl App {
             );
         });
         ua.horizontal(|ui| {
-            if w::pill(ui, Some(Icon::Play), "Écouter", None, sample.is_some()).clicked() {
+            if w::tool_button(ui, Some(Icon::Play), "Écouter", false, sample.is_some()).clicked() {
                 self.press_pad(slot);
             }
-            if w::pill(ui, Some(Icon::Stop), "Stop", None, true).clicked() {
+            if w::tool_button(ui, Some(Icon::Stop), "Stop", false, true).clicked() {
                 self.engine.pad(PadCmd::Stop { slot });
             }
         });
@@ -927,8 +1024,7 @@ impl App {
                 self.sb.learn_midi = None;
             }
             if pad.key.is_some()
-                && w::icon_button(ui, Icon::Close, sq(24.0), BtnStyle::Ghost, true, "Retirer")
-                    .clicked()
+                && w::icon_button(ui, Icon::Close, 24.0, BtnStyle::Ghost, true, "Retirer").clicked()
             {
                 pad.key = None;
             }
@@ -953,8 +1049,7 @@ impl App {
                 }
             }
             if pad.midi.is_some()
-                && w::icon_button(ui, Icon::Close, sq(24.0), BtnStyle::Ghost, true, "Retirer")
-                    .clicked()
+                && w::icon_button(ui, Icon::Close, 24.0, BtnStyle::Ghost, true, "Retirer").clicked()
             {
                 pad.midi = None;
             }
@@ -1006,7 +1101,7 @@ impl App {
             );
             return;
         };
-        let color = t::color(pad.color as usize);
+        let color = t::PALETTE[pad.color as usize % t::PALETTE.len()];
         let sr = s.sample_rate as f64;
         let frames = s.frames.max(1) as f64;
         let (z0, z1) = self.sb.zoom;
@@ -1248,11 +1343,6 @@ fn sanitize(pad: &mut Pad, s: Option<&SampleData>) {
     let len = (end - pad.start).max(0.0);
     pad.fade_in = pad.fade_in.clamp(0.0, len);
     pad.fade_out = pad.fade_out.clamp(0.0, len - pad.fade_in);
-}
-
-fn blend(a: Color32, b: Color32, k: f32) -> Color32 {
-    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k) as u8;
-    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
 fn pick_audio_files(multiple: bool) -> Option<Vec<PathBuf>> {
