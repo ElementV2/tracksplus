@@ -77,7 +77,7 @@ pub struct SettingsDialog {
     pub default_out: Option<String>,
     pub listed_host: Option<String>,
     pub error: Option<String>,
-    /// Onglet affiché : 0 = carte son, 1 = soundboard.
+    /// Onglet affiché : 0 = carte son, 1 = enregistrement, 2 = soundboard.
     pub tab: usize,
 }
 
@@ -272,6 +272,22 @@ pub struct BackupJob {
     done: bool,
 }
 
+/// Mesure de la place libre : disque de la session, et second disque de la copie de
+/// sécurité (`None` = pas de copie, `Some(Err)` = second disque introuvable).
+pub struct DiskSpace {
+    main: Option<u64>,
+    backup: Option<Result<u64, ()>>,
+}
+
+/// Place libre sur le disque qui contient (ou contiendra) `dir`.
+fn free_space(dir: &Path) -> Option<u64> {
+    let mut p: &Path = dir;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    fs4::available_space(p).ok()
+}
+
 const OUTPUT_STALLED: &str =
     "La sortie audio ne répond pas : vérifiez la carte son (Réglages audio pour la relancer)";
 
@@ -335,7 +351,7 @@ pub struct App {
     /// Carte son perdue : prochain essai de réouverture (secondes) et délai courant.
     pub reconnect: Option<(f64, f64)>,
     /// Mesure de l'espace disque libre en cours (thread).
-    pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
+    pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<DiskSpace>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
     /// La prise en cours est faite en écoutant les pistes existantes.
@@ -386,6 +402,8 @@ pub struct App {
     toast: Option<Toast>,
     pub ctx_clip: Option<(u64, u64)>,
     pub disk_free: Option<u64>,
+    /// Copie de sécurité : place libre sur le second disque (`Err` = disque introuvable).
+    pub backup_free: Option<Result<u64, ()>>,
     disk_checked: f64,
     title: String,
     pub export_last: Option<ExportSettings>,
@@ -504,6 +522,7 @@ impl App {
             toast: None,
             ctx_clip: None,
             disk_free: None,
+            backup_free: None,
             disk_checked: -100.0,
             title: String::new(),
             export_last: None,
@@ -1300,6 +1319,95 @@ impl App {
         }
     }
 
+    /// Onglet « Enregistrement » des réglages : copie de sécurité sur un second disque.
+    /// Désactivée par défaut ; réglage de l'ordinateur (pas de la session).
+    fn rec_settings(&mut self, ui: &mut egui::Ui) {
+        let stopped = self.is_stopped();
+        ui.label(
+            egui::RichText::new("COPIE DE SÉCURITÉ")
+                .font(t::caps(10.0))
+                .color(t::TEXT_3),
+        );
+        ui.add_space(4.0);
+        let mut on = self.backup_root.is_some();
+        let resp = ui
+            .add_enabled(
+                stopped,
+                egui::Checkbox::new(
+                    &mut on,
+                    "Enregistrer aussi chaque prise sur un second disque",
+                ),
+            )
+            .on_disabled_hover_text("Arrêtez d'abord la prise");
+        if resp.changed() {
+            if on {
+                self.pick_backup_root();
+            } else {
+                self.set_backup_root(None);
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Comme les enregistreurs pro : chaque prise est écrite en même temps sur un \
+                 second disque (clé, SSD externe), avec un double de la session qui s'ouvre tel \
+                 quel. Un second disque lent, plein ou débranché ne gêne jamais \
+                 l'enregistrement principal.",
+            )
+            .color(t::TEXT_3),
+        );
+        if let Some(root) = self.backup_root.clone() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Dossier").color(t::TEXT_2));
+                ui.label(egui::RichText::new(root.display().to_string()).font(t::medium(12.0)));
+            });
+            ui.add_space(4.0);
+            if ui
+                .add_enabled(stopped, egui::Button::new("Changer de dossier…"))
+                .clicked()
+            {
+                self.pick_backup_root();
+            }
+            ui.add_space(6.0);
+            let (txt, col) = match self.backup_free {
+                Some(Ok(free)) => (
+                    format!(
+                        "{:.0} Go libres · ≈ {} d'enregistrement avec les pistes armées",
+                        free as f64 / 1e9,
+                        fmt_duration(free / self.rec_bytes_per_sec())
+                    ),
+                    t::TEXT_3,
+                ),
+                Some(Err(())) => (
+                    "Second disque introuvable : branchez-le".to_string(),
+                    t::REC,
+                ),
+                None => ("Mesure de la place libre…".to_string(), t::TEXT_3),
+            };
+            ui.label(egui::RichText::new(txt).color(col));
+        }
+    }
+
+    /// Choix du dossier de la copie (sélecteur du système) ; refusé sur le disque de la
+    /// session elle-même.
+    fn pick_backup_root(&mut self) {
+        let Some(d) = rfd::FileDialog::new()
+            .set_title("Dossier de la copie de sécurité (second disque)")
+            .pick_folder()
+        else {
+            return;
+        };
+        if d.starts_with(&self.project.dir) || self.project.dir.starts_with(&d) {
+            self.notify(
+                "Choisissez un dossier sur un autre disque que celui de la session",
+                true,
+            );
+        } else {
+            self.set_backup_root(Some(d));
+        }
+    }
+
     fn set_backup_root(&mut self, d: Option<PathBuf>) {
         let mut prefs = crate::sessions::StartupPrefs::load();
         prefs.backup_dir = d.clone();
@@ -1312,6 +1420,9 @@ impl App {
             false,
         );
         self.backup_root = d;
+        // Nouvelle mesure du second disque au prochain passage (dans les 2 s).
+        self.backup_free = None;
+        self.disk_checked = f64::NEG_INFINITY;
     }
 
     /// Dossier de la session dans la copie de sécurité : `<second disque>/<session> (code)`,
@@ -1403,6 +1514,23 @@ impl App {
         }
     }
 
+    /// Débit d'écriture d'une prise avec les pistes armées (octets / s, au moins 1) :
+    /// une piste stéréo compte double.
+    fn rec_bytes_per_sec(&self) -> u64 {
+        let channels: usize = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.armed && t.input.is_some())
+            .map(|t| t.channels())
+            .sum();
+        let bytes = match self.project.rec_format {
+            RecFormat::Int24 => 3,
+            RecFormat::Float32 => 4,
+        };
+        (bytes * self.sr() as u64 * channels.max(1) as u64).max(1)
+    }
+
     pub fn live_alerts(&mut self) -> Vec<String> {
         let mut alerts = Vec::new();
         if !self.is_recording() {
@@ -1447,14 +1575,9 @@ impl App {
                 alerts.push(format!("Erreur disque : {e}"));
             }
         }
+        let bps = self.rec_bytes_per_sec();
         if let Some(free) = self.disk_free {
-            let armed = self.live.len().max(1) as u64;
-            let bps = match self.project.rec_format {
-                RecFormat::Int24 => 3,
-                RecFormat::Float32 => 4,
-            } * self.sr() as u64
-                * armed;
-            let secs = free / bps.max(1);
+            let secs = free / bps;
             // Alerte dès 30 min restantes (comme les enregistreurs pro) : le temps de
             // libérer de la place ou de prévoir un autre disque avant la fin du concert.
             if secs < 1800 {
@@ -1463,6 +1586,17 @@ impl App {
                     fmt_duration(secs)
                 ));
             }
+        }
+        match self.backup_free {
+            Some(Ok(free)) if free / bps < 1800 => alerts.push(format!(
+                "Copie de sécurité : second disque presque plein, ≈ {} restant (la prise principale continue)",
+                fmt_duration(free / bps)
+            )),
+            Some(Err(())) => alerts.push(
+                "Copie de sécurité : second disque introuvable (la prise principale continue)"
+                    .into(),
+            ),
+            _ => {}
         }
         if let Some(e) = self.engine.shared.last_error.lock().clone() {
             alerts.push(format!("Carte son : {e}"));
@@ -2532,7 +2666,8 @@ impl App {
             match rx.try_recv() {
                 Ok(free) => {
                     if *dir == self.project.dir {
-                        self.disk_free = free;
+                        self.disk_free = free.main;
+                        self.backup_free = free.backup;
                     }
                     self.disk_job = None;
                 }
@@ -2549,18 +2684,14 @@ impl App {
         if now - self.disk_checked > 2.0 && self.disk_job.is_none() {
             self.disk_checked = now;
             let dir = self.project.dir.clone();
+            let backup = self.backup_session_dir();
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = std::thread::Builder::new()
                 .name("tracksplus-disk-space".into())
                 .spawn(move || {
-                    let mut p: &Path = &dir;
-                    while !p.exists() {
-                        match p.parent() {
-                            Some(pp) => p = pp,
-                            None => break,
-                        }
-                    }
-                    let _ = tx.send(fs4::available_space(p).ok());
+                    let main = free_space(&dir);
+                    let backup = backup.map(|b| free_space(&b).ok_or(()));
+                    let _ = tx.send(DiskSpace { main, backup });
                 });
             if spawned.is_ok() {
                 self.disk_job = Some((now, self.project.dir.clone(), rx));
@@ -2920,44 +3051,6 @@ impl App {
                 self.project.dirty = true;
             }
         }
-        // Copie de sécurité simultanée sur un second disque (comme Reaper, Pyramix ou
-        // les enregistreurs Sound Devices) : si le disque principal lâche, tout est là.
-        let label = match &self.backup_root {
-            Some(d) => format!("Copie de sécurité : {}", d.display()),
-            None => "Copie de sécurité sur un second disque…".to_string(),
-        };
-        if ui
-            .add_enabled(stopped, egui::Button::new(label))
-            .on_hover_text(
-                "Enregistre chaque prise en même temps sur un second disque (clé, SSD externe), \
-                 avec un double de la session ouvrable tel quel. Un second disque lent, plein \
-                 ou débranché ne gêne jamais l'enregistrement principal.\nClic : choisir le dossier.",
-            )
-            .clicked()
-        {
-            ui.close();
-            if let Some(d) = rfd::FileDialog::new()
-                .set_title("Dossier de la copie de sécurité (second disque)")
-                .pick_folder()
-            {
-                if d.starts_with(&self.project.dir) || self.project.dir.starts_with(&d) {
-                    self.notify(
-                        "Choisissez un dossier sur un autre disque que celui de la session",
-                        true,
-                    );
-                } else {
-                    self.set_backup_root(Some(d));
-                }
-            }
-        }
-        if self.backup_root.is_some()
-            && ui
-                .add_enabled(stopped, egui::Button::new("Arrêter la copie de sécurité"))
-                .clicked()
-        {
-            ui.close();
-            self.set_backup_root(None);
-        }
         ui.separator();
         ui.label(
             egui::RichText::new("SOUNDBOARD")
@@ -3048,22 +3141,42 @@ impl App {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let bps = self.rec_bytes_per_sec();
+                // Second disque de la copie de sécurité (à droite du disque principal).
+                match self.backup_free {
+                    Some(Ok(free)) => {
+                        let secs = free / bps;
+                        ui.label(
+                            egui::RichText::new(format!("Copie ≈ {}", fmt_duration(secs)))
+                                .font(t::regular(11.5))
+                                .color(if secs < 1800 { t::REC } else { t::TEXT_3 }),
+                        )
+                        .on_hover_text(format!(
+                            "Copie de sécurité : {:.0} Go libres sur le second disque",
+                            free as f64 / 1e9
+                        ));
+                    }
+                    Some(Err(())) => {
+                        ui.label(
+                            egui::RichText::new("Copie : second disque introuvable")
+                                .font(t::medium(11.5))
+                                .color(t::REC),
+                        )
+                        .on_hover_text(
+                            "Branchez le disque de la copie de sécurité, ou désactivez-la (Réglages → Enregistrement)",
+                        );
+                    }
+                    None => {}
+                }
                 if let Some(free) = self.disk_free {
-                    let rec: Vec<_> = self
+                    let armed = self
                         .project
                         .tracks
                         .iter()
                         .filter(|t| t.armed && t.input.is_some())
-                        .collect();
-                    let armed = rec.len().max(1);
-                    // Une piste stéréo occupe deux fois plus de place.
-                    let channels = rec.iter().map(|t| t.channels()).sum::<usize>().max(1);
-                    let bps = match self.project.rec_format {
-                        RecFormat::Int24 => 3,
-                        RecFormat::Float32 => 4,
-                    } * self.sr() as u64
-                        * channels as u64;
-                    let secs = free / bps.max(1);
+                        .count()
+                        .max(1);
+                    let secs = free / bps;
                     let col = if secs < 1800 { t::REC } else { t::TEXT_3 };
                     ui.label(
                         egui::RichText::new(format!(
@@ -3142,7 +3255,7 @@ impl App {
                     vec2(ui.available_width(), 30.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        w::view_tabs(ui, &mut dlg.tab, &["CARTE SON", "SOUNDBOARD"]);
+                        w::view_tabs(ui, &mut dlg.tab, &["CARTE SON", "ENREGISTREMENT", "SOUNDBOARD"]);
                     },
                 );
                 {
@@ -3152,6 +3265,10 @@ impl App {
                 }
                 ui.add_space(12.0);
                 if dlg.tab == 1 {
+                    self.rec_settings(ui);
+                    return;
+                }
+                if dlg.tab == 2 {
                     self.sb_settings(ui);
                     return;
                 }
@@ -4919,6 +5036,16 @@ pub fn open_in_file_manager(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Place libre mesurée sur le disque qui contiendra le dossier, même s'il n'existe pas
+    /// encore (copie de sécurité jamais utilisée).
+    #[test]
+    fn free_space_of_future_folder() {
+        let base = std::env::temp_dir();
+        let missing = base.join("tp-pas-encore-cree").join("Session (1234abcd)");
+        assert!(!missing.exists());
+        assert!(super::free_space(&missing).is_some_and(|f| f > 0));
+    }
+
     use super::*;
 
     #[test]

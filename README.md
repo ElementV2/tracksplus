@@ -246,8 +246,10 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
 
 ## Fiabilité en live
 
-- **Copie de sécurité** (menu Session) : chaque prise est écrite en même temps sur un second
-  disque, avec un double de la session ouvrable tel quel. Un second disque lent, plein ou
+- **Copie de sécurité** (option, désactivée par défaut : Réglages → Enregistrement) : chaque
+  prise est écrite en même temps sur un second disque, avec un double de la session ouvrable
+  tel quel. La place libre du second disque est affichée en bas de l'écran et surveillée
+  (alerte dès 30 min restantes, ou si le disque est introuvable). Un second disque lent, plein ou
   débranché ne gêne jamais l'enregistrement principal.
 - **Fichiers BWF** : chaque prise porte son heure d'enregistrement (TimeReference) et le nom
   de sa piste ; Pro Tools, Nuendo ou Reaper peuvent la poser à son heure réelle.
