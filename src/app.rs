@@ -85,6 +85,9 @@ pub struct SettingsDialog {
     pub asio_in_use: Option<String>,
     /// Interroger les pilotes ASIO maintenant (`App::probe_asio`).
     pub probe: bool,
+    /// Carte son choisie (`card_of`) : l'entrée et les sorties proposées sont les siennes.
+    /// `None` : périphériques par défaut de Windows (hors ASIO).
+    pub card: Option<String>,
 }
 
 impl SettingsDialog {
@@ -92,6 +95,7 @@ impl SettingsDialog {
         let mut d = Self {
             asio_in_use,
             probe: false,
+            card: None,
             prefs: prefs.clone(),
             hosts: audio::host_names(),
             ins: Vec::new(),
@@ -106,7 +110,76 @@ impl SettingsDialog {
             d.prefs.host = Some(audio::default_host_name());
         }
         d.refresh();
+        let asio = d.asio();
+        d.card = d
+            .prefs
+            .output
+            .as_ref()
+            .or(d.prefs.input.as_ref())
+            .map(|n| card_of(n, asio));
         d
+    }
+
+    fn asio(&self) -> bool {
+        self.prefs.host.as_deref() == Some("ASIO")
+    }
+
+    /// Cartes son du pilote, dans l'ordre de la liste.
+    fn cards(&self) -> Vec<String> {
+        let asio = self.asio();
+        let mut v: Vec<String> = Vec::new();
+        for d in self.ins.iter().chain(&self.outs) {
+            let c = card_of(&d.name, asio);
+            if !v.contains(&c) {
+                v.push(c);
+            }
+        }
+        v
+    }
+
+    fn on_card(&self, d: &DeviceInfo) -> bool {
+        self.card
+            .as_ref()
+            .is_none_or(|c| card_of(&d.name, self.asio()) == *c)
+    }
+
+    /// Entrées de la carte choisie (toutes sans carte choisie).
+    fn card_ins(&self) -> Vec<DeviceInfo> {
+        self.ins
+            .iter()
+            .filter(|d| self.on_card(d))
+            .cloned()
+            .collect()
+    }
+
+    /// Sorties de la carte choisie (toutes sans carte choisie).
+    fn card_outs(&self) -> Vec<DeviceInfo> {
+        self.outs
+            .iter()
+            .filter(|d| self.on_card(d))
+            .cloned()
+            .collect()
+    }
+
+    /// Choix de la carte son : entrée et sortie principale prises sur elle, soundboard et
+    /// monitoring « comme le main ». Pilote ASIO pas encore interrogé : il l'est aussitôt.
+    fn select_card(&mut self, card: Option<String>) {
+        self.card = card;
+        let (ins, outs) = (self.card_ins(), self.card_outs());
+        let p = &mut self.prefs;
+        p.out_left = 0;
+        p.pad_output = None;
+        p.pad_left = 0;
+        p.monitor_output = None;
+        p.monitor_left = 0;
+        if self.card.is_none() {
+            p.input = None;
+            p.output = None;
+            return;
+        }
+        p.input = ins.first().map(|d| d.name.clone());
+        p.output = outs.first().map(|d| d.name.clone());
+        self.probe |= ins.iter().chain(&outs).any(|d| d.note.is_some());
     }
 
     fn refresh(&mut self) {
@@ -5881,6 +5954,7 @@ impl App {
                             // de pilote remet l'entrée et les sorties par défaut.
                             if cur != h && ui.selectable_label(false, &h).clicked() {
                                 dlg.prefs.host = Some(h);
+                                dlg.card = None;
                                 dlg.prefs.input = None;
                                 dlg.prefs.output = None;
                                 dlg.prefs.out_left = 0;
@@ -5894,69 +5968,104 @@ impl App {
                         }
                     });
                     ui.end_row();
-                    // Carte branchée, Dante Virtual Soundcard passée en ASIO… après
-                    // l'ouverture des réglages : la liste est relue à la demande.
-                    ui.label("");
-                    if ui.small_button("Actualiser").clicked() {
-                        // ASIO : tous les pilotes sont interrogés (celui en service est fermé
-                        // un instant, une application n'en charge qu'un à la fois).
-                        if dlg.prefs.host.as_deref() == Some("ASIO") {
-                            dlg.probe = true;
-                        } else {
-                            dlg.refresh();
-                        }
-                    }
-                    ui.end_row();
                     if dlg.listed_host != dlg.prefs.host {
                         dlg.refresh();
                     }
+                    let asio = dlg.asio();
 
-                    ui.label(egui::RichText::new("Entrée").color(t::TEXT_2));
-                    let cur = dlg.prefs.input.clone().unwrap_or_else(|| "Par défaut".into());
-                    let shown = combo_text(ui, &cur, combo_w);
-                    egui::ComboBox::from_id_salt("in").width(combo_w).selected_text(shown).show_ui(ui, |ui| {
-                        if ui.selectable_label(dlg.prefs.input.is_none(), "Par défaut").clicked() {
-                            dlg.prefs.input = None;
+                    // ---- Carte son : celles du pilote (en ASIO, chaque pilote est une carte ;
+                    // en WASAPI, les périphériques de Windows sont regroupés par carte). Entrée
+                    // et sorties ne proposent ensuite que les siennes.
+                    ui.label(egui::RichText::new("Carte son").color(t::TEXT_2));
+                    ui.horizontal(|ui| {
+                        let none = if asio { "Aucune" } else { "Par défaut (Windows)" };
+                        let cur = dlg.card.clone().unwrap_or_else(|| none.to_string());
+                        let mut pick: Option<Option<String>> = None;
+                        egui::ComboBox::from_id_salt("card")
+                            .width(combo_w)
+                            .selected_text(combo_text(ui, &cur, combo_w))
+                            .show_ui(ui, |ui| {
+                                if !asio && ui.selectable_label(dlg.card.is_none(), none).clicked() {
+                                    pick = Some(None);
+                                }
+                                for c in dlg.cards() {
+                                    if ui.selectable_label(dlg.card.as_deref() == Some(&c), &c).clicked() {
+                                        pick = Some(Some(c));
+                                    }
+                                }
+                            });
+                        if let Some(c) = pick {
+                            dlg.select_card(c);
                         }
-                        for d in &dlg.ins {
-                            let txt = if d.channels > 0 {
-                                format!("{}   {} canaux", d.name, d.channels)
+                        // Carte branchée, Dante Virtual Soundcard passée en ASIO… après
+                        // l'ouverture des réglages. ASIO : tous les pilotes sont interrogés
+                        // (celui en service est fermé un instant).
+                        if ui.small_button("Actualiser").clicked() {
+                            if asio {
+                                dlg.probe = true;
                             } else {
-                                d.name.clone()
-                            };
-                            // L'entrée ne touche jamais aux sorties : chacune se règle à part.
-                            if ui.selectable_label(dlg.prefs.input.as_deref() == Some(&d.name), txt).clicked() {
-                                dlg.prefs.input = Some(d.name.clone());
-                                // Pilote pas encore interrogé : il l'est tout de suite.
-                                dlg.probe |= d.note.is_some();
+                                dlg.refresh();
                             }
                         }
                     });
                     ui.end_row();
 
-                    // ---- Sorties : toutes réglées ici (multipiste, soundboard, monitoring).
-                    // Chaque liste montre toutes les paires de tous les périphériques (en
-                    // WASAPI, chaque paire d'une carte est un périphérique à part).
+                    ui.label(egui::RichText::new("Entrée").color(t::TEXT_2));
+                    let ins = dlg.card_ins();
+                    if asio {
+                        // ASIO : l'entrée, c'est la carte (les canaux se choisissent par piste).
+                        let txt = match ins.first() {
+                            Some(d) if d.channels > 0 => format!("{} entrées", d.channels),
+                            Some(_) => "—".to_string(),
+                            None => "Aucune entrée".to_string(),
+                        };
+                        ui.label(txt);
+                    } else {
+                        let cur = dlg.prefs.input.clone().unwrap_or_else(|| "Par défaut (Windows)".into());
+                        let shown = combo_text(ui, &cur, combo_w);
+                        egui::ComboBox::from_id_salt("in").width(combo_w).selected_text(shown).show_ui(ui, |ui| {
+                            if (dlg.card.is_none() || ins.is_empty())
+                                && ui.selectable_label(dlg.prefs.input.is_none(), "Par défaut (Windows)").clicked()
+                            {
+                                dlg.prefs.input = None;
+                            }
+                            for d in &ins {
+                                let txt = if d.channels > 0 {
+                                    format!("{}   {} canaux", d.name, d.channels)
+                                } else {
+                                    d.name.clone()
+                                };
+                                if ui.selectable_label(dlg.prefs.input.as_deref() == Some(&d.name), txt).clicked() {
+                                    dlg.prefs.input = Some(d.name.clone());
+                                }
+                            }
+                        });
+                    }
+                    ui.end_row();
+
+                    // ---- Sorties de la carte (multipiste, soundboard, monitoring).
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("SORTIES").font(t::caps(10.0)).color(t::TEXT_3));
                     ui.label("");
                     ui.end_row();
-                    let outs = dlg.outs.clone();
+                    let outs = dlg.card_outs();
                     let default_out = format!(
                         "Par défaut{}",
                         dlg.default_out.as_ref().map_or(String::new(), |n| format!(" · {n}"))
                     );
+                    // « Par défaut (Windows) » seulement sans carte choisie.
+                    let main_none = dlg.card.is_none().then_some("Par défaut (Windows)");
                     ui.label(egui::RichText::new("Main multipiste").color(t::TEXT_2))
                         .on_hover_text("Lecture des pistes");
-                    dlg.probe |= dest_combo(ui, "out_main", combo_w, &outs, &mut dlg.prefs.output, &mut dlg.prefs.out_left, "Par défaut (Windows)", &default_out);
+                    dlg.probe |= dest_combo(ui, "out_main", combo_w, &outs, &mut dlg.prefs.output, &mut dlg.prefs.out_left, main_none, &default_out);
                     ui.end_row();
                     ui.label(egui::RichText::new("Monitoring multipiste").color(t::TEXT_2))
                         .on_hover_text("Écoute en direct des entrées (bouton casque des pistes)");
-                    dlg.probe |= dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, "Comme le main multipiste", "Comme le main multipiste");
+                    dlg.probe |= dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, Some("Comme le main multipiste"), "Comme le main multipiste");
                     ui.end_row();
                     ui.label(egui::RichText::new("Soundboard").color(t::TEXT_2))
                         .on_hover_text("Lecture des pads");
-                    dlg.probe |= dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, "Comme le main multipiste", "Comme le main multipiste");
+                    dlg.probe |= dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, Some("Comme le main multipiste"), "Comme le main multipiste");
                     ui.end_row();
                     ui.add_space(4.0);
                     ui.label("");
@@ -7724,7 +7833,7 @@ fn dest_combo(
     outs: &[DeviceInfo],
     device: &mut Option<String>,
     left: &mut u16,
-    none_item: &str,
+    none_item: Option<&str>,
     none_text: &str,
 ) -> bool {
     let mut unprobed = false;
@@ -7743,7 +7852,9 @@ fn dest_combo(
         .height(360.0)
         .selected_text(combo_text(ui, &cur, width))
         .show_ui(ui, |ui| {
-            if ui.selectable_label(device.is_none(), none_item).clicked() {
+            if let Some(none_item) = none_item
+                && ui.selectable_label(device.is_none(), none_item).clicked()
+            {
                 *device = None;
                 *left = 0;
             }
@@ -7763,6 +7874,35 @@ fn dest_combo(
             }
         });
     unprobed
+}
+
+/// Carte son d'un périphérique. ASIO : le pilote lui-même. Ailleurs (WASAPI…) : le nom
+/// entre parenthèses à la fin, comme Windows nomme ses périphériques (« DVS Receive 1-2
+/// (Dante Virtual Soundcard) », « Haut-parleurs (Realtek(R) Audio) »), sinon le nom.
+fn card_of(device: &str, asio: bool) -> String {
+    let name = device.trim();
+    if asio || !name.ends_with(')') {
+        return name.to_string();
+    }
+    let mut depth = 0usize;
+    for (i, ch) in name.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = name[i + 1..name.len() - 1].trim();
+                    return if inner.is_empty() || i == 0 {
+                        name.to_string()
+                    } else {
+                        inner.to_string()
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    name.to_string()
 }
 
 /// Libellé d'une destination de sortie : le nom du périphérique s'il n'a que deux
@@ -8653,6 +8793,26 @@ mod tests {
         assert!(m.contains("relancez l'enregistrement si besoin"));
         assert!(!m.ends_with(". "));
         assert_eq!(relaunch_message(false, Some("")), m);
+    }
+
+    /// Cartes son : en WASAPI, les périphériques de Windows regroupés par carte (nom entre
+    /// parenthèses, même imbriquées) ; en ASIO, chaque pilote est une carte.
+    #[test]
+    fn devices_are_grouped_by_card() {
+        assert_eq!(
+            card_of("DVS Receive  1-2 (Dante Virtual Soundcard)", false),
+            "Dante Virtual Soundcard"
+        );
+        assert_eq!(
+            card_of("Haut-parleurs (Realtek(R) Audio)", false),
+            "Realtek(R) Audio"
+        );
+        assert_eq!(card_of("Micro USB", false), "Micro USB");
+        assert_eq!(card_of("(étrange)", false), "(étrange)");
+        assert_eq!(
+            card_of("Dante Virtual Soundcard (x64)", true),
+            "Dante Virtual Soundcard (x64)"
+        );
     }
 
     #[test]
