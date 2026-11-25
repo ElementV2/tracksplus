@@ -1272,7 +1272,9 @@ impl App {
             } * self.sr() as u64
                 * armed;
             let secs = free / bps.max(1);
-            if secs < 600 {
+            // Alerte dès 30 min restantes (comme les enregistreurs pro) : le temps de
+            // libérer de la place ou de prévoir un autre disque avant la fin du concert.
+            if secs < 1800 {
                 alerts.push(format!(
                     "Disque presque plein : ≈ {} d'enregistrement restant",
                     fmt_duration(secs)

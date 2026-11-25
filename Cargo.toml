@@ -39,6 +39,10 @@ id3 = { version = "1.17.4", default-features = false }
 cpal = { version = "0.18.2", features = ["realtime"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
+[dev-dependencies]
+# Tests : aucune allocation dans les callbacks audio (règle n°1 du temps réel).
+assert_no_alloc = "1.1"
+
 [build-dependencies]
 # Icône et informations de version intégrées à l'exécutable Windows.
 winresource = "0.1"

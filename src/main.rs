@@ -6,6 +6,11 @@ mod encode;
 mod export;
 #[cfg(test)]
 mod fuzz_tests;
+
+// Tests : toute allocation à l'intérieur de `assert_no_alloc(|| …)` fait échouer le test.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 mod import;
 mod midi;
 mod player;

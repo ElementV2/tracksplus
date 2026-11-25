@@ -546,6 +546,7 @@ impl Engine {
                 shared: shared.clone(),
                 monitor: mon_prod.take(),
                 sample_rate,
+                last_capture: None,
             };
             let stream = match fmt {
                 SampleFormat::F32 => build_input::<f32>(dev, cfg, st),
@@ -883,12 +884,138 @@ struct InState {
     /// Vers la sortie de monitoring (mix stéréo entrelacé des canaux écoutés).
     monitor: Option<Producer<f32>>,
     sample_rate: u32,
+    /// Bloc précédent : instant de capture de sa première trame et nombre de trames.
+    last_capture: Option<(cpal::StreamInstant, usize)>,
 }
 
 impl InState {
+    /// Décrochage non signalé par le pilote : l'instant de capture d'un bloc doit suivre
+    /// celui du précédent de sa durée exacte, quelle que soit la régularité de livraison
+    /// (rafales comprises). Un saut plus grand que la durée d'un bloc (et que 3 ms) veut
+    /// dire que des échantillons ont été perdus en amont.
+    fn check_capture_gap(&mut self, capture: cpal::StreamInstant, frames: usize) {
+        if let Some((prev, n)) = self.last_capture
+            && let Some(dt) = capture.checked_duration_since(prev)
+            && self.sample_rate > 0
+        {
+            let expected = n as f64 / self.sample_rate as f64;
+            let tolerance = (frames as f64 / self.sample_rate as f64).max(0.003);
+            if dt.as_secs_f64() > expected + tolerance
+                && self.shared.counting.load(Ordering::Relaxed)
+            {
+                self.shared.xruns.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.last_capture = Some((capture, frames));
+    }
+
     fn dispose(&self, v: Vec<RecTarget>) {
         if let Err(e) = self.garbage.try_send(v) {
             std::mem::forget(e.into_inner());
+        }
+    }
+}
+
+impl InState {
+    /// Corps du callback d'entrée (hors horodatage) : commandes, vumètres, monitoring,
+    /// écriture vers les tampons disque. Séparé pour être testé sans carte son.
+    fn process<T>(&mut self, data: &[T])
+    where
+        T: SizedSample,
+        f32: FromSample<T>,
+    {
+        let st = self;
+        while let Ok(cmd) = st.rx.try_recv() {
+            // Aucune libération mémoire ici : l'ancienne liste part vers l'interface,
+            // qui relâche les producteurs (le thread disque voit alors la fin de prise).
+            match cmd {
+                InCmd::Record(t) => {
+                    st.shared.rec_play_offset.store(
+                        st.shared.play_position_now(st.sample_rate),
+                        Ordering::Relaxed,
+                    );
+                    let old = std::mem::replace(&mut st.targets, t);
+                    st.dispose(old);
+                }
+                InCmd::Stop => {
+                    let old = std::mem::take(&mut st.targets);
+                    st.dispose(old);
+                }
+            }
+        }
+        let ch = st.channels;
+        if ch == 0 {
+            return;
+        }
+        let frames = data.len() / ch;
+        let sh = &*st.shared;
+        sh.in_block.store(frames as u32, Ordering::Relaxed);
+
+        // Crêtes par canal en un seul passage dans l'ordre de la mémoire (au lieu d'un
+        // passage par canal en sautant de trame en trame : 64× moins de lectures).
+        let mc = ch.min(MAX_INPUTS);
+        let mut peaks = [0f32; MAX_INPUTS];
+        for frame in data.chunks_exact(ch) {
+            for (p, s) in peaks[..mc].iter_mut().zip(&frame[..mc]) {
+                *p = p.max(s.to_sample::<f32>().abs());
+            }
+        }
+        for (m, p) in sh.meters.iter().zip(&peaks[..mc]) {
+            m.fetch_max(p.to_bits(), Ordering::Relaxed);
+        }
+
+        // Monitoring direct : mix stéréo des canaux écoutés vers la sortie.
+        if sh.monitor_on.load(Ordering::Relaxed)
+            && let Some(mp) = st.monitor.as_mut()
+        {
+            // Canaux écoutés, relevés une fois par bloc (tableau sur la pile).
+            let mut act = [(0usize, 0u8); MAX_INPUTS];
+            let mut na = 0;
+            for c in 0..ch.min(MAX_INPUTS) {
+                let m = sh.monitor[c].load(Ordering::Relaxed);
+                if m != 0 {
+                    act[na] = (c, m);
+                    na += 1;
+                }
+            }
+            let n = frames.min(mp.slots() / 2);
+            if n > 0
+                && let Ok(chunk) = mp.write_chunk_uninit(n * 2)
+            {
+                chunk.fill_from_iter((0..n).flat_map(|f| {
+                    let (mut l, mut r) = (0f32, 0f32);
+                    for &(c, m) in &act[..na] {
+                        let s = data[f * ch + c].to_sample::<f32>();
+                        match m {
+                            2 => l += s,
+                            3 => r += s,
+                            _ => {
+                                l += s;
+                                r += s;
+                            }
+                        }
+                    }
+                    [l, r]
+                }));
+            }
+        }
+
+        if !st.targets.is_empty() {
+            for t in &mut st.targets {
+                let cs = t.channels;
+                let lost = feed_target(t, frames, |f, k| {
+                    let c = cs[k];
+                    if c < ch {
+                        data[f * ch + c].to_sample::<f32>()
+                    } else {
+                        0.0
+                    }
+                });
+                if lost {
+                    sh.overruns.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            sh.rec_frames.fetch_add(frames as u64, Ordering::Release);
         }
     }
 }
@@ -908,98 +1035,10 @@ where
                 to_frames(ts.callback.duration_since(ts.capture), st.sample_rate),
                 Ordering::Relaxed,
             );
-            while let Ok(cmd) = st.rx.try_recv() {
-                // Aucune libération mémoire ici : l'ancienne liste part vers l'interface,
-                // qui relâche les producteurs (le thread disque voit alors la fin de prise).
-                match cmd {
-                    InCmd::Record(t) => {
-                        st.shared.rec_play_offset.store(
-                            st.shared.play_position_now(st.sample_rate),
-                            Ordering::Relaxed,
-                        );
-                        let old = std::mem::replace(&mut st.targets, t);
-                        st.dispose(old);
-                    }
-                    InCmd::Stop => {
-                        let old = std::mem::take(&mut st.targets);
-                        st.dispose(old);
-                    }
-                }
+            if let Some(frames) = data.len().checked_div(st.channels) {
+                st.check_capture_gap(ts.capture, frames);
             }
-            let ch = st.channels;
-            if ch == 0 {
-                return;
-            }
-            let frames = data.len() / ch;
-            let sh = &*st.shared;
-            sh.in_block.store(frames as u32, Ordering::Relaxed);
-
-            // Crêtes par canal en un seul passage dans l'ordre de la mémoire (au lieu d'un
-            // passage par canal en sautant de trame en trame : 64× moins de lectures).
-            let mc = ch.min(MAX_INPUTS);
-            let mut peaks = [0f32; MAX_INPUTS];
-            for frame in data.chunks_exact(ch) {
-                for (p, s) in peaks[..mc].iter_mut().zip(&frame[..mc]) {
-                    *p = p.max(s.to_sample::<f32>().abs());
-                }
-            }
-            for (m, p) in sh.meters.iter().zip(&peaks[..mc]) {
-                m.fetch_max(p.to_bits(), Ordering::Relaxed);
-            }
-
-            // Monitoring direct : mix stéréo des canaux écoutés vers la sortie.
-            if sh.monitor_on.load(Ordering::Relaxed)
-                && let Some(mp) = st.monitor.as_mut()
-            {
-                // Canaux écoutés, relevés une fois par bloc (tableau sur la pile).
-                let mut act = [(0usize, 0u8); MAX_INPUTS];
-                let mut na = 0;
-                for c in 0..ch.min(MAX_INPUTS) {
-                    let m = sh.monitor[c].load(Ordering::Relaxed);
-                    if m != 0 {
-                        act[na] = (c, m);
-                        na += 1;
-                    }
-                }
-                let n = frames.min(mp.slots() / 2);
-                if n > 0
-                    && let Ok(chunk) = mp.write_chunk_uninit(n * 2)
-                {
-                    chunk.fill_from_iter((0..n).flat_map(|f| {
-                        let (mut l, mut r) = (0f32, 0f32);
-                        for &(c, m) in &act[..na] {
-                            let s = data[f * ch + c].to_sample::<f32>();
-                            match m {
-                                2 => l += s,
-                                3 => r += s,
-                                _ => {
-                                    l += s;
-                                    r += s;
-                                }
-                            }
-                        }
-                        [l, r]
-                    }));
-                }
-            }
-
-            if !st.targets.is_empty() {
-                for t in &mut st.targets {
-                    let cs = t.channels;
-                    let lost = feed_target(t, frames, |f, k| {
-                        let c = cs[k];
-                        if c < ch {
-                            data[f * ch + c].to_sample::<f32>()
-                        } else {
-                            0.0
-                        }
-                    });
-                    if lost {
-                        sh.overruns.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                sh.rec_frames.fetch_add(frames as u64, Ordering::Release);
-            }
+            st.process(data);
         },
         move |e| err_shared.on_error(e),
         None,
@@ -1528,6 +1567,149 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Décrochage détecté par l'horodatage de capture, sans fausse alerte sur des blocs
+    /// livrés en rafale.
+    #[test]
+    fn capture_gap_counts_dropouts_only() {
+        let shared = Arc::new(Shared::new());
+        shared.counting.store(true, Ordering::Relaxed);
+        let mut st = InState {
+            channels: 2,
+            rx: bounded::<InCmd>(1).1,
+            targets: Vec::new(),
+            garbage: bounded(1).0,
+            shared: shared.clone(),
+            monitor: None,
+            sample_rate: 48000,
+            last_capture: None,
+        };
+        let t0 = cpal::StreamInstant::ZERO;
+        let at = |frames: u64| {
+            t0.checked_add(std::time::Duration::from_nanos(
+                frames * 1_000_000_000 / 48000,
+            ))
+            .unwrap()
+        };
+        // Blocs réguliers de 480 trames : rien.
+        for k in 0..10 {
+            st.check_capture_gap(at(k * 480), 480);
+        }
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 0);
+        // 960 trames manquantes (20 ms) : un décrochage.
+        st.check_capture_gap(at(10 * 480 + 960), 480);
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 1);
+    }
+
+    /// Règle n°1 du temps réel (R. Bencina, T. Doumler) : aucune allocation ni
+    /// libération dans les callbacks. Chaque chemin est exercé : prise mono et stéréo,
+    /// monitoring, arrêt de prise, lecture, bascule mute/solo, pads (appui, fondu,
+    /// panique), trames perdues — le test échoue à la moindre allocation.
+    #[test]
+    fn audio_callbacks_never_allocate() {
+        use crate::sampler::{PadMode, PadParams, SampleData};
+        use assert_no_alloc::assert_no_alloc;
+        // --- entrée : 8 canaux, une cible mono, une stéréo, monitoring de 2 canaux.
+        let shared = Arc::new(Shared::new());
+        shared.monitor_on.store(true, Ordering::Relaxed);
+        shared.monitor[0].store(1, Ordering::Relaxed);
+        shared.monitor[3].store(2, Ordering::Relaxed);
+        let (tx, rx) = bounded::<InCmd>(4);
+        let (gtx, _grx) = bounded::<Vec<RecTarget>>(4);
+        let (mprod, _mcons) = rtrb::RingBuffer::new(48000);
+        let mut ins = InState {
+            channels: 8,
+            rx,
+            targets: Vec::new(),
+            garbage: gtx,
+            shared: shared.clone(),
+            monitor: Some(mprod),
+            sample_rate: 48000,
+            last_capture: None,
+        };
+        let (p1, _c1) = rtrb::RingBuffer::new(4096);
+        let (p2, _c2) = rtrb::RingBuffer::new(1 << 20);
+        tx.send(InCmd::Record(vec![
+            RecTarget::new(1, p1),
+            RecTarget::stereo(4, p2),
+        ]))
+        .unwrap();
+        let data_f = vec![0.25f32; 256 * 8];
+        let data_i = vec![1 << 20; 256 * 8];
+        assert_no_alloc(|| {
+            // Le petit tampon mono déborde vite : chemin « trames perdues » compris.
+            for _ in 0..40 {
+                ins.process(&data_f);
+                ins.process::<i32>(&data_i);
+            }
+        });
+        tx.send(InCmd::Stop).unwrap();
+        assert_no_alloc(|| ins.process(&data_f));
+
+        // --- sortie : lecture, bascule, pads.
+        let (otx, orx) = bounded::<OutCmd>(8);
+        let (ogt, _ogr) = bounded(8);
+        let (ptx, prx) = bounded::<PadCmd>(64);
+        let (sgt, _sgr) = bounded(64);
+        let mut out = OutState::new(
+            2,
+            0,
+            orx,
+            ogt,
+            shared.clone(),
+            Sampler::new(prx, sgt, 0, 48000),
+        );
+        let (mut pp, pc) = rtrb::RingBuffer::new(1 << 16);
+        let (mut pp2, pc2) = rtrb::RingBuffer::new(1 << 16);
+        for _ in 0..(1 << 15) {
+            let _ = pp.push(0.1);
+            let _ = pp2.push(0.2);
+        }
+        otx.send(OutCmd::Play(pc)).unwrap();
+        otx.send(OutCmd::Switch(pc2, 2048)).unwrap();
+        let smp = Arc::new(SampleData {
+            sample_rate: 48000,
+            frames: 48000,
+            data: vec![0.3; 96000],
+            peaks: Vec::new(),
+        });
+        let params = |mode| PadParams {
+            start: 0,
+            end: 48000,
+            fade_in: 100,
+            fade_out: 100,
+            gain: 1.0,
+            mode,
+            looped: true,
+        };
+        for (slot, mode) in [
+            (0, PadMode::Toggle),
+            (1, PadMode::Gate),
+            (2, PadMode::Retrigger),
+        ] {
+            ptx.send(PadCmd::Press {
+                slot,
+                sample: smp.clone(),
+                params: params(mode),
+            })
+            .unwrap();
+        }
+        assert_no_alloc(|| {
+            for _ in 0..50 {
+                out.process(128);
+            }
+        });
+        ptx.send(PadCmd::Release { slot: 1 }).unwrap();
+        ptx.send(PadCmd::FadeAll { frames: 4800 }).unwrap();
+        otx.send(OutCmd::Stop).unwrap();
+        assert_no_alloc(|| {
+            for _ in 0..200 {
+                out.process(128);
+            }
+        });
+        ptx.send(PadCmd::StopAll).unwrap();
+        assert_no_alloc(|| out.process(128));
+    }
+
     #[test]
     fn play_position_is_interpolated_between_output_blocks() {
         let sh = super::Shared::new();
