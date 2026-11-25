@@ -1058,8 +1058,7 @@ fn free_space(dir: &Path) -> Option<u64> {
     fs4::available_space(p).ok()
 }
 
-const OUTPUT_STALLED: &str =
-    "La sortie audio ne répond pas : vérifiez la carte son (Réglages audio pour la relancer)";
+const OUTPUT_STALLED: &str = "Sortie audio bloquée · voir Réglages audio";
 
 pub struct App {
     pub tab: usize,
@@ -1505,10 +1504,7 @@ impl App {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.load_session(&path)));
             if res.is_err() {
                 app.notify(
-                    format!(
-                        "Récupération de « {} » impossible : ouvrez-la à la main",
-                        path.display()
-                    ),
+                    format!("Récupération impossible : « {} »", path.display()),
                     true,
                 );
             }
@@ -1529,10 +1525,7 @@ impl App {
                             .unwrap_or_default()
                     })
                     .collect();
-                let others = format!(
-                    "Prise interrompue aussi dans : {} — ouvrez ces sessions pour récupérer leurs prises",
-                    join_few(&names, 3)
-                );
+                let others = format!("Autres prises interrompues : {}", join_few(&names, 3));
                 // Ajouté au message de la récupération (qui reste lisible).
                 let text = match app.take_toast_text() {
                     Some(t) => format!("{t} · {others}"),
@@ -1557,7 +1550,7 @@ impl App {
         launch_warnings.extend(
             app.backup_prefs_error
                 .iter()
-                .map(|e| format!("Copie de sécurité : réglage illisible ({e}), copie inactive"))
+                .map(|e| format!("Copie de sécurité inactive : {e}"))
                 .chain(prefs_notice),
         );
         if !launch_warnings.is_empty() {
@@ -1720,10 +1713,7 @@ impl App {
             return;
         }
         if !self.engine.has_output() {
-            self.notify(
-                "Aucune sortie audio : choisissez-en une dans les réglages audio",
-                true,
-            );
+            self.notify("Aucune sortie audio · voir Réglages audio", true);
             return;
         }
         // Bandes lues sans rééchantillonnage : à une autre fréquence, elles partiraient à la
@@ -1805,7 +1795,7 @@ impl App {
         let sr = self.engine.status.sample_rate;
         (self.project.has_audio() && self.project.sample_rate != sr).then(|| {
             format!(
-                "La session est en {} kHz mais la carte tourne en {} kHz. Changez la fréquence dans les réglages audio.",
+                "Session en {} kHz, carte en {} kHz",
                 fmt_khz(self.project.sample_rate),
                 fmt_khz(sr)
             )
@@ -1815,9 +1805,8 @@ impl App {
     /// Sortie principale en cours de réouverture (essai lancé, pas encore installé) :
     /// message, sinon `None`. Rien n'est envoyé à l'ancien flux, fermé juste après.
     fn output_reopening(&self) -> Option<String> {
-        (self.engine.reopening() & audio::LOST_OUTPUT != 0).then(|| {
-            "Réouverture de la sortie audio en cours : réessayez dans un instant".to_string()
-        })
+        (self.engine.reopening() & audio::LOST_OUTPUT != 0)
+            .then(|| "Sortie audio en réouverture…".to_string())
     }
 
     /// L'entrée existe mais ne délivre rien (perdue, en cours de réouverture, ou muette) :
@@ -1826,18 +1815,12 @@ impl App {
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
         let reopening = self.engine.reopening() & audio::LOST_INPUT != 0;
         if lost & audio::LOST_INPUT != 0 || reopening {
-            return Some(
-                "Entrée audio perdue : reconnexion en cours, l'enregistrement sera possible dès son retour"
-                    .into(),
-            );
+            return Some("Entrée audio perdue · reconnexion…".into());
         }
         let hb = self.hb[audio::SLOT_INPUT];
         let beat = self.engine.shared.heartbeat[audio::SLOT_INPUT].load(Ordering::Relaxed);
         if self.engine.has_input() && beat == hb.0 && self.now - hb.1 > 1.0 {
-            return Some(
-                "L'entrée audio ne délivre plus de signal (câble, carte ou horloge Dante) : vérifiez la connexion"
-                    .into(),
-            );
+            return Some("Entrée audio : plus de signal".into());
         }
         None
     }
@@ -1855,14 +1838,11 @@ impl App {
             OverFinishing::Free => false,
             OverFinishing::Adopt => true,
             OverFinishing::Wait => {
-                self.notify("Finalisation de la prise précédente en cours…", false);
+                self.notify("Finalisation de la prise précédente…", false);
                 return;
             }
             OverFinishing::TooMany => {
-                self.notify(
-                    "Le disque ne répond plus depuis plusieurs prises : vérifiez-le, ou relancez TracksPlus (les prises seront récupérées)",
-                    true,
-                );
+                self.notify("Disque bloqué depuis plusieurs prises", true);
                 return;
             }
         };
@@ -1871,12 +1851,7 @@ impl App {
         // secours serait remplacé par celui de la prise suivante. Refus avant tout (la
         // lecture en cours continue).
         if let Some(why) = self.project.save_refused() {
-            self.notify(
-                format!(
-                    "Prise impossible : la session ne peut pas être enregistrée ({why}). Faites d'abord « Enregistrer sous »."
-                ),
-                true,
-            );
+            self.notify(format!("Prise impossible : {why} · Enregistrer sous"), true);
             return;
         }
         if self.transport != Transport::Stopped {
@@ -1891,10 +1866,7 @@ impl App {
             return;
         }
         if !self.engine.has_input() {
-            self.notify(
-                "Aucune entrée audio : choisissez votre carte dans les réglages audio",
-                true,
-            );
+            self.notify("Aucune entrée audio · voir Réglages audio", true);
             return;
         }
         let sr = self.engine.status.sample_rate;
@@ -1921,10 +1893,7 @@ impl App {
             .map(|t| t.name.clone())
             .collect();
         if armed.is_empty() {
-            self.notify(
-                "Armez au moins une piste (pastille rouge) avec une entrée valide",
-                true,
-            );
+            self.notify("Aucune piste armée", true);
             return;
         }
 
@@ -1977,10 +1946,7 @@ impl App {
         if self.project.has_audio()
             && let Some(msg) = self.output_reopening()
         {
-            self.notify(
-                format!("{msg} — prise lancée sans la lecture des pistes existantes"),
-                true,
-            );
+            self.notify(format!("{msg} · prise sans lecture"), true);
         }
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
@@ -2035,10 +2001,7 @@ impl App {
                 return;
             }
             None => {
-                self.abort_record_start(
-                    "Le disque de la session ne répond pas : prise impossible pour l'instant. Vérifiez le disque puis relancez la prise."
-                        .into(),
-                );
+                self.abort_record_start("Disque de la session bloqué · prise impossible".into());
                 return;
             }
         };
@@ -2061,9 +2024,7 @@ impl App {
                     }
                 }
                 Err(e) => self.notify(
-                    format!(
-                        "Journal de la prise précédente illisible ({e}) : ses fichiers restent dans Audio/"
-                    ),
+                    format!("Journal de la prise précédente illisible : {e}"),
                     true,
                 ),
             }
@@ -2110,7 +2071,7 @@ impl App {
         ) {
             Ok(r) => r,
             Err(e) => {
-                self.abort_record_start(format!("Impossible de démarrer l'écriture disque : {e}"));
+                self.abort_record_start(format!("Écriture disque impossible : {e}"));
                 return;
             }
         };
@@ -2119,10 +2080,7 @@ impl App {
         if adopt && let Some(mut f) = self.finishing.take() {
             f.take.merge = true;
             self.stalled_takes.push(f);
-            self.notify(
-                "Prise précédente pas encore entièrement écrite (disque lent) : elle sera ajoutée à la session dès que son écriture se termine, et reste récupérable en cas de coupure",
-                true,
-            );
+            self.notify("Disque lent · prise précédente en cours d'écriture", true);
         }
         // Prises précédentes restées dans l'ancien journal : intégrées maintenant que la
         // capture a son thread d'écriture (sauvegarde en arrière-plan juste après).
@@ -2130,10 +2088,7 @@ impl App {
             let (n, cleanup) = recovery::apply_journal(&mut self.project, &j, &[]);
             if n > 0 {
                 self.load_peaks();
-                self.notify(
-                    format!("{n} prise(s) précédente(s) récupérée(s) depuis le disque"),
-                    false,
-                );
+                self.notify(format!("{n} prise(s) précédente(s) récupérée(s)"), false);
             }
             let dir = self.project.dir.clone();
             self.stash_stale_files(&dir, cleanup);
@@ -2154,21 +2109,13 @@ impl App {
         }
         self.rec_has_backup = has_backup;
         if backup_blocked {
-            self.notify(
-                "Copie de sécurité inactive pour cette prise : le second disque n'a pas fini d'écrire la précédente (il ne répond plus)",
-                true,
-            );
+            self.notify("Copie de sécurité inactive : second disque bloqué", true);
         } else if self.backup_root.is_some() && !has_backup {
-            self.notify(
-                "Copie de sécurité inactive pour cette session : elle est sur le même disque que la copie",
-                false,
-            );
+            self.notify("Copie de sécurité inactive : même disque", false);
         } else if self.backup_root.is_none()
             && let Some(e) = &self.backup_prefs_error
         {
-            let msg = format!(
-                "Copie de sécurité inactive : son réglage n'a pas pu être lu ({e}). Choisissez de nouveau le second disque."
-            );
+            let msg = format!("Copie de sécurité inactive : {e}");
             self.notify(msg, true);
         }
         self.recorder = Some(recorder);
@@ -2210,7 +2157,7 @@ impl App {
         if !skipped.is_empty() {
             self.notify(
                 format!(
-                    "Attention : {} piste(s) armée(s) sans entrée valide ne sont PAS enregistrées : {}",
+                    "{} piste(s) sans entrée, NON enregistrée(s) : {}",
                     skipped.len(),
                     skipped.join(", ")
                 ),
@@ -2297,9 +2244,7 @@ impl App {
                     // Nouvel essai par la sauvegarde automatique (active aussi pendant une prise).
                     self.project.dirty = true;
                     self.notify(
-                        format!(
-                            "Attention : session non sauvegardée ({e:#}) — nouvel essai automatique"
-                        ),
+                        format!("Session non sauvegardée · nouvel essai : {e:#}"),
                         true,
                     );
                 }
@@ -2344,10 +2289,7 @@ impl App {
             None => recovery::remove_journal(&self.project.dir),
             Some(j) => {
                 if let Err(e) = recovery::write_journal(&self.project.dir, &j) {
-                    self.notify(
-                        format!("Attention : journal de secours non écrit ({e:#})"),
-                        true,
-                    );
+                    self.notify(format!("Journal de secours non écrit : {e:#}"), true);
                 }
             }
         }
@@ -2456,10 +2398,8 @@ impl App {
                             .filter(|e| e.starts_with("copie"))
                             .collect();
                         if self.engine.shared.copy_overruns.load(Ordering::Relaxed) > 0 {
-                            take.backup_warn.push(
-                                "le second disque n'a pas suivi (silence inséré dans la copie)"
-                                    .into(),
-                            );
+                            take.backup_warn
+                                .push("second disque trop lent (silence)".into());
                         }
                         let progress = rec.progress();
                         let (tx, rx) = std::sync::mpsc::channel();
@@ -2594,10 +2534,7 @@ impl App {
                     let idle = self.now - f.seen.1;
                     if idle > FINISH_SLOW_SECS && !f.slow_told {
                         f.slow_told = true;
-                        self.notify(
-                            "Disque lent : la fin de la prise est encore en cours d'écriture, elle sera ajoutée à la session dès que c'est terminé",
-                            true,
-                        );
+                        self.notify("Disque lent · fin de prise en cours d'écriture", true);
                     }
                     return;
                 }
@@ -2634,10 +2571,7 @@ impl App {
                 let _ = recovery::keep_journal(&dir, j);
             }
             self.notify(
-                format!(
-                    "Prise précédente terminée : elle sera ajoutée à sa session ({}) à sa prochaine ouverture",
-                    dir.display()
-                ),
+                format!("Prise précédente terminée · gardée pour {}", dir.display()),
                 false,
             );
             return;
@@ -2659,10 +2593,7 @@ impl App {
                     self.given_up.push((dir.clone(), j.clone()));
                 }
                 self.take_notes(split, gap, gap_missing, lost_card, None);
-                self.notify(
-                    "Le disque ne répond plus : les prises seront récupérées automatiquement à la prochaine ouverture de la session",
-                    true,
-                );
+                self.notify("Disque bloqué · prises récupérées à la réouverture", true);
                 return;
             }
             TakeOutcome::Done(Finished { main: Err(_), .. }) | TakeOutcome::Lost => {
@@ -2680,21 +2611,18 @@ impl App {
                         Ok(r) => {
                             self.load_peaks();
                             let msg = match &r.saved {
-                                Ok(()) => format!(
-                                    "Problème d'écriture disque : {} prise(s) récupérée(s) depuis le disque",
-                                    r.takes
-                                ),
+                                Ok(()) => {
+                                    format!("Erreur disque : {} prise(s) récupérée(s)", r.takes)
+                                }
                                 Err(e) => format!(
-                                    "Problème d'écriture disque : {} prise(s) récupérée(s), session pas encore sauvegardée ({e:#}) — le journal de secours est conservé, nouvel essai automatique",
+                                    "Erreur disque : {} prise(s) récupérée(s) · session non sauvegardée : {e:#}",
                                     r.takes
                                 ),
                             };
                             self.notify(msg, true);
                         }
                         Err(e) => self.notify(
-                            format!(
-                                "Problème d'écriture disque, journal de secours illisible ({e:#}) : les fichiers sont conservés dans Audio/"
-                            ),
+                            format!("Erreur disque · journal de secours illisible : {e:#}"),
                             true,
                         ),
                     }
@@ -2709,14 +2637,12 @@ impl App {
                 self.load_peaks();
                 self.prune_peaks();
                 let msg = match self.save_after_late_take(cleanup) {
-                    None => format!(
-                        "Problème d'écriture disque : {n} prise(s) récupérée(s) depuis le disque"
-                    ),
+                    None => format!("Erreur disque : {n} prise(s) récupérée(s)"),
                     Some(e) => {
                         // Journal de la prise gardé : la récupération se refera.
                         let _ = recovery::keep_journal(&dir, j);
                         format!(
-                            "Problème d'écriture disque : {n} prise(s) récupérée(s), session pas encore sauvegardée ({e:#}) — le journal de secours est conservé, nouvel essai automatique"
+                            "Erreur disque : {n} prise(s) récupérée(s) · session non sauvegardée : {e:#}"
                         )
                     }
                 };
@@ -2831,7 +2757,7 @@ impl App {
             }
             self.notify(
                 format!(
-                    "Prise précédente complétée sur le disque ({})",
+                    "Prise précédente complétée · {}",
                     fmt_time(max_len, self.sr())
                 ),
                 !errors.is_empty(),
@@ -2877,16 +2803,19 @@ impl App {
             }
             self.notify(msg, true);
         } else if let Err(e) = save {
-            self.notify(format!("Sauvegarde de la session impossible (les fichiers sont bien sur le disque) : {e:#}"), true);
+            self.notify(
+                format!("Prise sur le disque · session non sauvegardée : {e:#}"),
+                true,
+            );
         } else if overruns > 0 {
             self.notify(
-                format!("Prise enregistrée, mais {overruns} saturations disque compensées par du silence"),
+                format!("Prise enregistrée · {overruns} saturations disque (silence)"),
                 true,
             );
         } else if xruns > 0 {
             self.notify(
                 format!(
-                    "Prise enregistrée · {} · mais le pilote audio a signalé {xruns} décrochage{} : augmentez le buffer ou passez en ASIO",
+                    "Prise enregistrée · {} · {xruns} décrochage{} · augmentez le buffer",
                     fmt_time(max_len, self.sr()),
                     if xruns > 1 { "s" } else { "" }
                 ),
@@ -2895,16 +2824,13 @@ impl App {
         } else if !backup_warn.is_empty() {
             self.notify(
                 format!(
-                    "Prise enregistrée sur le disque principal · Copie de sécurité incomplète : {}",
+                    "Prise enregistrée · copie de sécurité incomplète : {}",
                     join_few(&backup_warn, 3)
                 ),
                 true,
             );
         } else if !released {
-            self.notify(
-                "Prise enregistrée (la carte son ne répondait plus à l'arrêt)",
-                true,
-            );
+            self.notify("Prise enregistrée · carte son muette à l'arrêt", true);
         } else {
             self.notify(
                 format!(
@@ -2932,13 +2858,13 @@ impl App {
         let sr = self.sr();
         if split {
             let next = if self.resume.is_some() {
-                "la suite est relancée automatiquement à sa place"
+                "suite relancée"
             } else {
-                "relancez l'enregistrement"
+                "relancez la prise"
             };
             self.notify_level(
                 format!(
-                    "L'entrée s'est interrompue pendant la prise (trou de {}, plus long que les tampons) : prise coupée à cet endroit et sauvegardée ; {next}",
+                    "Entrée coupée {} · prise sauvegardée · {next}",
                     fmt_gap(gap_missing as f64 / sr as f64)
                 ),
                 Level::Critical,
@@ -2946,7 +2872,7 @@ impl App {
         } else if gap > 0 {
             self.notify(
                 format!(
-                    "L'entrée s'est interrompue pendant la prise : {} de silence inséré, la suite est restée à sa place",
+                    "Entrée coupée {} · silence inséré",
                     fmt_gap(gap as f64 / sr as f64)
                 ),
                 true,
@@ -2954,18 +2880,16 @@ impl App {
         }
         if lost_card {
             let next = if self.resume.is_some() {
-                "elle sera relancée automatiquement dès le retour de la carte"
+                "relance à son retour"
             } else {
-                "relancez l'enregistrement dès le retour de la carte"
+                "relancez la prise"
             };
             let kept = match len {
                 Some(n) => format!("prise sauvegardée ({})", fmt_time(n, sr)),
-                None => "ce qui a été capté est gardé".to_string(),
+                None => "prise gardée".to_string(),
             };
             self.notify_level(
-                format!(
-                    "Carte son perdue pendant la prise : enregistrement arrêté, {kept} ; {next}"
-                ),
+                format!("Carte son perdue · {kept} · {next}"),
                 Level::Critical,
             );
         }
@@ -3028,10 +2952,7 @@ impl App {
             self.stop();
         } else {
             self.stop_armed_until = self.now + 2.0;
-            self.notify(
-                "Enregistrement en cours — appuyez encore une fois pour l'arrêter",
-                true,
-            );
+            self.notify("Appuyez encore pour arrêter", true);
         }
     }
 
@@ -3120,15 +3041,11 @@ impl App {
         let dante = [&st.input, &st.output, &st.pad_output, &st.monitor_output]
             .into_iter()
             .flatten()
-            .find(|n| n.to_lowercase().contains("dante"));
-        match dante {
-            Some(name) => format!(
-                "« {name} » ne reçoit pas d'horloge Dante : allumez un appareil Dante sur le réseau (console, stagebox) ou Dante Via sur un autre ordinateur. Le son démarrera tout seul."
-            ),
-            None => format!(
-                "Carte son ouverte mais silencieuse ({}) : le pilote n'envoie aucun son pour l'instant.",
-                self.engine.slots_label(slots)
-            ),
+            .any(|n| n.to_lowercase().contains("dante"));
+        if dante {
+            "Dante : pas d'horloge réseau".to_string()
+        } else {
+            format!("Carte son muette : {}", self.engine.slots_label(slots))
         }
     }
 
@@ -3233,7 +3150,7 @@ impl App {
     /// Échap, panique, indicateur du transport).
     pub fn cancel_resume(&mut self) {
         if self.resume.take().is_some() {
-            self.notify_level("Relance automatique de la prise annulée", Level::Critical);
+            self.notify_level("Relance auto annulée", Level::Critical);
         }
     }
 
@@ -3283,16 +3200,13 @@ impl App {
             ResumeStep::Cancel => self.resume = None,
             ResumeStep::Blocked => {
                 self.resume = None;
-                self.notify_level(
-                    "Relance automatique de la prise impossible : le disque ne répond plus depuis plusieurs prises. Vérifiez-le puis relancez l'enregistrement à la main",
-                    Level::Critical,
-                );
+                self.notify_level("Relance impossible : disque bloqué", Level::Critical);
             }
             ResumeStep::Expire => {
                 self.resume = None;
                 self.notify_level(
                     format!(
-                        "Relance automatique de la prise abandonnée : la carte son n'est pas revenue dans les {} minutes. Relancez l'enregistrement à la main.",
+                        "Relance abandonnée : carte absente depuis {} min",
                         (RESUME_MAX / 60.0).round()
                     ),
                     Level::Critical,
@@ -3309,18 +3223,11 @@ impl App {
                         format!("Reprise auto (trou {})", fmt_gap(gap)),
                     );
                     self.notify_level(
-                        format!(
-                            "Prise relancée automatiquement à {} (trou de {})",
-                            fmt_time(self.playhead, self.sr()),
-                            fmt_gap(gap)
-                        ),
+                        format!("Prise relancée · trou de {}", fmt_gap(gap)),
                         Level::Critical,
                     );
                 } else {
-                    self.notify_level(
-                        "Relance automatique de la prise impossible : relancez l'enregistrement à la main",
-                        Level::Critical,
-                    );
+                    self.notify_level("Relance impossible · relancez la prise", Level::Critical);
                 }
             }
         }
@@ -3381,10 +3288,12 @@ impl App {
             // Pilote relâché faute d'horloge : son message est déjà affiché.
             if !self.clockless {
                 let what = self.engine.problems(lost).join(" · ");
-                self.device_notice(if lost != 0 {
-                    format!("Carte son perdue ({what}) : reconnexion automatique…")
+                self.device_notice(if lost != 0 && self.engine.single_device() {
+                    "Carte son perdue · reconnexion…".to_string()
+                } else if lost != 0 {
+                    format!("{what} · reconnexion…")
                 } else {
-                    format!("Carte son : {what} — en attente de son retour…")
+                    format!("{what} · en attente…")
                 });
             }
         }
@@ -3402,9 +3311,7 @@ impl App {
                 // Rien de mort, seulement un flux refusé : on ne coupe pas ce qui marche.
                 self.reconnect = Some((f64::INFINITY, delay));
                 let what = self.engine.problems(0).join(" · ");
-                self.device_notice(format!(
-                    "Carte son : {what} — corrigez-le dans les réglages audio"
-                ));
+                self.device_notice(format!("{what} · voir Réglages audio"));
                 return;
             }
             if !self.is_stopped() || pads_busy {
@@ -3412,9 +3319,9 @@ impl App {
                     self.reconnect_wait = true;
                     self.notify_level(
                         if pads_busy {
-                            "Carte son perdue : elle sera rouverte dès que les pads en lecture seront arrêtés"
+                            "Carte son perdue · réouverture à l'arrêt des pads"
                         } else {
-                            "Carte son perdue : elle sera rouverte dès l'arrêt de la lecture ou de la prise"
+                            "Carte son perdue · réouverture à l'arrêt"
                         },
                         Level::Device,
                     );
@@ -3493,9 +3400,7 @@ impl App {
                         job.alerted = true;
                         let what = self.engine.slots_label(job.slots);
                         self.notify_level(
-                            format!(
-                                "Le pilote de la carte son ne répond plus pour {what} (ouverture bloquée) : TracksPlus attend sa réponse et continue de rouvrir les autres flux. Si rien ne bouge, débranchez puis rebranchez la carte, ou redémarrez le service Audio de Windows."
-                            ),
+                            format!("Pilote bloqué : {what} · rebranchez la carte"),
                             Level::Warn,
                         );
                     }
@@ -3584,7 +3489,7 @@ impl App {
             self.reconnect = Some((self.now + delay, next_delay(delay, asio)));
             if touched != 0 && !self.clockless {
                 let what = self.engine.problems(lost).join(" · ");
-                self.device_notice(format!("Carte son : {what} — nouvel essai automatique…"));
+                self.device_notice(format!("{what} · nouvel essai…"));
             }
         }
         // Carte revenue à une autre fréquence que la session : lecture et prise bloquées,
@@ -3592,10 +3497,7 @@ impl App {
         if rate_before != self.engine.status.sample_rate
             && let Some(msg) = self.rate_mismatch()
         {
-            self.notify(
-                format!("Carte son revenue à une autre fréquence. {msg}"),
-                true,
-            );
+            self.notify(format!("Carte son revenue · {msg}"), true);
         }
     }
 
@@ -3764,11 +3666,7 @@ impl App {
         let sessions = project::default_sessions_root();
         if same_volume(&d, &self.project.dir) || same_volume(&d, &sessions) {
             // Même disque : la copie ne protégerait de rien si ce disque lâche.
-            self.notify(
-                "La copie de sécurité doit être sur un AUTRE disque que celui des sessions \
-                 (clé USB, SSD externe, second disque interne)",
-                true,
-            );
+            self.notify("Copie de sécurité : choisissez un AUTRE disque", true);
         } else {
             self.set_backup_root(Some(d));
         }
@@ -3787,10 +3685,7 @@ impl App {
                 );
             }
             // Réglage appliqué pour cette fois, mais il ne sera pas retrouvé au lancement.
-            Err(e) => self.notify(
-                format!("Copie de sécurité : réglage non enregistré ({e:#}), à refaire au prochain lancement"),
-                true,
-            ),
+            Err(e) => self.notify(format!("Réglage de la copie non enregistré : {e:#}"), true),
         }
         self.backup_root = d;
         // Nouvelle mesure du second disque au prochain passage (dans les 2 s).
@@ -3873,7 +3768,7 @@ impl App {
                 String::new()
             };
             self.notify(
-                format!("Lecture : prise illisible, jouée en silence — {first}{more}"),
+                format!("Prise illisible, jouée en silence : {first}{more}"),
                 true,
             );
         }
@@ -3903,10 +3798,7 @@ impl App {
             return alerts;
         }
         if self.recorder.as_ref().is_some_and(|r| !r.is_alive()) {
-            alerts.push(
-                "Écriture disque arrêtée (erreur interne) : arrêtez la prise, elle sera récupérée"
-                    .into(),
-            );
+            alerts.push("Écriture disque arrêtée · arrêtez la prise".into());
         }
         let frames = self.engine.shared.rec_frames.load(Ordering::Relaxed);
         if frames != self.rec_watch.0 {
@@ -3924,14 +3816,14 @@ impl App {
                 .max(0.0)
                 .ceil();
             alerts.push(format!(
-                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion{} · la prise continue, arrêt dans {left:.0} s si rien ne revient",
-                if dante { " et l'horloge Dante" } else { "" }
+                "PLUS DE SIGNAL{} · arrêt dans {left:.0} s",
+                if dante { " · horloge Dante ?" } else { "" }
             ));
         }
         let gap = self.engine.shared.rec_gap_frames.load(Ordering::Relaxed);
         if gap > 0 {
             alerts.push(format!(
-                "Entrée interrompue pendant la prise : {} de silence inséré (la suite reste à sa place)",
+                "Entrée coupée · {} de silence inséré",
                 fmt_gap(gap as f64 / self.sr() as f64)
             ));
         }
@@ -3946,31 +3838,25 @@ impl App {
             // libérer de la place ou de prévoir un autre disque avant la fin du concert.
             if secs < 1800 {
                 alerts.push(format!(
-                    "Disque presque plein : ≈ {} d'enregistrement restant",
+                    "Disque presque plein · ≈ {} restant",
                     fmt_duration(secs)
                 ));
             }
         }
         match self.backup_free {
             Some(Ok(free)) if free / bps < 1800 => alerts.push(format!(
-                "Copie de sécurité : second disque presque plein, ≈ {} restant (la prise principale continue)",
+                "Copie de sécurité : second disque presque plein · ≈ {} restant",
                 fmt_duration(free / bps)
             )),
-            Some(Err(())) => alerts.push(
-                "Copie de sécurité : second disque introuvable (la prise principale continue)"
-                    .into(),
-            ),
+            Some(Err(())) => alerts.push("Copie de sécurité : second disque introuvable".into()),
             _ => {}
         }
         let ov = self.engine.shared.overruns.load(Ordering::Relaxed);
         if ov > 0 {
-            alerts.push(format!("{ov} pertes de données : le disque ne suit pas"));
+            alerts.push(format!("{ov} pertes de données · disque trop lent"));
         }
         if self.engine.shared.copy_overruns.load(Ordering::Relaxed) > 0 {
-            alerts.push(
-                "Copie de sécurité : le second disque ne suit pas (la prise principale continue)"
-                    .into(),
-            );
+            alerts.push("Copie de sécurité : second disque trop lent".into());
         }
         // Erreurs de fichiers en dernier, regroupées : recalculées seulement quand elles
         // changent (jamais une liste reformatée à chaque image).
@@ -4258,10 +4144,7 @@ impl App {
             return true;
         }
         if let Err(e) = self.board.save_devices() {
-            self.notify(
-                format!("Réglages du soundboard non sauvegardés : {e:#}"),
-                true,
-            );
+            self.notify(format!("Réglages soundboard non sauvegardés : {e:#}"), true);
         }
         // Fichier de soundboard protégé (illisible, ou d'une version plus récente) : rien
         // n'est écrit tant que le soundboard n'a pas vraiment changé ; à la première vraie
@@ -4273,7 +4156,7 @@ impl App {
             match self.board.release_guard(&self.project.dir) {
                 Ok(Some(aside)) => self.notify(
                     format!(
-                        "Soundboard modifié : l'ancien fichier est conservé sous « {} » (importable)",
+                        "Ancien soundboard gardé : « {} »",
                         aside.file_name().unwrap_or_default().to_string_lossy()
                     ),
                     true,
@@ -4314,10 +4197,7 @@ impl App {
     /// n'abandonne pas la session en cours (disque plein, clé retirée…). Un second essai
     /// dans les 10 s passe outre, pour ne jamais rester bloqué.
     pub fn save_before_leaving(&mut self) -> bool {
-        self.save_before(
-            "Session en cours non sauvegardée : changement annulé. Recommencez pour \
-             changer quand même (les modifications non sauvegardées seront perdues).",
-        )
+        self.save_before("Session non sauvegardée · recommencez pour forcer")
     }
 
     /// Sauvegarde automatique en cours : on attend qu'elle soit écrite (10 s au plus) ; si
@@ -4394,7 +4274,7 @@ impl App {
         let mut b = match Board::load_session(&self.project.dir) {
             Ok(b) => b,
             Err(e) => {
-                unreadable = Some(format!("soundboard de la session illisible ({e:#})"));
+                unreadable = Some(format!("soundboard illisible : {e:#}"));
                 Board::default()
             }
         };
@@ -4403,7 +4283,7 @@ impl App {
         if !network.is_empty() {
             self.park_network_pads(&network);
             warnings.push(format!(
-                "{} son(s) du soundboard hors de la session (partage réseau ou chemin douteux) non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
+                "{} son(s) hors session bloqué(s) · à remplacer",
                 network.len()
             ));
         }
@@ -4416,13 +4296,7 @@ impl App {
             b.protect(why);
         }
         if let Some(g) = &b.guard {
-            warnings.insert(
-                0,
-                format!(
-                    "Attention, {} : le fichier est gardé tel quel, et mis de côté sous un autre nom si vous modifiez le soundboard",
-                    g.reason
-                ),
-            );
+            warnings.insert(0, format!("{} · fichier protégé", g.reason));
         }
         self.set_board(b);
         (!warnings.is_empty()).then(|| warnings.join(" · "))
@@ -4494,7 +4368,7 @@ impl App {
             Ok(r) => r,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("Import du soundboard interrompu (erreur interne)".to_string())
+                Err("Import du soundboard interrompu".to_string())
             }
         };
         self.import_job = None;
@@ -4519,7 +4393,7 @@ impl App {
         } else {
             self.notify(
                 format!(
-                    "Soundboard importé · {} son(s) introuvable(s), pads à refaire",
+                    "Soundboard importé · {} son(s) introuvable(s)",
                     missing.len()
                 ),
                 true,
@@ -4627,14 +4501,9 @@ impl App {
                 let n = r.takes;
                 self.zoom_to_fit();
                 match r.saved {
-                    Ok(()) => {
-                        info = Some(format!(
-                            "Enregistrement interrompu récupéré : {n} prise(s) restaurée(s) dans « {} »",
-                            self.project.name
-                        ))
-                    }
+                    Ok(()) => info = Some(format!("{n} prise(s) interrompue(s) récupérée(s)")),
                     Err(e) => warnings.push(format!(
-                        "Enregistrement interrompu récupéré : {n} prise(s) restaurée(s), session pas encore sauvegardée ({e:#}) — le journal de secours est conservé"
+                        "{n} prise(s) interrompue(s) récupérée(s) · session non sauvegardée : {e:#}"
                     )),
                 }
             }
@@ -4644,10 +4513,9 @@ impl App {
                     && self.project.sample_rate != self.engine.status.sample_rate
                 {
                     warnings.push(format!(
-                        "Session en {} kHz, carte en {} kHz : réglez la carte sur {} kHz.",
+                        "Session en {} kHz, carte en {} kHz",
                         fmt_khz(self.project.sample_rate),
-                        fmt_khz(self.engine.status.sample_rate),
-                        fmt_khz(self.project.sample_rate)
+                        fmt_khz(self.engine.status.sample_rate)
                     ));
                 }
             }
@@ -4695,10 +4563,7 @@ impl App {
             c(a) == c(b)
         };
         if same(&dir, &self.project.dir) || same(&parent, &self.project.dir) {
-            self.notify(
-                "C'est déjà le dossier de cette session : choisissez un autre dossier pour en faire une copie",
-                true,
-            );
+            self.notify("Dossier de la session · choisissez-en un autre", true);
             return;
         }
         // Copie des prises et des sons dans un thread (fenêtre de progression) : l'interface
@@ -4728,7 +4593,7 @@ impl App {
             Ok(r) => r,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("Enregistrement de la session interrompu (erreur interne)".to_string())
+                Err("Enregistrer sous interrompu".to_string())
             }
         };
         self.save_as_job = None;
@@ -4737,7 +4602,7 @@ impl App {
                 if !lost.is_empty() {
                     self.notify(
                         format!(
-                            "{} prise(s) introuvable(s) non copiée(s) : {}",
+                            "{} prise(s) introuvable(s) : {}",
                             lost.len(),
                             lost.join(", ")
                         ),
@@ -4906,7 +4771,7 @@ impl App {
         // Réglé à part (onglet Enregistrement), appliqué tout de suite : jamais écrasé ici.
         prefs.auto_restart = self.prefs.auto_restart;
         if self.editing_locked() {
-            return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
+            return Err("Arrêtez la prise d'abord".into());
         }
         // Choix explicite de l'utilisateur : une reconnexion automatique en cours s'efface.
         // Si elle est en train d'ouvrir la carte, on attend qu'elle ait fini (et on jette
@@ -4914,7 +4779,7 @@ impl App {
         // pilote qui ne répond plus du tout : on ne l'ouvre pas une seconde fois.
         let blocked = |e: &Engine, slots: u8| {
             format!(
-                "Le pilote de la carte son ne répond plus pour {} (ouverture bloquée) : réessayez dans un instant, ou débranchez puis rebranchez la carte.",
+                "Pilote bloqué : {} · rebranchez la carte",
                 e.slots_label(slots)
             )
         };
@@ -4975,10 +4840,7 @@ impl App {
     /// fréquence repassent en « Auto ».
     fn reload_audio(&mut self) {
         if self.is_recording() {
-            self.notify(
-                "Impossible pendant une prise : arrêtez d'abord l'enregistrement",
-                true,
-            );
+            self.notify("Arrêtez la prise d'abord", true);
             return;
         }
         let before = self.prefs.clone();
@@ -4990,7 +4852,7 @@ impl App {
         match self.apply_audio(prefs) {
             Ok(()) => {
                 let msg = format!(
-                    "Carte son relancée avec les réglages du pilote ({} kHz)",
+                    "Carte son relancée · {} kHz",
                     fmt_khz(self.engine.status.sample_rate)
                 );
                 self.notify(msg, false);
@@ -5035,11 +4897,11 @@ impl App {
 
     pub fn open_export(&mut self) {
         if self.editing_locked() {
-            self.notify("Export indisponible pendant l'enregistrement", true);
+            self.notify("Export impossible pendant la prise", true);
             return;
         }
         if !self.project.has_audio() {
-            self.notify("Rien à exporter pour l'instant", true);
+            self.notify("Rien à exporter", true);
             return;
         }
         self.close_dialogs();
@@ -6307,17 +6169,11 @@ impl App {
     /// piste audio par fichier (ou ajout à la piste audio `target`), prises posées à `at`.
     pub fn import_audio_files(&mut self, paths: Vec<PathBuf>, at: u64, target: Option<u64>) {
         if self.dialog_open() {
-            self.notify(
-                "Fermez la fenêtre ouverte avant de déposer des fichiers sur la timeline.",
-                true,
-            );
+            self.notify("Fermez la fenêtre ouverte d'abord", true);
             return;
         }
         if self.editing_locked() {
-            self.notify(
-                "Import impossible pendant un enregistrement ou une copie : réessayez après.",
-                true,
-            );
+            self.notify("Import impossible pour l'instant", true);
             return;
         }
         let (audio, other): (Vec<PathBuf>, Vec<PathBuf>) = paths
@@ -6326,7 +6182,7 @@ impl App {
         if audio.is_empty() {
             self.notify(
                 format!(
-                    "Aucun fichier audio reconnu ({}). Formats acceptés : WAV, AIFF, MP3, FLAC, Ogg, M4A.",
+                    "Format non reconnu : {}",
                     other
                         .iter()
                         .filter_map(|p| p.file_name())
@@ -6484,21 +6340,21 @@ impl App {
         if !errors.is_empty() {
             self.notify(
                 format!(
-                    "{}Impossible d'importer {} fichier(s) : {}",
+                    "{}{} fichier(s) non importé(s) : {}",
                     if n > 0 {
-                        format!("{n} piste(s) audio ajoutée(s). ")
+                        format!("{n} piste(s) ajoutée(s) · ")
                     } else {
                         String::new()
                     },
                     errors.len(),
-                    errors.join(" · ")
+                    join_few(&errors, 3)
                 ),
                 true,
             );
         } else if cancelled {
-            self.notify("Import annulé : rien n'a été ajouté", false);
+            self.notify("Import annulé", false);
         } else if n > 0 {
-            self.notify(format!("{n} fichier(s) importé(s) sur la timeline"), false);
+            self.notify(format!("{n} fichier(s) importé(s)"), false);
         }
     }
 
@@ -6689,9 +6545,9 @@ impl App {
                             // Export réussi mais à vérifier (saturation…) : message qui reste.
                             self.notify(
                                 format!(
-                                    "Export terminé · {} fichier(s), à vérifier : {}",
+                                    "Export terminé · {} fichier(s) · {}",
                                     out.files.len(),
-                                    out.warnings.join(" · ")
+                                    join_few(&out.warnings, 3)
                                 ),
                                 true,
                             );
@@ -6701,7 +6557,7 @@ impl App {
                         }
                     }
                     Err(e) if e.is::<crate::export::Cancelled>() => {
-                        self.notify("Export annulé : aucun fichier n'a été modifié", false)
+                        self.notify("Export annulé", false)
                     }
                     Err(e) => self.notify(format!("{e:#}"), true),
                 }
@@ -7295,7 +7151,7 @@ impl eframe::App for App {
             self.update_background(ctx);
         }));
         if res.is_err() {
-            self.notify("Erreur interne (tâches de fond) — l'audio continue", true);
+            self.notify("Erreur interne · l'audio continue", true);
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -7311,10 +7167,7 @@ impl eframe::App for App {
                 .cloned()
                 .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "erreur inconnue".into());
-            self.notify(
-                format!("Erreur interne de l'interface (l'audio continue) : {msg}"),
-                true,
-            );
+            self.notify(format!("Erreur interne · l'audio continue : {msg}"), true);
         }
         // À part : le message d'erreur et la confirmation de fermeture doivent s'afficher
         // même si le reste de l'interface a planté. Chacun a son propre garde-fou : une
@@ -7328,10 +7181,7 @@ impl eframe::App for App {
             self.confirm_close_dialog(&ctx)
         }));
         if dialog.is_err() {
-            self.notify(
-                "Erreur interne de la confirmation de fermeture (l'audio continue)",
-                true,
-            );
+            self.notify("Erreur interne · l'audio continue", true);
         }
         // 60 images/s quand quelque chose bouge (son, transport, animation), 10 sinon
         // (`logic` repasse toutes les 100 ms) : pas de calcul inutile à l'arrêt.
@@ -7421,16 +7271,14 @@ impl ShutdownPace {
 /// Message affiché après une relance automatique. `take_interrupted` : une prise était en
 /// cours (son journal est resté) ; `opened` : message de l'ouverture de la session.
 fn relaunch_message(take_interrupted: bool, opened: Option<&str>) -> String {
-    let mut m = String::from(
-        "TracksPlus a redémarré tout seul après une erreur interne (détails dans crash.log)",
-    );
+    let mut m = String::from("TracksPlus relancé après une erreur");
     m.push_str(if take_interrupted {
-        " : l'enregistrement s'est arrêté, ce qui était enregistré est conservé. Relancez l'enregistrement si besoin"
+        " · prise arrêtée, gardée"
     } else {
-        " : vérifiez la session et relancez l'enregistrement si besoin"
+        " · vérifiez la session"
     });
     if let Some(o) = opened.filter(|o| !o.is_empty()) {
-        m.push_str(". ");
+        m.push_str(" · ");
         m.push_str(o);
     }
     m
@@ -7504,14 +7352,11 @@ impl App {
         }
         self.sync_pending_saves();
         if crate::shutdown::take_shutdown_refused() {
-            self.notify(
-                "Windows a demandé l'arrêt de l'ordinateur pendant l'enregistrement : arrêt bloqué, la prise continue. Arrêtez la prise avant d'éteindre",
-                true,
-            );
+            self.notify("Arrêt de Windows bloqué · la prise continue", true);
         }
         if crate::shutdown::take_gpu_lost() {
             self.notify(
-                "Affichage perdu (carte graphique réinitialisée) : la prise continue. Arrêtez-la au clavier (deux appuis sur la touche d'arrêt), puis relancez TracksPlus",
+                "Affichage perdu · la prise continue · arrêt au clavier",
                 true,
             );
         }
@@ -8822,12 +8667,12 @@ mod tests {
             true,
             Some("Enregistrement interrompu récupéré : 3 prise(s)"),
         );
-        assert!(m.starts_with("TracksPlus a redémarré tout seul"));
-        assert!(m.contains("l'enregistrement s'est arrêté"));
-        assert!(m.ends_with("Enregistrement interrompu récupéré : 3 prise(s)"));
+        assert!(m.starts_with("TracksPlus relancé après une erreur"));
+        assert!(m.contains("prise arrêtée"));
+        assert!(m.ends_with(" · Enregistrement interrompu récupéré : 3 prise(s)"));
         let m = relaunch_message(false, None);
-        assert!(m.contains("relancez l'enregistrement si besoin"));
-        assert!(!m.ends_with(". "));
+        assert!(m.contains("vérifiez la session"));
+        assert!(!m.ends_with(" · "));
         assert_eq!(relaunch_message(false, Some("")), m);
     }
 

@@ -307,7 +307,7 @@ pub fn list_devices_in_use(
 /// Windows, en WASAPI).
 fn asio_hint(host: &str, device: &str) -> &'static str {
     if host == "ASIO" && device.to_lowercase().contains("dante") {
-        " : démarrez la Dante Virtual Soundcard en mode ASIO (en mode WDM, choisissez le pilote WASAPI)"
+        " · lancez la DVS en mode ASIO"
     } else {
         ""
     }
@@ -345,13 +345,9 @@ fn add_unlisted_asio(
     }
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
     let note = |known: bool| match (in_use, known) {
-        (Some(cur), true) => format!("disponible · « {cur} » sera fermé à l'application"),
-        (Some(cur), false) => format!(
-            "non vérifié · « {cur} » sera fermé pour l'essayer (Dante Virtual Soundcard : mode ASIO)"
-        ),
-        (None, _) => {
-            "ne répond pas · carte non démarrée ? (Dante Virtual Soundcard : mode ASIO)".to_string()
-        }
+        (Some(cur), true) => format!("disponible · ferme « {cur} »"),
+        (Some(cur), false) => format!("non vérifié · ferme « {cur} »"),
+        (None, _) => "ne répond pas · DVS en mode ASIO ?".to_string(),
     };
     for name in registered {
         if listed.iter().any(|l| same(l, name)) {
@@ -672,13 +668,13 @@ impl Shared {
         }
         let msg = match self.stream_error.load(Ordering::Acquire) {
             0 => return None,
-            1 => "la carte son n'est plus disponible (débranchée ou pilote arrêté)",
-            2 => "flux audio interrompu par le pilote (réglage changé, pilote relancé)",
-            3 => "carte son occupée par une autre application",
-            4 => "réglage refusé par la carte son",
-            5 => "accès à la carte son refusé par le système",
+            1 => "carte indisponible",
+            2 => "flux interrompu par le pilote",
+            3 => "carte occupée par une autre application",
+            4 => "réglage refusé",
+            5 => "accès refusé par le système",
             6 => "ressources du pilote épuisées",
-            8 => "erreur interne du traitement audio : flux rouvert automatiquement",
+            8 => "erreur interne · flux rouvert",
             _ => "erreur du pilote audio",
         };
         Some(msg.to_string())
@@ -957,6 +953,36 @@ fn slot_title(slot: usize) -> &'static str {
         SLOT_PADS => "Sortie soundboard",
         _ => "Sortie monitoring",
     }
+}
+
+/// Textes « <flux> « X » <suite> » qui ne diffèrent que par le flux : réunis en un seul
+/// « « X » <suite> » (même carte pour l'entrée et la sortie : nommée une fois).
+fn merge_slots(items: Vec<String>) -> Vec<String> {
+    let split = |t: &str| -> Option<(String, String)> {
+        let (title, after) = t.split_once(" « ")?;
+        if !(0..SLOTS).any(|s| slot_title(s) == title) {
+            return None;
+        }
+        let (name, rest) = after.split_once(" »")?;
+        Some((name.to_string(), rest.to_string()))
+    };
+    let keys: Vec<Option<(String, String)>> = items.iter().map(|t| split(t)).collect();
+    let mut out = Vec::new();
+    for (i, t) in items.iter().enumerate() {
+        let Some(k) = &keys[i] else {
+            out.push(t.clone());
+            continue;
+        };
+        if keys[..i].iter().any(|x| x.as_ref() == Some(k)) {
+            continue;
+        }
+        if keys[i + 1..].iter().any(|x| x.as_ref() == Some(k)) {
+            out.push(format!("« {} »{}", k.0, k.1));
+        } else {
+            out.push(t.clone());
+        }
+    }
+    out
 }
 
 pub struct Engine {
@@ -1278,10 +1304,10 @@ fn open_input(
         SampleFormat::I32 => build_input::<i32>(dev, cfg, st),
         SampleFormat::I24 => build_input::<cpal::I24>(dev, cfg, st),
         SampleFormat::I16 => build_input::<i16>(dev, cfg, st),
-        f => bail!("Format d'entrée non géré : {f:?}"),
+        f => bail!("Format non géré : {f:?}"),
     }
-    .context("ouverture du flux d'entrée")?;
-    stream.play().context("démarrage du flux d'entrée")?;
+    .context("ouverture")?;
+    stream.play().context("démarrage")?;
     Ok(SlotOpen {
         stream,
         tx: SlotTx::In(tx),
@@ -1669,9 +1695,7 @@ impl Engine {
                 // Réglé sur « Par défaut » : la carte d'origine est attendue, jamais remplacée
                 // en silence par le nouveau défaut de Windows (casque Bluetooth, webcam).
                 if *absent && self.plan.defaulted & bit != 0 {
-                    out.push(format!(
-                        "{t} (réglage « Par défaut » : la carte d'origine est attendue ; pour suivre le nouveau périphérique par défaut de Windows, cliquez sur « Actualiser » dans les réglages audio)"
-                    ));
+                    out.push(format!("{t} · « Actualiser » pour changer"));
                 } else {
                     out.push(t.clone());
                 }
@@ -1684,22 +1708,32 @@ impl Engine {
             }
         }
         if self.pads_folded() && missing & LOST_PADS != 0 {
-            out.push("pads joués sur l'écoute en attendant".into());
+            out.push("pads sur le main".into());
         }
-        out
+        merge_slots(out)
+    }
+
+    /// Une seule carte en jeu (tous les flux attendus sur le même périphérique) : les
+    /// messages peuvent dire « carte son » sans la nommer.
+    pub fn single_device(&self) -> bool {
+        let mut names = (0..SLOTS)
+            .filter(|&s| self.plan.want[s].wanted())
+            .map(|s| self.plan.want[s].label());
+        let first = names.next();
+        names.all(|n| Some(&n) == first.as_ref())
     }
 
     /// Échecs d'ouverture d'un périphérique présent (réglage refusé…), à corriger dans les
     /// réglages : `None` si tout est ouvert ou seulement absent.
     pub fn open_errors(&self) -> Option<String> {
-        let v: Vec<&str> = self
+        let v: Vec<String> = self
             .failed
             .iter()
             .flatten()
             .filter(|(_, absent)| !absent)
-            .map(|(t, _)| t.as_str())
+            .map(|(t, _)| t.clone())
             .collect();
-        (!v.is_empty()).then(|| v.join(" · "))
+        (!v.is_empty()).then(|| merge_slots(v).join(" · "))
     }
 
     /// Flux dont le périphérique est présent mais a refusé de s'ouvrir (bits `LOST_*`).
@@ -1756,13 +1790,16 @@ impl Engine {
         self.plan.rate_fixed
     }
 
-    /// Périphériques des flux `slots`, en clair (« Entrée « X », Sortie principale « Y » »).
+    /// Périphériques des flux `slots`, en clair (« Entrée « X », Sortie principale « Y » » ;
+    /// « « X » » seul si tous sont sur la même carte).
     pub fn slots_label(&self, slots: u8) -> String {
-        (0..SLOTS)
-            .filter(|&s| slots & slot_bit(s) != 0)
-            .map(|s| format!("{} « {} »", slot_title(s), self.plan.want[s].label()))
-            .collect::<Vec<_>>()
-            .join(", ")
+        merge_slots(
+            (0..SLOTS)
+                .filter(|&s| slots & slot_bit(s) != 0)
+                .map(|s| format!("{} « {} »", slot_title(s), self.plan.want[s].label()))
+                .collect(),
+        )
+        .join(", ")
     }
 
     /// Prépare la réouverture de `slots` (voir `expand`) : les flux concernés sont retirés
@@ -1840,7 +1877,7 @@ impl Engine {
                     if matches!(res, Some(Ok(_))) {
                         *res = Some(Err((
                             format!(
-                                "{} « {} » ouverte à une autre fréquence : nouvel essai",
+                                "{} « {} » : autre fréquence · nouvel essai",
                                 slot_title(slot),
                                 self.plan.want[slot].label()
                             ),
@@ -1863,7 +1900,7 @@ impl Engine {
         {
             results[SLOT_PADS] = Some(Err((
                 format!(
-                    "{} « {} » revenue pendant que le main joue les pads : nouvel essai",
+                    "{} « {} » revenue · nouvel essai",
                     slot_title(SLOT_PADS),
                     self.plan.want[SLOT_PADS].label()
                 ),
@@ -1883,7 +1920,7 @@ impl Engine {
                     let asked = self.plan.want[slot].name.clone();
                     if o.renamed {
                         self.renamed.push(format!(
-                            "{} « {} » retrouvée sous le nom « {} »",
+                            "{} « {} » renommée « {} »",
                             slot_title(slot),
                             asked.as_deref().unwrap_or("?"),
                             o.name
@@ -1959,9 +1996,10 @@ impl Engine {
         };
         st.monitor_output = name(SLOT_MON);
         st.monitor_ok = self.opened[self.plan.mon_on].is_some();
-        let mut errs: Vec<String> = self.failed.iter().flatten().map(|f| f.0.clone()).collect();
+        let mut errs: Vec<String> =
+            merge_slots(self.failed.iter().flatten().map(|f| f.0.clone()).collect());
         if self.pads_folded() {
-            errs.push("pads joués sur l'écoute".into());
+            errs.push("pads sur le main".into());
         }
         *self.shared.last_error.lock() = (!errs.is_empty()).then(|| errs.join(" · "));
     }
@@ -2155,12 +2193,7 @@ fn pick_config(dev: &cpal::Device, sr: u32, input: bool) -> Result<(SampleFormat
             .ok()
             .map(|c| c.sample_rate());
             match cur {
-                Some(c) if c != sr => anyhow!(
-                    "la carte tourne en {} kHz (réglage du pilote ou de Windows) mais TracksPlus est en {} kHz : remettez {} kHz",
-                    khz(c),
-                    khz(sr),
-                    khz(sr)
-                ),
+                Some(c) if c != sr => anyhow!("carte en {} kHz, attendu {} kHz", khz(c), khz(sr)),
                 _ => anyhow!("ne supporte pas {} kHz", khz(sr)),
             }
         })
@@ -3076,9 +3109,9 @@ fn start_output(
         SampleFormat::I32 => build_output::<i32>(dev, cfg, st),
         SampleFormat::I24 => build_output::<cpal::I24>(dev, cfg, st),
         SampleFormat::I16 => build_output::<i16>(dev, cfg, st),
-        f => Err(anyhow!("Format de sortie non géré : {f:?}")),
+        f => Err(anyhow!("Format non géré : {f:?}")),
     }?;
-    s.play().context("Démarrage du flux de sortie")?;
+    s.play().context("démarrage")?;
     Ok((s, channels))
 }
 
@@ -3657,6 +3690,18 @@ mod tests {
             e.slots_label(LOST_INPUT | LOST_OUTPUT),
             "Entrée « Entrée », Sortie principale « Sortie »"
         );
+        // Même carte pour l'entrée et la sortie : nommée une seule fois.
+        e.plan.want[SLOT_MAIN] = Want::named(Some("Entrée".into()));
+        assert_eq!(e.slots_label(LOST_INPUT | LOST_OUTPUT), "« Entrée »");
+        assert!(e.single_device());
+        assert_eq!(
+            merge_slots(vec![
+                "Entrée « A » perdue".into(),
+                "Sortie principale « A » perdue".into(),
+                "Sortie soundboard « B » perdue".into(),
+            ]),
+            ["« A » perdue", "Sortie soundboard « B » perdue"]
+        );
         // Fréquence pas encore ouverte (aucune carte) : elle n'est pas figée.
         assert!(!e.rate_fixed());
     }
@@ -4042,10 +4087,7 @@ mod tests {
         sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into(), LOST_PADS);
         drop(guard);
         sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into(), LOST_PADS);
-        assert!(
-            sh.error_text()
-                .is_some_and(|t| t.contains("plus disponible"))
-        );
+        assert!(sh.error_text().is_some_and(|t| t.contains("indisponible")));
         // Carte disparue : signalée pour la reconnexion automatique (un décrochage, non).
         assert_eq!(sh.device_lost.load(Ordering::Acquire), LOST_PADS);
         let sh2 = Shared::new();

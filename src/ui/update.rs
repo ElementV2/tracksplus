@@ -28,10 +28,7 @@ impl App {
         let active = !matches!(self.transport, crate::app::Transport::Stopped);
         if self.update_install && (active || self.pads_status().0 > 0) {
             self.update_install = false;
-            self.notify(
-                "Mise à jour reportée : installez-la depuis le menu quand vous serez prêt",
-                false,
-            );
+            self.notify("Mise à jour reportée", false);
             return;
         }
         // Installeur prêt après « Installer et redémarrer » : on le lance et on ferme.

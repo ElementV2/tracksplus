@@ -443,11 +443,9 @@ impl Running {
 /// Message d'un fils qui s'est arrêté sans répondre.
 fn died(stopped: u8) -> String {
     if stopped == STOP_TIMEOUT {
-        "fichier illisible (décodage bloqué, arrêté)".into()
+        "fichier illisible (décodage bloqué)".into()
     } else {
-        "fichier illisible : le décodage s'est arrêté (fichier abîmé ou trop gros pour la \
-         mémoire disponible)"
-            .into()
+        "fichier illisible (abîmé ou trop gros)".into()
     }
 }
 

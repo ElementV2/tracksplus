@@ -999,7 +999,7 @@ impl Recorder {
         if let Some(b) = &self.backup {
             b.errors.lock().summary("copie de sécurité : ", &mut v);
             if !b.is_alive() && !self.stop.load(Ordering::Relaxed) {
-                v.push("copie de sécurité arrêtée (erreur interne)".into());
+                v.push("copie de sécurité arrêtée".into());
             }
         }
         v

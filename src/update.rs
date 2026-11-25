@@ -194,7 +194,7 @@ impl Updater {
             })
             .and_then(|_| {
                 std::fs::rename(&part, &file)
-                    .map_err(|e| format!("impossible d'enregistrer l'installeur : {e}"))
+                    .map_err(|e| format!("installeur non enregistré : {e}"))
             });
             me.set(match res {
                 Ok(()) => State::Ready { release, file },
@@ -257,18 +257,18 @@ fn part_path(file: &Path) -> PathBuf {
 fn verify_download(file: &Path, size: u64, sha256: Option<&str>) -> Result<(), String> {
     let got = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
     if size > 0 && got != size {
-        return Err(format!("téléchargement incomplet ({got} / {size} octets)"));
+        return Err(format!("téléchargement incomplet ({got} / {size} o)"));
     }
     match sha256 {
         Some(want) => {
             let have = sha256_file(file).map_err(|e| format!("installeur illisible : {e}"))?;
             if have != want {
-                return Err("installeur corrompu (empreinte SHA-256 différente)".into());
+                return Err("installeur corrompu (SHA-256)".into());
             }
             Ok(())
         }
         // Sans empreinte, rien ne garantit l'intégrité : on n'exécute jamais un tel fichier.
-        None => Err("empreinte inconnue : installeur impossible à vérifier".into()),
+        None => Err("empreinte inconnue · installeur non vérifiable".into()),
     }
 }
 
@@ -281,7 +281,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// fichier rendu reste ouvert, personne ne peut le modifier, le remplacer ni le renommer.
 /// Son empreinte est vérifiée à travers ce même accès.
 fn open_verified(file: &Path, sha256: Option<&str>) -> Result<std::fs::File, String> {
-    let want = sha256.ok_or("empreinte inconnue : installeur impossible à vérifier")?;
+    let want = sha256.ok_or("empreinte inconnue · installeur non vérifiable")?;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(windows)]
@@ -295,11 +295,7 @@ fn open_verified(file: &Path, sha256: Option<&str>) -> Result<std::fs::File, Str
         .map_err(|e| format!("installeur inaccessible : {e}"))?;
     let have = sha256_reader(&f).map_err(|e| format!("installeur illisible : {e}"))?;
     if have != want {
-        return Err(
-            "installeur modifié depuis son téléchargement (empreinte SHA-256 différente) : \
-             mise à jour annulée"
-                .into(),
-        );
+        return Err("installeur modifié · mise à jour annulée".into());
     }
     Ok(f)
 }
@@ -401,7 +397,7 @@ pub fn launch_installer(file: &Path, sha256: Option<&str>) -> Result<(), String>
         ])
         .spawn()
         .map(|_| drop(locked))
-        .map_err(|e| format!("impossible de lancer l'installeur : {e}"))
+        .map_err(|e| format!("installeur non lancé : {e}"))
 }
 
 /// Ouvre une adresse dans le navigateur.
@@ -543,13 +539,11 @@ fn curl(args: &[&str], out: Option<&Path>, url: &str) -> Result<String, String> 
         // CREATE_NO_WINDOW : pas de console qui clignote.
         cmd.creation_flags(0x0800_0000);
     }
-    let o = cmd
-        .output()
-        .map_err(|_| "curl introuvable sur cet ordinateur".to_string())?;
+    let o = cmd.output().map_err(|_| "curl introuvable".to_string())?;
     if !o.status.success() {
         let err = String::from_utf8_lossy(&o.stderr);
         return Err(if err.contains("404") {
-            "aucune version publiée trouvée".into()
+            "aucune version publiée".into()
         } else if err.contains("resolve") || err.contains("connect") || err.contains("timed out") {
             "pas de connexion à Internet".into()
         } else {

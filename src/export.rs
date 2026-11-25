@@ -387,10 +387,7 @@ impl ExportJob {
                     .cloned()
                     .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "erreur inconnue".into());
-                bail!(
-                    "L'export s'est arrêté sur une erreur interne ({msg}). Aucun fichier \
-                     incomplet n'a été laissé et les exports précédents sont intacts."
-                )
+                bail!("Export arrêté · erreur interne : {msg}")
             }
         }
     }
@@ -448,7 +445,7 @@ fn file_stem(name: &str) -> String {
 /// Dossier d'export : relatif à la session, jamais vide, jamais le dossier des prises.
 fn export_dir(project: &Project, dir: &Path) -> Result<PathBuf> {
     if dir.as_os_str().is_empty() {
-        bail!("Choisissez le dossier où écrire les fichiers exportés");
+        bail!("Choisissez un dossier d'export");
     }
     let dir = if dir.is_relative() {
         project.dir.join(dir)
@@ -462,10 +459,7 @@ fn export_dir(project: &Project, dir: &Path) -> Result<PathBuf> {
             .to_lowercase()
     };
     if canon(&dir) == canon(&project.audio_dir()) {
-        bail!(
-            "Export impossible dans le dossier « Audio » de la session : il contient les prises \
-             enregistrées. Choisissez un autre dossier, par exemple « Export »."
-        );
+        bail!("Export impossible dans « Audio » · choisissez un autre dossier");
     }
     Ok(dir)
 }
@@ -484,9 +478,9 @@ fn check_takes(project: &Project, tracks: &[usize], start: u64, end: u64) -> Res
                 Some("fichier introuvable".to_string())
             } else {
                 match WavSource::open(&path) {
-                    Err(e) => Some(format!("illisible ({e})")),
+                    Err(e) => Some(format!("illisible : {e}")),
                     Ok(src) if src.frames() < c.offset + c.len => {
-                        Some("fichier plus court que la prise (tronqué)".to_string())
+                        Some("fichier tronqué".to_string())
                     }
                     Ok(_) => None,
                 }
@@ -500,8 +494,7 @@ fn check_takes(project: &Project, tracks: &[usize], start: u64, end: u64) -> Res
         return Ok(());
     }
     bail!(
-        "Export impossible : {} prise(s) manquante(s) ou illisible(s) dans le dossier « Audio » \
-         de la session — {}",
+        "Export impossible : {} prise(s) illisible(s) · {}",
         bad.len(),
         list(&bad)
     )
@@ -516,7 +509,7 @@ fn list(items: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" · ");
     if items.len() > 5 {
-        s += &format!(" · et {} autre(s)", items.len() - 5);
+        s += &format!(" · +{} autre(s)", items.len() - 5);
     }
     s
 }
@@ -528,10 +521,7 @@ fn write_error(e: anyhow::Error, name: &str) -> anyhow::Error {
             .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
     });
     if full {
-        anyhow!(
-            "Disque plein pendant l'écriture de « {name} ». Libérez de la place puis relancez \
-             l'export : les exports précédents sont intacts."
-        )
+        anyhow!("Disque plein : « {name} »")
     } else {
         e.context(format!("Écriture de « {name} »"))
     }
@@ -552,7 +542,7 @@ pub fn run_export(
     let (start, end) = s.range.unwrap_or((0, project.end()));
     let end = end.min(project.end().max(start));
     if end <= start {
-        bail!("Rien à exporter : la plage est vide");
+        bail!("Rien à exporter : plage vide");
     }
     let len = end - start;
     let sr_in = project.sample_rate;
@@ -567,7 +557,7 @@ pub fn run_export(
         .filter(|&i| s.tracks.is_empty() || s.tracks.contains(&project.tracks[i].id))
         .collect();
     if with_audio.is_empty() {
-        bail!("Aucune piste sélectionnée ne contient d'audio");
+        bail!("Aucune piste sélectionnée avec de l'audio");
     }
     if !s.stems && !s.mix {
         bail!("Cochez au moins « Pistes séparées » ou « Mix »");
@@ -624,8 +614,7 @@ pub fn run_export(
             .any(|c| project.clip_path(c).to_string_lossy().to_lowercase() == target);
         if clash {
             bail!(
-                "Export impossible : « {} » remplacerait une prise de la session. Choisissez \
-                 un autre dossier.",
+                "Export impossible : « {} » écraserait une prise",
                 u.path.display()
             );
         }
@@ -654,11 +643,9 @@ pub fn run_export(
         && need > free as f64
     {
         bail!(
-            "Espace disque insuffisant : cet export demande environ {}, il reste {} dans {}. \
-             Libérez de la place ou choisissez un autre dossier.",
+            "Espace disque insuffisant : {} requis, {} libres",
             fmt_gb(need),
-            fmt_gb(free as f64),
-            dir.display()
+            fmt_gb(free as f64)
         );
     }
 
@@ -753,17 +740,11 @@ pub fn run_export(
         .map(|(u, n)| {
             if float_out {
                 format!(
-                    "« {} » dépasse 0 dBFS ({n} échantillons) : rien n'est écrêté en 32 bits \
-                     flottant, mais le son saturera à la lecture. Activez la normalisation \
-                     (crête −1 dB) ou baissez le niveau.",
+                    "« {} » au-dessus de 0 dBFS ({n} éch.) · rien n'est écrêté",
                     u.name
                 )
             } else {
-                format!(
-                    "« {} » : {n} échantillons au-delà de 0 dBFS ont été écrêtés (saturation). \
-                     Activez la normalisation (crête −1 dB) pour l'éviter.",
-                    u.name
-                )
+                format!("« {} » : {n} échantillons écrêtés", u.name)
             }
         })
         .collect();
@@ -795,13 +776,7 @@ fn commit_files(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
-    let busy = |p: &Path| {
-        format!(
-            "Impossible de remplacer « {} » : le fichier est peut-être ouvert dans un autre \
-             programme. Fermez-le puis relancez l'export.",
-            p.display()
-        )
-    };
+    let busy = |p: &Path| format!("« {} » ouvert ailleurs · fermez-le", p.display());
     // Remet les anciens fichiers (indices de `pairs`) ; rend ceux qui n'ont pas pu l'être.
     let restore = |moved: &[usize], rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>| {
         let mut stuck = Vec::new();
@@ -809,7 +784,7 @@ fn commit_files(
             let dst = &pairs[i].1;
             if rename(&backup_of(dst), dst).is_err() {
                 stuck.push(format!(
-                    "l'ancien « {} » est resté sous le nom « {} »",
+                    "ancien « {} » resté en « {} »",
                     name(dst),
                     name(&backup_of(dst))
                 ));
@@ -828,10 +803,10 @@ fn commit_files(
         if rename(dst, &old).is_err() {
             let stuck = restore(&moved, rename);
             if stuck.is_empty() {
-                bail!("{} Aucun fichier n'a été remplacé.", busy(dst));
+                bail!("Aucun fichier remplacé : {}", busy(dst));
             }
             bail!(
-                "{} Aucun nouveau fichier n'a été mis en place, mais {}.",
+                "Aucun fichier remplacé : {} · {}",
                 busy(dst),
                 stuck.join(", ")
             );
@@ -849,18 +824,15 @@ fn commit_files(
         for (j, (part, dst)) in pairs[..k].iter().enumerate().rev() {
             // Avec un ancien fichier, sa remise en place (plus bas) remplace le nouveau.
             if rename(dst, part).is_err() && !moved.contains(&j) {
-                stuck.push(format!(
-                    "« {} » (nouveau fichier) est resté en place",
-                    name(dst)
-                ));
+                stuck.push(format!("nouveau « {} » resté en place", name(dst)));
             }
         }
         stuck.extend(restore(&moved, rename));
         if stuck.is_empty() {
-            bail!("{} Aucun fichier n'a été remplacé.", busy(dst));
+            bail!("Aucun fichier remplacé : {}", busy(dst));
         }
         bail!(
-            "{} Le dossier n'a pas pu être remis tout à fait dans son état d'avant : {}.",
+            "Dossier d'export incomplet : {} · {}",
             busy(dst),
             stuck.join(", ")
         );
@@ -905,10 +877,7 @@ fn check_aiff_size(
     let bytes = pcm_data_bytes(len, sr_in, sr_out, channels, depth);
     if bytes > MAX_AIFF_DATA {
         bail!(
-            "Export impossible : un fichier ferait {} Go, au-delà de la limite de 4 Go du \
-             format AIFF. Choisissez le WAV ou le BWF (sans limite de taille), moins de bits, \
-             une fréquence plus basse, des pistes séparées plutôt que le mix, ou une plage \
-             plus courte.",
+            "AIFF limité à 4 Go ({} Go) · choisissez WAV ou BWF",
             format!("{:.1}", bytes as f64 / 1e9).replace('.', ",")
         );
     }
@@ -1054,11 +1023,7 @@ fn render_all(
         pos += n as u64;
         let errors: Vec<String> = renderers.iter_mut().flat_map(|r| r.take_errors()).collect();
         if !errors.is_empty() {
-            bail!(
-                "Export interrompu : lecture impossible d'une prise — {}. Les exports \
-                 précédents sont intacts.",
-                list(&errors)
-            );
+            bail!("Export interrompu · prise illisible : {}", list(&errors));
         }
         if !on_progress(pos as f64 / len as f64) {
             return Err(Cancelled.into());

@@ -212,10 +212,7 @@ fn fourcc(t: &[u8]) -> String {
 }
 
 fn too_big(kind: &[u8]) -> anyhow::Error {
-    anyhow!(
-        "fichier abîmé : le bloc « {} » annonce plus de données que le fichier n'en contient",
-        fourcc(kind)
-    )
+    anyhow!("fichier abîmé : bloc « {} » tronqué", fourcc(kind))
 }
 
 /// Contrôle du conteneur qui commence à `pos` (marqueur trouvé par la détection).
@@ -397,10 +394,7 @@ fn check_flac(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Result<()
         let size = u32::from_be_bytes([0, h[1], h[2], h[3]]) as u64;
         let body = at + 4;
         if size > len - body {
-            bail!(
-                "fichier abîmé : un bloc de métadonnées FLAC annonce plus de données que le \
-                 fichier n'en contient"
-            );
+            bail!("fichier abîmé : métadonnées FLAC tronquées");
         }
         // Commentaires (4) et image (6) : lus en entier (16 Mo au plus) pour être vérifiés.
         if kind == 4 || kind == 6 {

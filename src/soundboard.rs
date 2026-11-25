@@ -342,7 +342,7 @@ impl Board {
         let (mut b, newer) = Self::load_checked(&path)?;
         b.resolve_paths(dir);
         if newer {
-            b.protect("soundboard enregistré par une version plus récente de TracksPlus".into());
+            b.protect("soundboard d'une version plus récente".into());
         }
         Ok(b)
     }
@@ -417,7 +417,7 @@ impl Board {
     /// tant que le fichier en place est protégé (`guard`).
     pub fn save_session(&self, dir: &Path) -> Result<()> {
         if let Some(g) = &self.guard {
-            bail!("{} : le fichier n'est pas remplacé", g.reason);
+            bail!("{} · fichier protégé", g.reason);
         }
         let mut b = self.clone();
         for page in &mut b.pages {
@@ -473,9 +473,7 @@ impl Board {
             Ok(r) => r,
             Err(e) => {
                 if let Some(v) = crate::project::newer_format(&s) {
-                    bail!(
-                        "soundboard enregistré par une version plus récente de TracksPlus (format {v})"
-                    );
+                    bail!("soundboard d'une version plus récente (format {v})");
                 }
                 return Err(anyhow::Error::new(e).context("Fichier de soundboard invalide"));
             }
@@ -566,8 +564,7 @@ pub const MAX_PAD_BYTES: u64 = 3 << 30;
 /// reconnexion qui revient aussitôt à la fréquence d'avant ne redécode rien.
 const STASH_KEEP: std::time::Duration = std::time::Duration::from_secs(120);
 
-const MEMORY_FULL: &str =
-    "Mémoire réservée aux sons pleine : retirez des pads ou raccourcissez des sons";
+const MEMORY_FULL: &str = "Mémoire des sons pleine · retirez des pads";
 
 /// Mémoire occupée par un son décodé de `frames` trames (données et forme d'onde).
 fn sample_bytes(frames: u64) -> u64 {
@@ -1032,7 +1029,7 @@ fn build_sample(data: Vec<f32>, sample_rate: u32) -> Result<SampleData> {
     let mut peaks = Vec::new();
     peaks
         .try_reserve_exact(frames / SAMPLE_PEAK + 1)
-        .map_err(|_| anyhow!("mémoire insuffisante pour charger ce son"))?;
+        .map_err(|_| anyhow!("mémoire insuffisante"))?;
     for block in data.chunks(SAMPLE_PEAK * 2) {
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for &[l, r] in block.as_chunks::<2>().0 {
@@ -1085,7 +1082,7 @@ pub fn decode_stereo(
         && n / src_sr as u64 > MAX_SECONDS
     {
         return Err(anyhow!(
-            "son trop long ({} min) : 30 min maximum pour un pad",
+            "son trop long ({} min, max 30)",
             n / src_sr as u64 / 60
         ));
     }
@@ -1097,7 +1094,7 @@ pub fn decode_stereo(
     {
         return Err(anyhow!("son trop long à cette fréquence de session"));
     }
-    let oom = |_| anyhow!("mémoire insuffisante pour charger ce son");
+    let oom = |_| anyhow!("mémoire insuffisante");
     let mut data: Vec<f32> = Vec::new();
     // Réservation d'après l'en-tête, bornée par la taille réelle du fichier (au plus 64
     // trames par octet, bien au-delà de tout format réel) : un fichier de 100 octets qui
@@ -1113,7 +1110,7 @@ pub fn decode_stereo(
     }
     let mut sink = |block: &[f32]| -> Result<()> {
         if (data.len() + block.len()) as u64 / 2 > max_out {
-            return Err(anyhow!("son trop long : 30 min maximum pour un pad"));
+            return Err(anyhow!("son trop long (max 30 min)"));
         }
         if data.capacity() - data.len() < block.len() {
             // Croissance d'un quart au moins : peu de recopies, peu de place perdue.
@@ -1131,7 +1128,7 @@ pub fn decode_stereo(
             Ok(p) => p,
             Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(SymError::ResetRequired) => break,
-            Err(e) => return Err(anyhow!("lecture impossible ({e})")),
+            Err(e) => return Err(anyhow!("lecture impossible : {e}")),
         };
         if packet.track_id() != track_id {
             continue;
@@ -1139,7 +1136,7 @@ pub fn decode_stereo(
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(SymError::DecodeError(_)) => continue,
-            Err(e) => return Err(anyhow!("décodage impossible ({e})")),
+            Err(e) => return Err(anyhow!("décodage impossible : {e}")),
         };
         let spec = *decoded.spec();
         let ch = spec.channels.count().max(1);
@@ -1151,7 +1148,7 @@ pub fn decode_stereo(
         let kept = trim.apply(b.samples(), ch);
         read += (kept.len() / ch) as u64;
         if read > max_src {
-            return Err(anyhow!("son trop long : 30 min maximum pour un pad"));
+            return Err(anyhow!("son trop long (max 30 min)"));
         }
         // NaN / infini (fichier abîmé) : silence. Sans cela, un seul pad abîmé rendrait
         // tout le mixage de sortie NaN — donc muet — pendant qu'il joue.

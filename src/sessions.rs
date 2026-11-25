@@ -73,7 +73,7 @@ fn read_prefs<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, 
                 Ok(v) => return Ok(Some(v)),
                 Err(e) => {
                     last = PrefsError {
-                        msg: format!("{} illisible ({e})", path.display()),
+                        msg: format!("{} illisible : {e}", path.display()),
                         invalid: true,
                     }
                 }
@@ -81,7 +81,7 @@ fn read_prefs<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, 
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
                 last = PrefsError {
-                    msg: format!("lecture de {} impossible ({e})", path.display()),
+                    msg: format!("{} : {e}", path.display()),
                     invalid: false,
                 }
             }
@@ -153,13 +153,12 @@ fn set_aside_invalid(path: &Path, e: &PrefsError) -> Option<()> {
     match crate::project::set_aside(path, "illisible", true) {
         Ok(aside) => {
             let mut msg = format!(
-                "Réglages de l'accueil illisibles ({}) : sessions récentes et dossier des sons                  remis à zéro. L'ancien fichier est conservé sous « {} ».",
-                e.msg,
+                "Réglages de l'accueil remis à zéro · ancien : « {} »",
                 aside.file_name().unwrap_or_default().to_string_lossy()
             );
             // Ancien emplacement du réglage de la copie de sécurité : perdu avec ce fichier.
             if backup_prefs_path().is_some_and(|b| !b.is_file()) {
-                msg += " Si une copie de sécurité était réglée, choisissez de nouveau le second disque.";
+                msg += " · copie de sécurité à rechoisir";
             }
             if let Ok(mut n) = PREFS_NOTICE.lock() {
                 *n = Some(msg);
@@ -291,7 +290,7 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
                 .iter()
                 .any(|b| b.is_file())
             {
-                "Fichier illisible · ouvrir pour reprendre la version précédente".to_string()
+                "Fichier illisible · version précédente dispo".to_string()
             } else {
                 format!("Fichier illisible ({})", short_error(&e))
             };
@@ -323,7 +322,7 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
         summary += " · version plus récente (lecture seule)";
     }
     if interrupted {
-        summary = format!("Prise interrompue : ouvrir pour la récupérer · {summary}");
+        summary = format!("Prise interrompue · {summary}");
     }
     Some(SessionInfo {
         path: path.to_path_buf(),

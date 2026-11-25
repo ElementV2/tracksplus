@@ -60,7 +60,7 @@ fn copy_worker(src: PathBuf, dir: PathBuf, done: std::sync::mpsc::Sender<Result<
                         crate::soundboard::copy_into_session(&src, &dir)
                             .map_err(|e| format!("{e:#}"))
                     })
-                    .unwrap_or_else(|_| Err("copie interrompue (erreur interne)".into()));
+                    .unwrap_or_else(|_| Err("copie interrompue".into()));
                     let _ = done.send(r);
                 }
             });
@@ -677,10 +677,7 @@ impl App {
             if let Some(slot) = self.sb.learn_key {
                 if pressed && key == Key::Delete {
                     // Suppr est réservé à la suppression du pad sélectionné.
-                    self.notify(
-                        "Suppr sert à supprimer un pad : choisissez une autre touche",
-                        true,
-                    );
+                    self.notify("Suppr réservé · choisissez une autre touche", true);
                     continue;
                 }
                 if pressed {
@@ -787,11 +784,7 @@ impl App {
         // Fichier du soundboard protégé (illisible, ou d'une version plus récente) : rappel
         // permanent, on ne peut pas le manquer.
         if let Some(g) = &self.board.guard {
-            let text = format!(
-                "Soundboard protégé — {} : le fichier de la session est gardé tel quel. Si vous \
-                 modifiez le soundboard, il sera d'abord mis de côté sous un autre nom (importable).",
-                g.reason
-            );
+            let text = format!("Soundboard protégé : {} · original gardé", g.reason);
             egui::Panel::top("sb_guard")
                 .resizable(false)
                 .frame(
@@ -1760,10 +1753,7 @@ impl App {
             }
         }
         if !dropped.is_empty() && self.board.locked {
-            self.notify(
-                "Mode spectacle : déverrouillez le soundboard pour ajouter des sons",
-                true,
-            );
+            self.notify("Mode spectacle · déverrouillez d'abord", true);
         } else if !dropped.is_empty() && !blocked {
             let target = drop_slot.or_else(|| {
                 (0..cols * rows)
@@ -2011,8 +2001,7 @@ impl App {
                     ui.add_sized(
                         LEARN,
                         egui::Label::new(
-                            egui::RichText::new(format!("{} (case)", key.label()))
-                                .color(t::TEXT_2),
+                            egui::RichText::new(format!("{} (case)", key.label())).color(t::TEXT_2),
                         ),
                     );
                     ui.label("");
@@ -2033,10 +2022,7 @@ impl App {
                     self.sb.learn_midi = if learning { None } else { Some(slot) };
                     self.sb.learn_key = None;
                     if self.midi.connected.is_empty() && !learning {
-                        self.notify(
-                            "Choisissez d'abord un contrôleur MIDI dans Réglages (en haut à droite du soundboard)",
-                            true,
-                        );
+                        self.notify("Aucun contrôleur MIDI · voir Réglages", true);
                     }
                 }
                 if pad.midi.is_some()

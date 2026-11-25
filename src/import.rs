@@ -103,9 +103,7 @@ impl ImportJob {
                                         &|_| {},
                                     )
                                 }))
-                                .unwrap_or_else(|_| {
-                                    Err(anyhow!("fichier illisible (erreur du décodeur)"))
-                                })
+                                .unwrap_or_else(|_| Err(anyhow!("fichier illisible")))
                             });
                     out.push((src, r));
                 }
@@ -356,7 +354,7 @@ fn import_file_limited(
             Ok(p) => p,
             Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(SymError::ResetRequired) => break,
-            Err(e) => bail!("lecture impossible ({e})"),
+            Err(e) => bail!("lecture impossible : {e}"),
         };
         if packet.track_id() != track_id {
             continue;
@@ -365,7 +363,7 @@ fn import_file_limited(
             Ok(d) => d,
             // Paquet abîmé isolé (fréquent en MP3) : on continue.
             Err(SymError::DecodeError(_)) => continue,
-            Err(e) => bail!("décodage impossible ({e})"),
+            Err(e) => bail!("décodage impossible : {e}"),
         };
         let dspec = *decoded.spec();
         let ch = dspec.channels.count().max(1);
@@ -386,7 +384,7 @@ fn import_file_limited(
     conv.finish(&mut write)?;
     drop(write);
     if out.done.is_empty() && out.frames == 0 {
-        bail!("le fichier ne contient pas de son");
+        bail!("aucun son dans le fichier");
     }
     let segments = out.finish()?;
     let name = src
@@ -403,9 +401,9 @@ fn import_file_limited(
 fn write_err(e: hound::Error) -> anyhow::Error {
     match e {
         hound::Error::IoError(io) if io.kind() == std::io::ErrorKind::StorageFull => {
-            anyhow!("disque plein : libérez de la place puis recommencez")
+            anyhow!("disque plein")
         }
-        e => anyhow!("écriture dans le dossier Audio ({e})"),
+        e => anyhow!("écriture dans Audio : {e}"),
     }
 }
 

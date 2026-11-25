@@ -486,11 +486,11 @@ impl Project {
         let res = match rx.recv_timeout(SAVE_WAIT) {
             Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-                "disque trop lent : sauvegarde toujours en cours après {} s",
+                "disque lent : sauvegarde en cours depuis {} s",
                 SAVE_WAIT.as_secs()
             )),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(anyhow::anyhow!("sauvegarde interrompue (erreur interne)"))
+                Err(anyhow::anyhow!("sauvegarde interrompue"))
             }
         };
         if res.is_err() {
@@ -548,11 +548,7 @@ impl Project {
             return Some(why.clone());
         }
         if !self.owns_file && self.file_path().try_exists().unwrap_or(true) {
-            return Some(format!(
-                "un fichier de session « {} » existe déjà dans {} : il n'est pas remplacé",
-                self.name,
-                self.dir.display()
-            ));
+            return Some(format!("« {} » existe déjà ici", self.name));
         }
         None
     }
@@ -627,7 +623,7 @@ impl Project {
                 Err(TryLockError::Poisoned(e)) => break e.into_inner(),
                 Err(TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
-                        bail!("disque occupé : la sauvegarde précédente n'est pas terminée");
+                        bail!("disque occupé : sauvegarde précédente en cours");
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
@@ -658,7 +654,7 @@ impl Project {
             Err(e) => {
                 if let Some(v) = newer_format(json) {
                     bail!(
-                        "Session enregistrée par une version plus récente de TracksPlus (format {v}) : mettez l'application à jour pour l'ouvrir"
+                        "Session d'une version plus récente (format {v}) · mettez à jour TracksPlus"
                     );
                 }
                 return Err(anyhow::Error::new(e).context("Fichier de session invalide"));
@@ -673,12 +669,7 @@ impl Project {
         p.dirty = false;
         p.owns_file = true;
         if p.format_version > FORMAT_VERSION || unknown {
-            p.read_only = Some(
-                "session enregistrée par une version plus récente de TracksPlus : elle n'est pas \
-                 modifiée ici (mettez l'application à jour, ou utilisez « Enregistrer sous » pour \
-                 en faire une copie)"
-                    .into(),
-            );
+            p.read_only = Some("session d'une version plus récente".into());
         }
         Ok(p)
     }
@@ -708,7 +699,7 @@ impl Project {
         let Some(best) = newest_readable(path, candidates) else {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             return Err(err.context(format!(
-                "« {name} » illisible, et aucune version précédente lisible"
+                "« {name} » illisible, aucune version précédente lisible"
             )));
         };
         let Candidate {
@@ -717,12 +708,8 @@ impl Project {
             project: mut p,
         } = best;
         let from = from.display();
-        let read_only_msg = || {
-            format!(
-                "Fichier de session illisible : version précédente ouverte en lecture seule \
-                 ({from})"
-            )
-        };
+        let read_only_msg =
+            || format!("Session illisible · version précédente en lecture seule ({from})");
         if p.read_only.is_some() {
             // Version de secours d'un format plus récent : rien n'est touché sur le disque.
             return Ok((p, Some(read_only_msg())));
@@ -730,10 +717,7 @@ impl Project {
         let aside = match copy_aside(path, "illisible") {
             Ok(a) => a,
             Err(e) => {
-                p.read_only = Some(format!(
-                    "le fichier de session abîmé n'a pas pu être mis de côté ({e}) : utilisez \
-                     « Enregistrer sous »"
-                ));
+                p.read_only = Some(format!("fichier abîmé non mis de côté : {e}"));
                 return Ok((p, Some(read_only_msg())));
             }
         };
@@ -744,12 +728,10 @@ impl Project {
         // Fichier en place resté abîmé : la prochaine sauvegarde le remplacera.
         p.dirty = restored.is_err();
         let mut msg = format!(
-            "Fichier de session illisible : version précédente reprise ({from}). Le fichier \
-             abîmé est conservé sous « {aside} » ; les prises plus récentes restent dans le \
-             dossier Audio."
+            "Session illisible · version précédente reprise ({from}) · ancien fichier : « {aside} »"
         );
         if let Err(e) = restored {
-            msg += &format!(" Elle n'a pas encore pu être réécrite ({e:#}).");
+            msg += &format!(" · non réécrite : {e:#}");
         }
         Ok((p, Some(msg)))
     }
@@ -845,11 +827,7 @@ impl Project {
         next.name = new_name;
         let target = next.file_path();
         if target.exists() && target != self.file_path() {
-            bail!(
-                "Une session « {} » existe déjà dans ce dossier ({})",
-                next.name,
-                next.dir.display()
-            );
+            bail!("« {} » existe déjà dans ce dossier", next.name);
         }
         if target != self.file_path() {
             // Copie ailleurs : le fichier protégé (version plus récente) reste intact, la
