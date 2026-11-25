@@ -270,6 +270,36 @@ pub struct BackupJob {
     dir: PathBuf,
     journal: Option<recovery::Journal>,
     done: bool,
+    /// Soundboard de la session (copié avec ses sons, chemins vers la copie).
+    board: Board,
+}
+
+/// Soundboard dans le double de la session : les sons du dossier « Sons » de la session
+/// sont copiés (seulement les nouveaux ou modifiés) et les pads pointent vers la copie.
+fn backup_board(mut board: Board, from: &Path, to: &Path) {
+    let sounds = crate::soundboard::SOUNDS_DIR;
+    let (src, dst) = (from.join(sounds), to.join(sounds));
+    if let Ok(rd) = std::fs::read_dir(&src) {
+        let _ = std::fs::create_dir_all(&dst);
+        for e in rd.flatten() {
+            let (a, b) = (e.path(), dst.join(e.file_name()));
+            let same = match (std::fs::metadata(&a), std::fs::metadata(&b)) {
+                (Ok(ma), Ok(mb)) => ma.len() == mb.len(),
+                _ => false,
+            };
+            if a.is_file() && !same {
+                let _ = project::copy_synced(&a, &b);
+            }
+        }
+    }
+    for page in &mut board.pages {
+        for pad in page.pads.iter_mut().flatten() {
+            if let Ok(rel) = pad.path.strip_prefix(from) {
+                pad.path = to.join(rel);
+            }
+        }
+    }
+    let _ = board.save_session(to);
 }
 
 /// Mesure de la place libre : disque de la session, et second disque de la copie de
@@ -1578,8 +1608,9 @@ impl App {
                 .name("tracksplus-backup-session".into())
                 .spawn(move || {
                     for mut job in rx {
-                        job.project.dir = job.dir.clone();
+                        let from = std::mem::replace(&mut job.project.dir, job.dir.clone());
                         let saved = job.project.save().is_ok();
+                        backup_board(job.board, &from, &job.dir);
                         if let Some(j) = &job.journal {
                             let _ = recovery::write_journal(&job.dir, j);
                         } else if job.done && saved {
@@ -1596,6 +1627,7 @@ impl App {
             dir,
             journal,
             done,
+            board: self.board.clone(),
         });
     }
 
@@ -5148,6 +5180,31 @@ pub fn open_in_file_manager(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Copie de sécurité : sons du soundboard copiés, pads pointant vers la copie (qui
+    /// marche donc sans le disque principal) ; un son hors de la session garde son chemin.
+    #[test]
+    fn backup_board_copies_sounds() {
+        use crate::soundboard::{Board, Pad, SOUNDS_DIR};
+        let base = std::env::temp_dir().join(format!("tp-bboard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (from, to) = (base.join("main/S"), base.join("copie/S (1)"));
+        std::fs::create_dir_all(from.join(SOUNDS_DIR)).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join(SOUNDS_DIR).join("a.wav"), b"son").unwrap();
+        let mut b = Board::default();
+        b.set(0, Some(Pad::new(from.join(SOUNDS_DIR).join("a.wav"), 0)));
+        b.set(1, Some(Pad::new(base.join("ailleurs.wav"), 1)));
+        super::backup_board(b, &from, &to);
+        assert_eq!(
+            std::fs::read(to.join(SOUNDS_DIR).join("a.wav")).unwrap(),
+            b"son"
+        );
+        let back = Board::load_session(&to).unwrap();
+        assert_eq!(back.pad(0).unwrap().path, to.join(SOUNDS_DIR).join("a.wav"));
+        assert_eq!(back.pad(1).unwrap().path, base.join("ailleurs.wav"));
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn same_volume_detects_same_disk() {
         let t = std::env::temp_dir();
