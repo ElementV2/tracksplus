@@ -24,6 +24,8 @@ $asioUrl = 'https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-
 $asioZipSha256 = 'D5EBF0C20DD2C5F43771FD0C1418F4B361BF52434EE670097CFA6B3A335E2ECA'
 # Empreinte des sources (.cpp, .h, .c : chemin relatif et SHA-256, triés), voir Get-SdkTreeHash.
 $asioTreeSha256 = 'A766723D8D7D78BCD85A9F7F0F8ED5FF62A35620D1A58FBDB6864FF335AAE6A6'
+# Même SDK pris dans le miroir de build-windows.sh (commit épinglé, fins de ligne du dépôt).
+$asioMirrorTreeSha256 = '7D50CEAD9BC096C64253F33D60C3FC6C33531928724187E31B755E086F4BB090'
 
 function Get-SdkTreeHash($dir) {
     $base = (Resolve-Path $dir).Path.TrimEnd('\') + '\'
@@ -55,11 +57,15 @@ if (-not (Test-Path (Join-Path $sdk 'host\asiodrivers.h'))) {
     Move-Item $header.Directory.Parent.FullName $sdk
     Remove-Item -Recurse -Force $tmp
 }
-# Vérifié à chaque compilation, même avec un SDK déjà présent (copie locale modifiée).
+# Vérifié à chaque compilation, même avec un SDK déjà présent (copie locale modifiée) ou
+# donné par CPAL_ASIO_DIR. Une autre version ne passe que si TRACKSPLUS_ACCEPT_ASIO_SDK
+# donne son empreinte exacte.
 $tree = Get-SdkTreeHash $sdk
-if ($tree -ne $asioTreeSha256) {
-    if ($env:CPAL_ASIO_DIR) {
-        Write-Warning "Sources du SDK ASIO de CPAL_ASIO_DIR différentes de la version épinglée ($tree)"
+if ($tree -ne $asioTreeSha256 -and $tree -ne $asioMirrorTreeSha256) {
+    if ($env:TRACKSPLUS_ACCEPT_ASIO_SDK -eq $tree) {
+        Write-Warning "SDK ASIO non épinglé accepté ($tree)"
+    } elseif ($env:CPAL_ASIO_DIR) {
+        throw "Sources du SDK ASIO de CPAL_ASIO_DIR différentes de la version épinglée ($tree) : posez TRACKSPLUS_ACCEPT_ASIO_SDK=$tree pour les accepter"
     } else {
         throw "Sources du SDK ASIO modifiées ($tree au lieu de $asioTreeSha256) : supprimez target\asio-sdk pour le retélécharger"
     }

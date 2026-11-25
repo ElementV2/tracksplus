@@ -502,6 +502,26 @@ impl Budget {
                 Some(cur.saturating_sub(bytes))
             });
     }
+
+    /// Passe une réservation de `from` à `to` octets : réduite toujours, agrandie
+    /// seulement s'il y a la place (sinon elle reste de `from`).
+    fn resize(&self, from: u64, to: u64) -> bool {
+        if to <= from {
+            self.release(from - to);
+            true
+        } else {
+            self.try_acquire(to - from)
+        }
+    }
+
+    /// Place encore libre.
+    fn available(&self) -> u64 {
+        let used = self
+            .committed
+            .load(Ordering::Relaxed)
+            .saturating_add(self.inflight.load(Ordering::Relaxed));
+        self.limit.saturating_sub(used)
+    }
 }
 
 /// Demande de décodage : chemin, fréquence cible, génération, fenêtre à rafraîchir.
@@ -537,6 +557,9 @@ pub struct SampleCache {
     parked: HashSet<PathBuf>,
     /// Sons à la fréquence précédente (voir `STASH_KEEP`).
     stash: Option<(u32, HashMap<PathBuf, Arc<SampleData>>, std::time::Instant)>,
+    /// Dernière génération demandée quand ces sons ont été libérés : un refus « mémoire
+    /// pleine » d'une demande antérieure a pu être décidé alors qu'ils comptaient encore.
+    stash_dropped_gen: u64,
     /// Nombre d'entrées lors du dernier décompte de la mémoire.
     counted_len: usize,
     scratch: Vec<usize>,
@@ -560,6 +583,7 @@ impl SampleCache {
             budget: Arc::new(Budget::new(limit)),
             parked: HashSet::new(),
             stash: None,
+            stash_dropped_gen: 0,
             counted_len: 0,
             scratch: Vec::new(),
         }
@@ -762,9 +786,12 @@ impl SampleCache {
             }
             any = true;
             // Mémoire pleine alors que des sons à l'ancienne fréquence sont gardés de
-            // côté : ils passent après les sons utiles.
-            if d.full && self.stash.is_some() {
-                self.stash = None;
+            // côté : ils passent après les sons utiles. Tout refus d'une demande faite
+            // avant leur libération est relancé (dans ce lot ou un suivant), pas seulement
+            // le premier : la place a pu manquer à cause d'eux. Une demande relancée a une
+            // génération plus récente : un nouveau refus est alors définitif.
+            if d.full && (self.stash.is_some() || d.generation <= self.stash_dropped_gen) {
+                self.drop_stash();
                 self.map.remove(&d.path);
                 retry.push(d.path);
                 continue;
@@ -791,12 +818,19 @@ impl SampleCache {
             .as_ref()
             .is_some_and(|(_, _, at)| at.elapsed() > STASH_KEEP)
         {
-            self.stash = None;
+            self.drop_stash();
             self.recount();
         } else if self.map.len() != self.counted_len {
             self.recount();
         }
         any
+    }
+
+    /// Libère les sons à l'ancienne fréquence (le décompte suit, par l'appelant).
+    fn drop_stash(&mut self) {
+        if self.stash.take().is_some() {
+            self.stash_dropped_gen = self.next_gen;
+        }
     }
 
     pub fn get(&self, path: &Path) -> Option<&Arc<SampleData>> {
@@ -817,8 +851,9 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Décode un son pour un pad : dans un processus fils quand c'est possible (un fichier
-/// piégé n'arrête que lui), sinon ici. La mémoire réservée aux sons est vérifiée avant
-/// d'allouer le son. Rend (résultat, mémoire réservée, refus faute de place).
+/// piégé n'arrête que lui), sinon ici. La mémoire réservée aux sons est vérifiée dès que
+/// la taille du son est connue (en-tête), avant de le décoder, puis ajustée à sa taille
+/// réelle avant de l'allouer ici. Rend (résultat, mémoire réservée, refus faute de place).
 fn decode_job(path: &Path, sr: u32, budget: &Budget) -> (Result<SampleData, String>, u64, bool) {
     let reserved = std::cell::Cell::new(0u64);
     let full = std::cell::Cell::new(false);
@@ -827,18 +862,21 @@ fn decode_job(path: &Path, sr: u32, budget: &Budget) -> (Result<SampleData, Stri
             return Err("son trop long à cette fréquence de session".into());
         }
         let b = sample_bytes(frames);
-        if !budget.try_acquire(b) {
+        if !budget.resize(reserved.get(), b) {
             full.set(true);
             return Err(MEMORY_FULL.into());
         }
         reserved.set(b);
         Ok(())
     };
-    // Mémoire du processus fils : le son décodé et sa marge de croissance.
-    let need = MAX_PAD_BYTES + MAX_PAD_BYTES / 4 + (512 << 20);
+    // Mémoire du processus fils : le son décodé et sa marge de croissance, sans dépasser
+    // ce que la mémoire réservée aux sons peut encore accueillir (un son plus gros y serait
+    // refusé de toute façon), plus le décodeur lui-même.
+    let room = budget.available().saturating_mul(13) / 10;
+    let need = (MAX_PAD_BYTES + MAX_PAD_BYTES / 4).min(room) + (512 << 20);
     let r = match crate::isolate::decode_pad(path, sr, need, &accept) {
         Some(r) => r.and_then(|data| build_sample(data, sr).map_err(|e| format!("{e:#}"))),
-        None => decode_guarded(path, sr).and_then(|s| accept(s.frames as u64).map(|_| s)),
+        None => decode_guarded(path, sr, &accept).and_then(|s| accept(s.frames as u64).map(|_| s)),
     };
     if r.is_err() && reserved.get() > 0 {
         budget.release(reserved.get());
@@ -849,17 +887,28 @@ fn decode_job(path: &Path, sr: u32, budget: &Budget) -> (Result<SampleData, Stri
 
 /// Décodage protégé : un décodeur qui plante sur un fichier abîmé donne une erreur
 /// (le pad l'affiche) au lieu de laisser le pad « en chargement » pour toujours.
-fn decode_guarded(path: &Path, sr: u32) -> Result<SampleData, String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_sample(path, sr))) {
+/// `accept` reçoit la taille annoncée par l'en-tête (voir `decode_stereo`).
+fn decode_guarded(
+    path: &Path,
+    sr: u32,
+    accept: &dyn Fn(u64) -> Result<(), String>,
+) -> Result<SampleData, String> {
+    let announce = |frames: u64| accept(frames).map_err(|e| anyhow!(e));
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let data = decode_stereo(path, sr, &|_| {}, &announce)?;
+        build_sample(shrink(data), sr)
+    })) {
         Ok(r) => r.map_err(|e| format!("{e:#}")),
         Err(_) => Err("fichier illisible".into()),
     }
 }
 
-/// Décode un fichier audio en stéréo f32 à la fréquence `target_sr`.
+/// Décode un fichier audio en stéréo f32 à la fréquence `target_sr`, ici et sans mémoire
+/// réservée (tests ; l'application passe par `decode_job`).
+#[cfg(test)]
 pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
-    let data = decode_stereo(path, target_sr, &|_| {})?;
-    build_sample(data, target_sr)
+    let data = decode_stereo(path, target_sr, &|_| {}, &|_| Ok(()))?;
+    build_sample(shrink(data), target_sr)
 }
 
 /// Son prêt à jouer : données stéréo entrelacées et forme d'onde.
@@ -894,8 +943,15 @@ fn build_sample(data: Vec<f32>, sample_rate: u32) -> Result<SampleData> {
 /// décodage : jamais l'original et la version convertie en mémoire en même temps). Toutes
 /// les réservations sont faillibles et bornées : un manque de mémoire ou un en-tête
 /// fantaisiste devient une erreur affichée sur le pad, jamais un arrêt de l'application.
-/// `tick(f)` reçoit l'avancement (0 à 1, quand la longueur est connue).
-pub fn decode_stereo(path: &Path, target_sr: u32, tick: &dyn Fn(f64)) -> Result<Vec<f32>> {
+/// `tick(f)` reçoit l'avancement (0 à 1, quand la longueur est connue). `announce(trames)`
+/// reçoit la taille attendue (si l'en-tête la donne) avant toute réservation ; son refus
+/// arrête le décodage.
+pub fn decode_stereo(
+    path: &Path,
+    target_sr: u32,
+    tick: &dyn Fn(f64),
+    announce: &dyn Fn(u64) -> Result<()>,
+) -> Result<Vec<f32>> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::errors::Error as SymError;
 
@@ -936,7 +992,11 @@ pub fn decode_stereo(path: &Path, target_sr: u32, tick: &dyn Fn(f64)) -> Result<
     // annonce des heures ne fait rien réserver. Le reste grandit au besoin.
     if let Some(n) = n_frames {
         let n = n.min(max_src).min(file_len.saturating_mul(64));
-        let want = conv.output_frames(n).min(max_out) + crate::decode::CHUNK as u64;
+        let frames = conv.output_frames(n).min(max_out);
+        // Taille annoncée avant toute réservation : la mémoire réservée aux sons peut
+        // refuser le son tout de suite, sans le décoder en entier.
+        announce(frames)?;
+        let want = frames + crate::decode::CHUNK as u64;
         data.try_reserve_exact(want as usize * 2).map_err(oom)?;
     }
     let mut sink = |block: &[f32]| -> Result<()> {
@@ -1004,16 +1064,21 @@ pub fn decode_stereo(path: &Path, target_sr: u32, tick: &dyn Fn(f64)) -> Result<
     if data.is_empty() {
         return Err(anyhow!("fichier vide"));
     }
-    // Le son reste en mémoire tout le spectacle : une place perdue notable est rendue (par
-    // une copie faillible ; sans mémoire pour la faire, le son reste tel quel).
+    Ok(data)
+}
+
+/// Le son reste en mémoire tout le spectacle : une place perdue notable est rendue (par
+/// une copie faillible ; sans mémoire pour la faire, le son reste tel quel). Inutile dans
+/// le processus fils : l'application reçoit le son dans une place exacte.
+fn shrink(data: Vec<f32>) -> Vec<f32> {
     if data.capacity() - data.len() > data.len() / 16 + (1 << 16) {
         let mut exact: Vec<f32> = Vec::new();
         if exact.try_reserve_exact(data.len()).is_ok() {
             exact.extend_from_slice(&data);
-            data = exact;
+            return exact;
         }
     }
-    Ok(data)
+    data
 }
 
 /// Chemin sur un partage réseau ou un périphérique (pas un simple fichier local) :
@@ -1487,6 +1552,76 @@ mod tests {
         assert!(c.get(&b).is_some());
         assert_eq!(c.budget.inflight.load(Ordering::Relaxed), 0);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Plusieurs sons refusés faute de place pendant que des sons à l'ancienne fréquence
+    /// sont gardés de côté : tous sont relancés une fois la place rendue (ceux du même lot
+    /// comme ceux qui arrivent ensuite), pas seulement le premier.
+    #[test]
+    fn memory_full_with_stash_retries_every_refusal() {
+        let dir = std::env::temp_dir().join(format!("tp-stash-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<PathBuf> = (0..3).map(|i| dir.join(format!("{i}.wav"))).collect();
+        for p in &paths {
+            write_tone(p, 48000, 4800);
+        }
+        let mut c = SampleCache::with_budget(48000, 4_000_000);
+        let old = SampleData {
+            sample_rate: 44100,
+            frames: 200_000,
+            data: vec![0.0; 400_000],
+            peaks: Vec::new(),
+        };
+        let old_map = HashMap::from([(dir.join("ancien.wav"), Arc::new(old))]);
+        c.stash = Some((44100, old_map, std::time::Instant::now()));
+        c.recount();
+        // Refus décidés par les threads de décodage pendant que ces sons comptaient.
+        let refuse = |c: &mut SampleCache, p: &PathBuf, generation: u64| {
+            c.tx.send(Decoded {
+                path: p.clone(),
+                generation,
+                result: Err(MEMORY_FULL.into()),
+                reserved: 0,
+                full: true,
+            })
+            .unwrap();
+        };
+        let mut gens = Vec::new();
+        for p in &paths {
+            c.map.insert(p.clone(), LoadState::Loading);
+            c.next_gen += 1;
+            c.pending.lock().insert(p.clone(), c.next_gen);
+            gens.push(c.next_gen);
+        }
+        // Deux refus dans le même lot…
+        refuse(&mut c, &paths[0], gens[0]);
+        refuse(&mut c, &paths[1], gens[1]);
+        c.poll();
+        assert!(c.stash.is_none());
+        // … et un troisième qui arrive après la libération.
+        refuse(&mut c, &paths[2], gens[2]);
+        wait_loaded(&mut c);
+        for p in &paths {
+            assert!(c.get(p).is_some(), "{} resté refusé", p.display());
+        }
+        assert_eq!(c.budget.inflight.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Réservation faite sur la taille annoncée, puis ajustée à la taille réelle :
+    /// réduite toujours, agrandie seulement s'il reste de la place.
+    #[test]
+    fn budget_reservation_is_resized() {
+        let b = Budget::new(1000);
+        assert!(b.resize(0, 400));
+        assert!(b.resize(400, 900));
+        assert!(!b.resize(900, 1100));
+        assert_eq!(b.inflight.load(Ordering::Relaxed), 900);
+        assert!(b.resize(900, 100));
+        assert_eq!(b.available(), 900);
+        b.committed.store(950, Ordering::Relaxed);
+        assert_eq!(b.available(), 0);
     }
 
     /// Reconnexion qui revient à la fréquence d'avant : sons repris sans redécodage.

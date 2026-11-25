@@ -3,8 +3,10 @@
 //! Un fichier abîmé ou fabriqué ne doit jamais faire tomber l'application. Une demande
 //! d'allocation géante lue dans un en-tête n'est pas une panique : elle arrête le processus
 //! d'un coup (`catch_unwind` n'y peut rien). D'où, avant de confier le fichier à symphonia :
-//! - la structure du conteneur est contrôlée (CAF, MP4/M4A, WAV, AIFF, étiquette ID3v2) :
-//!   aucun bloc ni aucune table ne peut annoncer plus de données que le fichier n'en a ;
+//! - la structure du conteneur est contrôlée (CAF, MP4/M4A, WAV, AIFF, FLAC), en suivant
+//!   le même parcours que symphonia : aucun bloc ni aucune table ne peut annoncer plus de
+//!   données que le fichier n'en a ;
+//! - une étiquette ID3v2 devant les données est sautée sans être lue ;
 //! - la fréquence est bornée avant de créer un rééchantillonneur, dont la taille des
 //!   tampons est elle-même vérifiée ;
 //! - le délai d'encodeur et le bourrage de fin (MP3, Ogg, AAC/M4A) sont retirés : un pad
@@ -21,7 +23,6 @@ use std::path::Path;
 use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, Decoder, DecoderOptions};
 use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::{MediaSourceStream, ReadBytes};
-use symphonia::core::meta::{MetadataLog, MetadataOptions};
 use symphonia::core::probe::Instantiate;
 
 /// Fréquences d'échantillonnage acceptées pour un fichier source. Au-delà, l'en-tête est
@@ -71,7 +72,6 @@ pub fn open(path: &Path) -> Result<Opened> {
         enable_gapless: true,
         ..Default::default()
     };
-    let mut probed_meta = MetadataLog::default();
     // Même parcours que `Probe::format`, avec le contrôle du conteneur juste avant que
     // son lecteur ne lise quoi que ce soit.
     let mut format = loop {
@@ -84,14 +84,13 @@ pub fn open(path: &Path) -> Result<Opened> {
                 check_container(&mut check, mss.pos(), file_len)?;
                 break make(mss, &opts).map_err(|e| anyhow!("format non reconnu ({e})"))?;
             }
-            Instantiate::Metadata(make) => {
-                check_id3v2(&mut check, mss.pos(), file_len)?;
-                let mut reader = make(&MetadataOptions::default());
-                probed_meta.push(
-                    reader
-                        .read_all(&mut mss)
-                        .map_err(|e| anyhow!("étiquette illisible ({e})"))?,
-                );
+            Instantiate::Metadata(_) => {
+                // Étiquette ID3v2 devant les données (seul lecteur d'étiquette de la
+                // détection) : sautée sans être lue. Rien n'en est utilisé, et ses trames
+                // annoncent des tailles que symphonia réserverait avant de les lire.
+                let skip = id3v2_len(&mut check, mss.pos(), file_len)?;
+                mss.ignore_bytes(skip)
+                    .map_err(|_| anyhow!("fichier abîmé (étiquette ID3 tronquée)"))?;
                 // Garde-fou : la recherche avance forcément.
                 if mss.pos() <= at {
                     bail!("format non reconnu");
@@ -227,6 +226,7 @@ fn check_container(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Resu
     let h = read_at::<16>(r, pos)?;
     match &h[..4] {
         b"caff" => check_caf(r, pos, len),
+        b"fLaC" => check_flac(r, pos, len),
         // Marqueur MP4 : « ftyp », 4 octets après le début du premier bloc.
         b"ftyp" => check_mp4(r, pos.saturating_sub(4), len),
         b"RIFF" => check_iff(r, pos, len, false),
@@ -235,43 +235,240 @@ fn check_container(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Resu
     }
 }
 
-/// CAF : blocs (type, taille i64). La table des paquets (« pakt ») ne peut pas annoncer
-/// plus de paquets que d'octets (au moins un octet par paquet).
+/// Blocs CAF parcourus au plus (chaque bloc fait au moins 12 octets).
+const MAX_CAF_CHUNKS: u32 = 1_000_000;
+
+/// CAF : même parcours des blocs que symphonia (`CafReader::read_chunks`), qui lit jusqu'à
+/// la fin du fichier, y compris après le bloc « data » : des données de taille connue sont
+/// sautées, des données de taille -1 (« jusqu'à la fin ») sont relues comme des en-têtes
+/// de blocs. Chaque table des paquets (« pakt ») et chaque cookie (« kuki ») rencontré
+/// est contrôlé avant que symphonia n'en réserve la taille annoncée.
 fn check_caf(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Result<()> {
+    // « caff », version, options.
     let mut at = pos + 8;
-    for _ in 0..100_000 {
-        if at + 12 > len {
+    // (octets par paquet, trames par paquet) de la description audio.
+    let mut desc: Option<(u32, u32)> = None;
+    for _ in 0..MAX_CAF_CHUNKS {
+        // Fin du fichier (symphonia s'arrête là), en-tête incomplet, ou position au-delà
+        // de la fin après un saut : symphonia échoue en lisant, sans rien réserver.
+        if at.saturating_add(12) > len {
             return Ok(());
         }
         let h = read_at::<12>(r, at)?;
-        let kind = &h[..4];
+        let kind: [u8; 4] = h[..4].try_into().unwrap();
         let size = i64::from_be_bytes(h[4..12].try_into().unwrap());
-        let avail = len - (at + 12);
-        if kind == b"data" {
-            // Données audio (taille -1 = jusqu'à la fin) : rien d'autre n'est lu avant.
-            return Ok(());
-        }
-        if size < 0 || size as u64 > avail {
-            return Err(too_big(kind));
-        }
-        if kind == b"pakt" {
-            if size < 24 {
-                bail!("fichier abîmé : table des paquets trop courte");
+        let body = at + 12;
+        let avail = len - body;
+        let next = match &kind {
+            b"desc" => {
+                if size != 32 || desc.is_some() {
+                    bail!("fichier abîmé : description audio invalide");
+                }
+                let d = read_at::<32>(r, body)?;
+                desc = Some((
+                    u32::from_be_bytes(d[16..20].try_into().unwrap()),
+                    u32::from_be_bytes(d[20..24].try_into().unwrap()),
+                ));
+                body + 32
             }
-            let t = read_at::<16>(r, at + 12)?;
-            let packets = i64::from_be_bytes(t[..8].try_into().unwrap());
-            let frames = i64::from_be_bytes(t[8..].try_into().unwrap());
-            if packets < 0
-                || frames < 0
-                || packets as u64 > (size as u64 - 24)
-                || packets as u64 > MAX_CAF_PACKETS
-            {
-                bail!("fichier abîmé : table des paquets invraisemblable");
+            b"data" => match size {
+                // Taille inconnue : symphonia lit le compteur d'éditions, puis prend les
+                // octets audio qui suivent pour le bloc suivant.
+                -1 => body + 4,
+                s if s < 4 => bail!("fichier abîmé : bloc « data » de taille invalide"),
+                // Données sautées (au-delà de la fin : la lecture suivante échoue).
+                s => body.saturating_add(s as u64),
+            },
+            b"chan" => {
+                if size < 12 {
+                    bail!("fichier abîmé : bloc « chan » de taille invalide");
+                }
+                if avail < 12 {
+                    return Ok(());
+                }
+                // Symphonia lit les descriptions de canaux annoncées (20 octets chacune),
+                // quelle que soit la taille du bloc.
+                let c = read_at::<12>(r, body)?;
+                let count = u32::from_be_bytes(c[8..12].try_into().unwrap()) as u64;
+                body + 12 + 20 * count
             }
+            b"pakt" => {
+                let Some((bpp, fpp)) = desc else {
+                    bail!("fichier abîmé : description audio manquante");
+                };
+                check_pakt(r, body, size, len, bpp, fpp)?
+            }
+            // Cookie : lu d'un bloc, sa taille réservée avant la lecture.
+            b"kuki" => {
+                if size < 0 || size as u64 > avail {
+                    return Err(too_big(&kind));
+                }
+                body + size as u64
+            }
+            // « free » et blocs inconnus : sautés.
+            _ => {
+                if size < 0 {
+                    return Err(too_big(&kind));
+                }
+                body.saturating_add(size as u64)
+            }
+        };
+        // Le premier bloc doit être la description audio (sinon symphonia s'arrête).
+        if desc.is_none() {
+            bail!("fichier abîmé : description audio manquante");
         }
-        at += 12 + size as u64;
+        at = next;
     }
     bail!("fichier abîmé : trop de blocs")
+}
+
+/// Table des paquets d'un CAF : symphonia réserve `paquets` entrées, puis lit les entrées
+/// (entiers de longueur variable, 1 à 9 octets) sans tenir compte de la taille du bloc.
+/// Renvoie la position où il reprend la lecture des blocs.
+fn check_pakt(
+    r: &mut BufReader<std::fs::File>,
+    body: u64,
+    size: i64,
+    len: u64,
+    bpp: u32,
+    fpp: u32,
+) -> Result<u64> {
+    if size < 24 {
+        bail!("fichier abîmé : table des paquets trop courte");
+    }
+    let t = read_at::<16>(r, body)?;
+    let packets = i64::from_be_bytes(t[..8].try_into().unwrap());
+    let frames = i64::from_be_bytes(t[8..].try_into().unwrap());
+    if packets < 0 || frames < 0 {
+        bail!("fichier abîmé : table des paquets invraisemblable");
+    }
+    let packets = packets as u64;
+    // Entiers lus par paquet : taille et durée variables, l'une des deux, ou aucune
+    // (débit constant : symphonia refuse alors toute table non vide, après l'avoir
+    // réservée).
+    let per = match (bpp, fpp) {
+        (0, 0) => 2,
+        (0, _) | (_, 0) => 1,
+        _ => 0,
+    };
+    let start = body + 24;
+    // Au moins un octet par entier : la table ne peut pas annoncer plus d'entrées que le
+    // fichier n'a d'octets après elle.
+    if packets > MAX_CAF_PACKETS
+        || (per == 0 && packets > 0)
+        || packets * per > len.saturating_sub(start)
+    {
+        bail!("fichier abîmé : table des paquets invraisemblable");
+    }
+    r.seek(SeekFrom::Start(start))?;
+    let mut end = start;
+    let mut b = [0u8; 1];
+    for _ in 0..packets * per {
+        let mut terminated = false;
+        for _ in 0..9 {
+            r.read_exact(&mut b)
+                .map_err(|_| anyhow!("fichier abîmé : table des paquets tronquée"))?;
+            end += 1;
+            if b[0] & 0x80 == 0 {
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            bail!("fichier abîmé : table des paquets invalide");
+        }
+    }
+    Ok(end)
+}
+
+/// FLAC natif : blocs de métadonnées jusqu'au dernier, comme symphonia. Il réserve la
+/// taille lue dans une image (type MIME, description, données) ou dans un commentaire
+/// avant de la lire : aucune ne peut dépasser son bloc (16 Mo au plus).
+fn check_flac(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Result<()> {
+    // « fLaC », puis des blocs d'au moins 4 octets : la boucle finit d'elle-même.
+    let mut at = pos + 4;
+    loop {
+        if at + 4 > len {
+            return Ok(());
+        }
+        let h = read_at::<4>(r, at)?;
+        let last = h[0] & 0x80 != 0;
+        let kind = h[0] & 0x7f;
+        let size = u32::from_be_bytes([0, h[1], h[2], h[3]]) as u64;
+        let body = at + 4;
+        if size > len - body {
+            bail!(
+                "fichier abîmé : un bloc de métadonnées FLAC annonce plus de données que le \
+                 fichier n'en contient"
+            );
+        }
+        // Commentaires (4) et image (6) : lus en entier (16 Mo au plus) pour être vérifiés.
+        if kind == 4 || kind == 6 {
+            let mut b = vec![0u8; size as usize];
+            r.seek(SeekFrom::Start(body))?;
+            r.read_exact(&mut b)
+                .map_err(|_| anyhow!("fichier abîmé (en-tête tronqué)"))?;
+            if kind == 4 {
+                check_vorbis_comment(&b)?;
+            } else {
+                check_flac_picture(&b)?;
+            }
+        }
+        if last {
+            return Ok(());
+        }
+        at = body + size;
+    }
+}
+
+/// Lecture des champs d'un bloc de métadonnées déjà en mémoire.
+struct Fields<'a>(&'a [u8]);
+
+impl Fields<'_> {
+    fn skip(&mut self, n: usize) -> Result<&[u8]> {
+        if n > self.0.len() {
+            bail!("fichier abîmé : un champ de métadonnées dépasse son bloc");
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+
+    fn u32_le(&mut self) -> Result<usize> {
+        Ok(u32::from_le_bytes(self.skip(4)?.try_into().unwrap()) as usize)
+    }
+
+    fn u32_be(&mut self) -> Result<usize> {
+        Ok(u32::from_be_bytes(self.skip(4)?.try_into().unwrap()) as usize)
+    }
+}
+
+/// Commentaires Vorbis (sans bit de fin) : fournisseur, puis chaque commentaire.
+fn check_vorbis_comment(b: &[u8]) -> Result<()> {
+    let mut f = Fields(b);
+    let vendor = f.u32_le()?;
+    f.skip(vendor)?;
+    let n = f.u32_le()?;
+    // Chaque commentaire coûte au moins 4 octets : boucle bornée par la taille du bloc.
+    for _ in 0..n {
+        let l = f.u32_le()?;
+        f.skip(l)?;
+    }
+    Ok(())
+}
+
+/// Image FLAC : type, type MIME, description, dimensions et couleurs, données.
+fn check_flac_picture(b: &[u8]) -> Result<()> {
+    let mut f = Fields(b);
+    f.skip(4)?;
+    let mime = f.u32_be()?;
+    f.skip(mime)?;
+    let desc = f.u32_be()?;
+    f.skip(desc)?;
+    f.skip(16)?;
+    let data = f.u32_be()?;
+    f.skip(data)?;
+    Ok(())
 }
 
 /// WAV (RIFF, petit-boutiste) et AIFF (FORM, gros-boutiste) : aucun bloc lu avant les
@@ -430,61 +627,25 @@ fn table(
     Ok(())
 }
 
-/// Étiquette ID3v2 (avant un MP3, parfois un WAV) : aucune trame ne dépasse l'étiquette,
-/// qui ne dépasse pas le fichier.
-fn check_id3v2(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Result<()> {
+/// Longueur de l'étiquette ID3v2 qui commence à `pos` (en-tête compris) : là où symphonia
+/// reprend la recherche du format après l'avoir lue. Son pied de page éventuel (« 3DI »)
+/// n'est pas compté, comme chez lui : la recherche du marqueur suivant le passe.
+fn id3v2_len(r: &mut BufReader<std::fs::File>, pos: u64, len: u64) -> Result<u64> {
     if pos + 10 > len {
-        return Ok(());
+        bail!("fichier abîmé (étiquette ID3 tronquée)");
     }
     let h = read_at::<10>(r, pos)?;
     if &h[..3] != b"ID3" {
-        return Ok(());
+        bail!("format non reconnu");
     }
-    let (major, flags) = (h[3], h[5]);
-    let syncsafe = |b: &[u8]| {
-        b.iter()
-            .fold(0u64, |acc, &x| (acc << 7) | (x as u64 & 0x7f))
-    };
-    let tag_end = pos + 10 + syncsafe(&h[6..10]);
-    if tag_end > len {
+    // Taille « syncsafe » : 7 bits par octet, 28 bits en tout (256 Mo au plus).
+    let size = h[6..10]
+        .iter()
+        .fold(0u64, |acc, &x| (acc << 7) | (x as u64 & 0x7f));
+    if pos + 10 + size > len {
         bail!("fichier abîmé : étiquette ID3 plus grande que le fichier");
     }
-    // ID3v2.2 : tailles sur 3 octets (16 Mo au plus). Désynchronisation de toute
-    // l'étiquette : les tailles brutes ne sont pas lisibles telles quelles.
-    if !(3..=4).contains(&major) || flags & 0x80 != 0 {
-        return Ok(());
-    }
-    let mut at = pos + 10;
-    if flags & 0x40 != 0 {
-        // En-tête étendu : sa taille (v2.4 : comprise, v2.3 : sans les 4 octets).
-        let e = read_at::<4>(r, at)?;
-        let n = if major == 4 {
-            syncsafe(&e)
-        } else {
-            u32::from_be_bytes(e) as u64 + 4
-        };
-        at += n;
-    }
-    for _ in 0..100_000 {
-        if at + 10 > tag_end {
-            return Ok(());
-        }
-        let f = read_at::<10>(r, at)?;
-        if f[0] == 0 {
-            // Remplissage : fin des trames.
-            return Ok(());
-        }
-        let size = if major == 4 {
-            syncsafe(&f[4..8])
-        } else {
-            u32::from_be_bytes(f[4..8].try_into().unwrap()) as u64
-        };
-        if size > tag_end - (at + 10) {
-            return Err(too_big(&f[..4]));
-        }
-        at += 10 + size;
-    }
-    bail!("fichier abîmé : trop de trames ID3")
+    Ok(10 + size)
 }
 
 // ------------------------------------------------------------------ conversion
@@ -683,27 +844,41 @@ mod tests {
         assert!(format!("{e:#}").contains("abîmé"), "{e:#}");
     }
 
+    /// En-tête CAF et description audio (44,1 kHz, stéréo).
+    fn caf_desc(format: &[u8; 4], bpp: u32, fpp: u32, bits: u32) -> Vec<u8> {
+        let mut f = b"caff\x00\x01\x00\x00".to_vec();
+        f.extend_from_slice(b"desc");
+        f.extend_from_slice(&32i64.to_be_bytes());
+        f.extend_from_slice(&44100f64.to_be_bytes());
+        f.extend_from_slice(format);
+        f.extend_from_slice(&[0; 4]);
+        f.extend_from_slice(&bpp.to_be_bytes());
+        f.extend_from_slice(&fpp.to_be_bytes());
+        f.extend_from_slice(&2u32.to_be_bytes());
+        f.extend_from_slice(&bits.to_be_bytes());
+        f
+    }
+
+    fn caf_chunk(f: &mut Vec<u8>, kind: &[u8; 4], size: i64, body: &[u8]) {
+        f.extend_from_slice(kind);
+        f.extend_from_slice(&size.to_be_bytes());
+        f.extend_from_slice(body);
+    }
+
+    /// Table des paquets annonçant 2^40 paquets (24 octets d'en-tête).
+    fn forged_pakt(f: &mut Vec<u8>) {
+        let mut t = (1i64 << 40).to_be_bytes().to_vec();
+        t.extend_from_slice(&[0; 16]);
+        caf_chunk(f, b"pakt", 24, &t);
+    }
+
     /// CAF de quelques octets dont la table annonce 2^40 paquets : refusé avant que
     /// symphonia ne réserve la table (sinon : arrêt brutal du processus).
     #[test]
     fn forged_caf_is_refused_before_allocation() {
         let d = tmp("caf");
-        let mut f = b"caff\x00\x01\x00\x00".to_vec();
-        // desc : 32 octets (44,1 kHz, AAC).
-        f.extend_from_slice(b"desc");
-        f.extend_from_slice(&32i64.to_be_bytes());
-        f.extend_from_slice(&44100f64.to_be_bytes());
-        f.extend_from_slice(b"aac ");
-        f.extend_from_slice(&[0; 4]);
-        f.extend_from_slice(&0u32.to_be_bytes());
-        f.extend_from_slice(&1024u32.to_be_bytes());
-        f.extend_from_slice(&2u32.to_be_bytes());
-        f.extend_from_slice(&0u32.to_be_bytes());
-        f.extend_from_slice(b"pakt");
-        f.extend_from_slice(&24i64.to_be_bytes());
-        f.extend_from_slice(&(1i64 << 40).to_be_bytes());
-        f.extend_from_slice(&0i64.to_be_bytes());
-        f.extend_from_slice(&[0; 8]);
+        let mut f = caf_desc(b"aac ", 0, 1024, 0);
+        forged_pakt(&mut f);
         let p = d.join("piege.caf");
         std::fs::write(&p, &f).unwrap();
         expect_damaged(&p);
@@ -718,10 +893,174 @@ mod tests {
         std::fs::write(&p3, &junk).unwrap();
         expect_damaged(&p3);
         // Cookie de taille géante.
-        let mut k = b"caff\x00\x01\x00\x00kuki".to_vec();
-        k.extend_from_slice(&(1i64 << 50).to_be_bytes());
-        k.extend_from_slice(&[0; 16]);
+        let mut k = caf_desc(b"aac ", 0, 1024, 0);
+        caf_chunk(&mut k, b"kuki", 1 << 50, &[0; 16]);
         std::fs::write(&p, &k).unwrap();
+        expect_damaged(&p);
+        // Table placée après des données de taille connue : symphonia saute les données
+        // et lit la table quand même.
+        let mut a = caf_desc(b"aac ", 0, 1024, 0);
+        caf_chunk(&mut a, b"data", 4 + 8, &[0; 12]);
+        forged_pakt(&mut a);
+        std::fs::write(&p, &a).unwrap();
+        expect_damaged(&p);
+        // Données de taille -1 : symphonia relit les octets « audio » comme des blocs.
+        let mut u = caf_desc(b"aac ", 0, 1024, 0);
+        caf_chunk(&mut u, b"data", -1, &[0; 4]);
+        forged_pakt(&mut u);
+        std::fs::write(&p, &u).unwrap();
+        expect_damaged(&p);
+        // Cookie géant après les données.
+        let mut c = caf_desc(b"aac ", 0, 1024, 0);
+        caf_chunk(&mut c, b"data", 4 + 4, &[0; 8]);
+        caf_chunk(&mut c, b"kuki", 1 << 40, &[0; 16]);
+        std::fs::write(&p, &c).unwrap();
+        expect_damaged(&p);
+        // Table d'un paquet (une entrée d'un octet) dans un bloc qui annonce plus :
+        // symphonia reprend juste après l'entrée, pas à la fin annoncée du bloc. Une table
+        // piégée cachée dans ce « reste » est lue.
+        let mut v = caf_desc(b"aac ", 0, 1024, 0);
+        let mut t = 1i64.to_be_bytes().to_vec();
+        t.extend_from_slice(&[0; 16]);
+        t.push(0x01);
+        forged_pakt(&mut t);
+        caf_chunk(&mut v, b"pakt", t.len() as i64, &t);
+        std::fs::write(&p, &v).unwrap();
+        expect_damaged(&p);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Un CAF ordinaire (PCM 16 bits, données de taille connue à la fin) s'ouvre.
+    #[test]
+    fn normal_caf_opens() {
+        let d = tmp("caf-ok");
+        let mut f = caf_desc(b"lpcm", 4, 1, 16);
+        let mut data = vec![0u8; 4];
+        data.extend((0..400u16).flat_map(|i| i.to_be_bytes()));
+        caf_chunk(&mut f, b"data", data.len() as i64, &data);
+        let p = d.join("ok.caf");
+        std::fs::write(&p, &f).unwrap();
+        let o = open(&p).unwrap();
+        assert_eq!(o.sample_rate, Some(44100));
+        assert_eq!(o.channels, Some(2));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// FLAC dont une image ou un commentaire annonce 4 Go : refusé avant que symphonia ne
+    /// réserve le champ.
+    #[test]
+    fn forged_flac_metadata_is_refused() {
+        let d = tmp("flac");
+        let p = d.join("piege.flac");
+        let block = |kind: u8, body: &[u8]| {
+            let mut b = vec![kind];
+            b.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+            b.extend_from_slice(body);
+            b
+        };
+        // STREAMINFO : 44,1 kHz, stéréo, 16 bits.
+        let mut si = vec![0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0];
+        si.extend_from_slice(&[0x0a, 0xc4, 0x42, 0xf0, 0, 0, 0, 0]);
+        si.extend_from_slice(&[0; 16]);
+        let head = |more: &[u8]| {
+            let mut f = b"fLaC".to_vec();
+            f.extend_from_slice(&block(0, &si));
+            f.extend_from_slice(more);
+            f.extend_from_slice(&[0xff, 0xf8, 0x69, 0x08, 0, 0, 0, 0]);
+            f
+        };
+        // Image : type MIME de 4 Go.
+        let mut pic = 3u32.to_be_bytes().to_vec();
+        pic.extend_from_slice(&0xffff_fff0u32.to_be_bytes());
+        pic.extend_from_slice(&[0; 32]);
+        std::fs::write(&p, head(&block(0x80 | 6, &pic))).unwrap();
+        expect_damaged(&p);
+        // Image correcte sauf les données, annoncées à 4 Go.
+        let mut pic = 3u32.to_be_bytes().to_vec();
+        pic.extend_from_slice(&9u32.to_be_bytes());
+        pic.extend_from_slice(b"image/png");
+        pic.extend_from_slice(&0u32.to_be_bytes());
+        pic.extend_from_slice(&[0; 16]);
+        pic.extend_from_slice(&u32::MAX.to_be_bytes());
+        pic.extend_from_slice(&[0; 8]);
+        std::fs::write(&p, head(&block(0x80 | 6, &pic))).unwrap();
+        expect_damaged(&p);
+        // Commentaire de 4 Go.
+        let mut vc = 0u32.to_le_bytes().to_vec();
+        vc.extend_from_slice(&1u32.to_le_bytes());
+        vc.extend_from_slice(&0xffff_fff0u32.to_le_bytes());
+        vc.extend_from_slice(b"TITLE=x");
+        std::fs::write(&p, head(&block(0x80 | 4, &vc))).unwrap();
+        expect_damaged(&p);
+        // Commentaires corrects : le contrôle les laisse passer.
+        let mut vc = 3u32.to_le_bytes().to_vec();
+        vc.extend_from_slice(b"moi");
+        vc.extend_from_slice(&1u32.to_le_bytes());
+        vc.extend_from_slice(&7u32.to_le_bytes());
+        vc.extend_from_slice(b"TITLE=x");
+        let f = head(&block(0x80 | 4, &vc));
+        std::fs::write(&p, &f).unwrap();
+        let mut c = BufReader::new(std::fs::File::open(&p).unwrap());
+        check_flac(&mut c, 0, f.len() as u64).unwrap();
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// MP3 encodé par LAME, précédé d'une étiquette ID3v2.
+    fn mp3_with_tag(tag: &[u8]) -> Vec<u8> {
+        use mp3lame_encoder::{Builder, FlushGap, InterleavedPcm};
+        let pcm: Vec<f32> = (0..8000)
+            .flat_map(|i| {
+                let v = (i as f32 * 0.02).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        let mut b = Builder::new().unwrap();
+        b.set_num_channels(2).unwrap();
+        b.set_sample_rate(44100).unwrap();
+        let mut enc = b.build().unwrap();
+        let mut out = tag.to_vec();
+        out.reserve(pcm.len() * 5 / 8 + 7200);
+        enc.encode_to_vec(InterleavedPcm(&pcm), &mut out).unwrap();
+        out.reserve(7200);
+        enc.flush_to_vec::<FlushGap>(&mut out).unwrap();
+        out
+    }
+
+    /// Étiquette ID3v2.3 : en-tête, trames, remplissage jusqu'à `size` octets.
+    fn id3v23(flags: u8, frames: &[u8], size: usize, pad: u8) -> Vec<u8> {
+        let mut t = vec![b'I', b'D', b'3', 3, 0, flags];
+        t.extend((0..4).rev().map(|i| ((size >> (7 * i)) & 0x7f) as u8));
+        t.extend_from_slice(frames);
+        t.resize(10 + size, pad);
+        t
+    }
+
+    /// Une étiquette ID3v2 est sautée sans être lue : un remplissage non conforme (0xFF)
+    /// ne fait plus refuser le fichier, et une trame piégée (4 Go annoncés, même dans une
+    /// étiquette désynchronisée) n'est jamais réservée.
+    #[test]
+    fn id3v2_tag_is_skipped() {
+        let d = tmp("id3");
+        let p = d.join("son.mp3");
+        let mut tit2 = b"TIT2".to_vec();
+        tit2.extend_from_slice(&6u32.to_be_bytes());
+        tit2.extend_from_slice(&[0, 0, 0]);
+        tit2.extend_from_slice(b"Titre");
+        std::fs::write(&p, mp3_with_tag(&id3v23(0, &tit2, 256, 0xff))).unwrap();
+        let o = open(&p).unwrap();
+        assert_eq!(o.sample_rate, Some(44100));
+        // Trame APIC de 4 Go, étiquette normale puis désynchronisée.
+        let mut apic = b"APIC".to_vec();
+        apic.extend_from_slice(&0xffff_ff00u32.to_be_bytes());
+        apic.extend_from_slice(&[0, 0]);
+        for flags in [0, 0x80] {
+            std::fs::write(&p, mp3_with_tag(&id3v23(flags, &apic, 128, 0))).unwrap();
+            assert!(open(&p).is_ok());
+        }
+        // Étiquette plus grande que le fichier : refusée proprement.
+        let mut big = id3v23(0, &tit2, 64, 0);
+        big[6..10].copy_from_slice(&[0x7f, 0x7f, 0x7f, 0x7f]);
+        std::fs::write(&p, &big).unwrap();
         expect_damaged(&p);
         let _ = std::fs::remove_dir_all(d);
     }
@@ -766,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_wav_chunks_and_id3_are_refused() {
+    fn forged_wav_chunks_are_refused() {
         let d = tmp("riff");
         let mut f = b"RIFF\xff\xff\xff\xffWAVE".to_vec();
         f.extend_from_slice(b"LIST");
@@ -774,18 +1113,6 @@ mod tests {
         f.extend_from_slice(b"INFOxxxx");
         let p = d.join("piege.wav");
         std::fs::write(&p, &f).unwrap();
-        expect_damaged(&p);
-        // ID3v2.3 dont une trame annonce 4 Go.
-        let mut id3 = b"ID3\x03\x00\x00".to_vec();
-        id3.extend_from_slice(&[0, 0, 0x01, 0x00]);
-        id3.extend_from_slice(b"APIC");
-        id3.extend_from_slice(&0xffff_ff00u32.to_be_bytes());
-        id3.extend_from_slice(&[0, 0]);
-        id3.resize(10 + 128, 0);
-        id3.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
-        id3.resize(id3.len() + 512, 0);
-        let p = d.join("piege.mp3");
-        std::fs::write(&p, &id3).unwrap();
         expect_damaged(&p);
         let _ = std::fs::remove_dir_all(d);
     }

@@ -15,6 +15,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -29,6 +30,10 @@ const KIND_PAD: u8 = 1;
 const KIND_IMPORT: u8 = 2;
 
 const MSG_PROGRESS: u8 = b'P';
+/// Taille attendue d'un son de pad (trames), dès l'ouverture du fichier.
+const MSG_SIZE: u8 = b'Z';
+/// Nom définitif d'un segment d'import, juste avant que le fichier n'y soit renommé.
+const MSG_NAMING: u8 = b'N';
 const MSG_SEGMENT: u8 = b'S';
 const MSG_DATA: u8 = b'D';
 const MSG_DONE: u8 = b'O';
@@ -223,8 +228,17 @@ fn send_error<W: Write>(out: Out<'_, W>, msg: &str) -> Result<()> {
 
 fn serve_pad<W: Write>(path: &Path, sr: u32, out: Out<'_, W>) -> Result<()> {
     let tick = heartbeat(out);
+    // L'application réserve la place du son dès qu'elle connaît sa taille, et arrête ce
+    // processus si elle manque : rien n'est décodé pour rien.
+    let announce = |frames: u64| -> Result<()> {
+        let mut w = out.borrow_mut();
+        w.write_all(&[MSG_SIZE])?;
+        put_u64(&mut *w, frames)?;
+        w.flush()?;
+        Ok(())
+    };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::soundboard::decode_stereo(path, sr, &tick)
+        crate::soundboard::decode_stereo(path, sr, &tick, &announce)
     }));
     let data = match r {
         Ok(Ok(d)) => d,
@@ -256,11 +270,19 @@ fn serve_import<W: Write>(
         tick(f);
         true
     };
-    let segment = |name: &str, frames: u64| {
+    // Chaque message est envoyé (vidé) avant l'étape suivante : arrêté à tout moment, ce
+    // processus ne laisse aucun fichier que l'application ne connaisse pas.
+    let segment = |e: crate::import::SegmentEvent<'_>| {
         let mut w = out.borrow_mut();
-        let _ = w.write_all(&[MSG_SEGMENT]);
-        let _ = put_str(&mut *w, name);
-        let _ = put_u64(&mut *w, frames);
+        let _ = match e {
+            crate::import::SegmentEvent::Naming(name) => w
+                .write_all(&[MSG_NAMING])
+                .and_then(|_| put_str(&mut *w, name)),
+            crate::import::SegmentEvent::Done(name, frames) => w
+                .write_all(&[MSG_SEGMENT])
+                .and_then(|_| put_str(&mut *w, name))
+                .and_then(|_| put_u64(&mut *w, frames)),
+        };
         let _ = w.flush();
     };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -452,9 +474,11 @@ fn child_limit(need: u64) -> u64 {
     need.min(half.max(1 << 30))
 }
 
-/// Son d'un pad décodé (stéréo entrelacé à `sr`) dans un processus fils. `accept(trames)`
-/// est appelé avant toute réservation (taille maximale, mémoire réservée aux sons) ; son
-/// refus est rendu tel quel. `None` : décodage isolé indisponible.
+/// Son d'un pad décodé (stéréo entrelacé à `sr`) dans un processus fils, dont la mémoire
+/// est bornée à `need`. `accept(trames)` est appelé dès que le fils annonce la taille du
+/// son (avant qu'il ne le décode), puis avec sa taille réelle avant toute réservation ici
+/// (taille maximale, mémoire réservée aux sons) ; un refus arrête le fils aussitôt et est
+/// rendu tel quel. `None` : décodage isolé indisponible.
 pub fn decode_pad(
     path: &Path,
     sr: u32,
@@ -481,6 +505,12 @@ fn read_pad(
         match tag {
             MSG_PROGRESS => {
                 get::<8>(r).map_err(|_| None)?;
+            }
+            MSG_SIZE => {
+                let frames = get_u64(r).map_err(|_| None)?;
+                if let Err(e) = accept(frames) {
+                    return Ok(Err(e));
+                }
             }
             MSG_ERROR => return Ok(Err(get_str(r).map_err(|_| None)?)),
             MSG_DATA => {
@@ -535,15 +565,28 @@ pub fn import(
     );
     // Tout se fait par blocs : peu de mémoire, sauf un rééchantillonneur de fréquence
     // première (quelques dizaines de Mo).
+    let existing = existing_names(audio_dir, file);
     let mut run = Running::start(&req, child_limit(1 << 30), Some(cancel.clone()))?;
     let mut segments = Vec::new();
-    let r = read_import(&mut run.out, progress, &mut segments);
+    let mut naming = None;
+    let r = read_import(
+        &mut run.out,
+        &existing,
+        file,
+        progress,
+        &mut segments,
+        &mut naming,
+    );
     let stopped = run.finish();
     Some(match r {
         Some(r) => r,
         None => {
-            // Fils arrêté en cours de route : ses fichiers sont retirés ici.
+            // Fils arrêté en cours de route : ses fichiers sont retirés ici, y compris
+            // celui qu'il renommait (nom annoncé libre juste avant).
             crate::import::remove_segments(audio_dir, file, &segments);
+            if let Some(n) = naming {
+                let _ = std::fs::remove_file(audio_dir.join(n));
+            }
             if stopped == STOP_CANCEL || cancel.load(Ordering::Relaxed) {
                 Err(crate::import::Cancelled.into())
             } else {
@@ -553,21 +596,55 @@ pub fn import(
     })
 }
 
-/// Lit les messages d'un fils d'import. `None` : flux interrompu.
+/// Fichiers du dossier Audio qui pourraient porter le nom d'un segment de `file` (en
+/// minuscules : Windows ne distingue pas la casse), relevés avant de lancer le fils.
+fn existing_names(audio_dir: &Path, file: &str) -> HashSet<String> {
+    let stem = file.trim_end_matches(".wav").to_lowercase();
+    std::fs::read_dir(audio_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_lowercase())
+                .filter(|n| n.starts_with(&stem))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Lit les messages d'un fils d'import. `None` : flux interrompu. Les noms de fichiers
+/// reçus (`segments`, et `naming` pour celui en cours de renommage) sont ceux que
+/// l'application retirera si le fils s'arrête : seul le nom attendu du segment suivant,
+/// absent du dossier avant l'import (`existing`, en minuscules), est accepté (un fils
+/// détourné par un fichier piégé ne fait jamais retirer une prise existante).
 fn read_import(
     r: &mut impl Read,
+    existing: &HashSet<String>,
+    file: &str,
     progress: &dyn Fn(f64) -> bool,
     segments: &mut Vec<(String, u64)>,
+    naming: &mut Option<String>,
 ) -> Option<Result<crate::import::Imported>> {
     loop {
         let tag = get::<1>(r).ok()?[0];
+        let expected = || crate::recorder::segment_name(file, segments.len() + 1);
         match tag {
             MSG_PROGRESS => {
                 progress(f64::from_le_bytes(get::<8>(r).ok()?));
             }
+            MSG_NAMING => {
+                let name = get_str(r).ok()?;
+                // Un fichier présent avant l'import n'est jamais le sien.
+                if name != expected() || existing.contains(&name.to_lowercase()) {
+                    return None;
+                }
+                *naming = Some(name);
+            }
             MSG_SEGMENT => {
                 let name = get_str(r).ok()?;
                 let frames = get_u64(r).ok()?;
+                if naming.as_deref() != Some(name.as_str()) {
+                    return None;
+                }
+                *naming = None;
                 segments.push((name, frames));
             }
             MSG_DONE => {
@@ -688,16 +765,23 @@ mod tests {
         let out = std::cell::RefCell::new(Vec::new());
         serve(&mut &req[..], &out).unwrap();
         let bytes = out.into_inner();
+        let calls = std::cell::Cell::new(0);
         let data = read_pad(&mut &bytes[..], &|n| {
             assert_eq!(n, 3000);
+            calls.set(calls.get() + 1);
             Ok(())
         })
         .unwrap()
         .unwrap();
         assert_eq!(data.len(), 6000);
         assert_eq!(data[200], data[201]);
+        // Taille annoncée dès l'ouverture, puis taille réelle avec les données.
+        assert_eq!(calls.get(), 2);
         let refused = read_pad(&mut &bytes[..], &|_| Err("pleine".into())).unwrap();
         assert_eq!(refused.unwrap_err(), "pleine");
+        // Le refus arrive sur l'annonce, avant les données : le fils est arrêté sans
+        // avoir envoyé le son.
+        assert_eq!(bytes[0], MSG_SIZE);
         // Flux coupé au milieu des données : signalé comme un arrêt du fils.
         assert!(read_pad(&mut &bytes[..bytes.len() / 2], &|_| Ok(())).is_err());
         // Fichier illisible : erreur transmise.
@@ -754,10 +838,19 @@ mod tests {
         let out = std::cell::RefCell::new(Vec::new());
         serve(&mut &req[..], &out).unwrap();
         let bytes = out.into_inner();
+        let file = "chanson_001.wav";
+        let none = HashSet::new();
         let mut segs = Vec::new();
-        let i = read_import(&mut &bytes[..], &|_| true, &mut segs)
-            .unwrap()
-            .unwrap();
+        let i = read_import(
+            &mut &bytes[..],
+            &none,
+            file,
+            &|_| true,
+            &mut segs,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(i.name, "chanson");
         assert!(i.stereo);
         assert_eq!(i.segments.len(), 1);
@@ -765,7 +858,72 @@ mod tests {
         assert_eq!(i.frames(), (10000u64 * 48000).div_ceil(44100));
         assert!(audio.join("chanson_001.wav").exists());
         // Flux interrompu : `None` (le fils s'est arrêté).
-        assert!(read_import(&mut &bytes[..3], &|_| true, &mut Vec::new()).is_none());
+        let mut naming = None;
+        let cut = read_import(
+            &mut &bytes[..3],
+            &none,
+            file,
+            &|_| true,
+            &mut segs,
+            &mut naming,
+        );
+        assert!(cut.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Fils arrêté entre l'annonce d'un nom et le message du segment terminé : le nom est
+    /// connu (le fichier sera retiré). Un nom inattendu, ou déjà pris avant l'import, ou un
+    /// segment jamais annoncé, est refusé : un fils détourné ne fait retirer aucune prise.
+    #[test]
+    fn import_segment_names_are_checked() {
+        let file = "concert_001.wav";
+        let msg = |tag: u8, name: &str, frames: Option<u64>| {
+            let mut v = vec![tag];
+            put_str(&mut v, name).unwrap();
+            if let Some(f) = frames {
+                put_u64(&mut v, f).unwrap();
+            }
+            v
+        };
+        let read = |bytes: &[u8], existing: &HashSet<String>| {
+            let (mut segs, mut naming) = (Vec::new(), None);
+            let r = read_import(
+                &mut &bytes[..],
+                existing,
+                file,
+                &|_| true,
+                &mut segs,
+                &mut naming,
+            );
+            (r.is_none(), segs, naming)
+        };
+        let none = HashSet::new();
+        // Premier segment terminé, second annoncé puis arrêt.
+        let mut s = msg(MSG_NAMING, "concert_001.wav", None);
+        s.extend(msg(MSG_SEGMENT, "concert_001.wav", Some(10)));
+        s.extend(msg(MSG_NAMING, "concert_001_p2.wav", None));
+        let (stopped, segs, naming) = read(&s, &none);
+        assert!(stopped);
+        assert_eq!(segs, vec![("concert_001.wav".to_string(), 10)]);
+        assert_eq!(naming.as_deref(), Some("concert_001_p2.wav"));
+        // Nom qui n'est pas celui du segment suivant.
+        let (_, _, naming) = read(&msg(MSG_NAMING, "Prise_001.wav", None), &none);
+        assert_eq!(naming, None);
+        // Nom déjà présent avant l'import (casse indifférente).
+        let taken: HashSet<String> = ["concert_001.wav".to_string()].into();
+        let (_, _, naming) = read(&msg(MSG_NAMING, "concert_001.wav", None), &taken);
+        assert_eq!(naming, None);
+        // Segment terminé sans annonce.
+        let (_, segs, _) = read(&msg(MSG_SEGMENT, "concert_001.wav", Some(10)), &none);
+        assert!(segs.is_empty());
+        // Relevé du dossier : en minuscules, limité aux noms de cet import.
+        let dir = std::env::temp_dir().join(format!("tp-isonames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Concert_001_P3.wav"), b"").unwrap();
+        std::fs::write(dir.join("autre.wav"), b"").unwrap();
+        let found = existing_names(&dir, file);
+        assert_eq!(found, ["concert_001_p3.wav".to_string()].into());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

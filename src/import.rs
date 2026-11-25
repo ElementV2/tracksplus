@@ -100,7 +100,7 @@ impl ImportJob {
                                         &file,
                                         sample_rate,
                                         &tick,
-                                        &|_, _| {},
+                                        &|_| {},
                                     )
                                 }))
                                 .unwrap_or_else(|_| {
@@ -155,6 +155,14 @@ pub fn remove_segments(audio_dir: &Path, file: &str, done: &[(String, u64)]) {
     }
 }
 
+/// Étape d'un fichier de l'import (voir `import_file`).
+pub enum SegmentEvent<'a> {
+    /// Nom définitif encore libre : le fichier terminé va y être renommé.
+    Naming(&'a str),
+    /// Fichier terminé sous son nom définitif (nom, trames).
+    Done(&'a str, u64),
+}
+
 /// Écriture découpée en fichiers de `max_bytes` au plus. Tout fichier non validé
 /// (erreur, annulation) est retiré, segments déjà terminés compris.
 struct Segments<'a> {
@@ -167,7 +175,7 @@ struct Segments<'a> {
     writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
     frames: u64,
     done: Vec<(String, u64)>,
-    on_segment: &'a dyn Fn(&str, u64),
+    on_segment: &'a dyn Fn(SegmentEvent<'_>),
     committed: bool,
 }
 
@@ -177,7 +185,7 @@ impl<'a> Segments<'a> {
         base: &'a str,
         spec: hound::WavSpec,
         max_bytes: u64,
-        on_segment: &'a dyn Fn(&str, u64),
+        on_segment: &'a dyn Fn(SegmentEvent<'_>),
     ) -> Self {
         let channels = spec.channels as usize;
         // En-tête WAV (44 octets) compris ; 4 octets par échantillon.
@@ -250,9 +258,12 @@ impl<'a> Segments<'a> {
         if dst.exists() {
             bail!("« {name} » existe déjà dans le dossier Audio");
         }
+        // Annoncé avant le renommage : un processus fils arrêté juste après laisse un
+        // fichier que l'application sait être le sien (et retire).
+        (self.on_segment)(SegmentEvent::Naming(&name));
         std::fs::rename(&part, &dst).context("écriture dans le dossier Audio")?;
         self.done.push((name.clone(), self.frames));
-        (self.on_segment)(&name, self.frames);
+        (self.on_segment)(SegmentEvent::Done(&name, self.frames));
         Ok(())
     }
 
@@ -275,14 +286,15 @@ impl Drop for Segments<'_> {
 /// Décode `src`, le convertit à `sr` et l'écrit dans `audio_dir/file` (WAV 32 bits
 /// flottant, mono ou stéréo comme l'original ; au-delà de 2 canaux, les deux premiers),
 /// découpé en fichiers de 2 Go au plus. `on_progress(f)` renvoie `false` pour annuler ;
-/// `on_segment(nom, trames)` est appelé à chaque fichier terminé.
+/// `on_segment` suit chaque fichier : son nom juste avant qu'il n'y soit renommé, puis
+/// le fichier terminé.
 pub fn import_file(
     src: &Path,
     audio_dir: &Path,
     file: &str,
     sr: u32,
     on_progress: &dyn Fn(f64) -> bool,
-    on_segment: &dyn Fn(&str, u64),
+    on_segment: &dyn Fn(SegmentEvent<'_>),
 ) -> Result<Imported> {
     import_file_limited(
         src,
@@ -301,7 +313,7 @@ fn import_file_limited(
     file: &str,
     sr: u32,
     on_progress: &dyn Fn(f64) -> bool,
-    on_segment: &dyn Fn(&str, u64),
+    on_segment: &dyn Fn(SegmentEvent<'_>),
     max_bytes: u64,
 ) -> Result<Imported> {
     use symphonia::core::audio::SampleBuffer;
@@ -444,7 +456,7 @@ mod tests {
             "chanson_001.wav",
             48000,
             &|_| true,
-            &|_, _| {},
+            &|_| {},
         )
         .unwrap();
         assert!(i.stereo);
@@ -464,7 +476,7 @@ mod tests {
             "voix_001.wav",
             48000,
             &|_| true,
-            &|_, _| {},
+            &|_| {},
         )
         .unwrap();
         assert!(!i.stereo);
@@ -483,6 +495,7 @@ mod tests {
         let audio = d.join("Audio");
         write_wav(&d.join("concert.wav"), 48000, 2, 10_000);
         let seen = std::cell::RefCell::new(Vec::new());
+        let named = std::cell::RefCell::new(Vec::<String>::new());
         // 1 000 trames stéréo flottantes par fichier (8 000 octets + en-tête).
         let i = import_file_limited(
             &d.join("concert.wav"),
@@ -490,7 +503,17 @@ mod tests {
             "concert_001.wav",
             48000,
             &|_| true,
-            &|n, f| seen.borrow_mut().push((n.to_string(), f)),
+            &|e| match e {
+                // Chaque nom est annoncé avant que le fichier n'y soit renommé.
+                SegmentEvent::Naming(n) => {
+                    assert!(!audio.join(n).exists());
+                    named.borrow_mut().push(n.to_string());
+                }
+                SegmentEvent::Done(n, f) => {
+                    assert_eq!(named.borrow().last().map(String::as_str), Some(n));
+                    seen.borrow_mut().push((n.to_string(), f));
+                }
+            },
             8_044,
         )
         .unwrap();
@@ -499,6 +522,7 @@ mod tests {
         assert_eq!(i.segments[0].0, "concert_001.wav");
         assert_eq!(i.segments[1].0, "concert_001_p2.wav");
         assert_eq!(*seen.borrow(), i.segments);
+        assert_eq!(named.borrow().len(), 10);
         for (f, n) in &i.segments {
             let r = hound::WavReader::open(audio.join(f)).unwrap();
             assert_eq!(r.duration() as u64, *n);
@@ -514,7 +538,7 @@ mod tests {
                 calls.set(calls.get() + 1);
                 calls.get() < 3
             },
-            &|_, _| {},
+            &|_| {},
             8_044,
         )
         .err()
@@ -537,7 +561,7 @@ mod tests {
                 "x_001.wav",
                 48000,
                 &|_| true,
-                &|_, _| {},
+                &|_| {},
                 8_044,
             )
             .is_err()
@@ -558,7 +582,7 @@ mod tests {
             "faux_001.wav",
             48000,
             &|_| true,
-            &|_, _| {},
+            &|_| {},
         )
         .err()
         .unwrap();
@@ -570,7 +594,7 @@ mod tests {
             "long_001.wav",
             48000,
             &|_| false,
-            &|_, _| {},
+            &|_| {},
         )
         .err()
         .unwrap();
@@ -589,7 +613,7 @@ mod tests {
             "piege_001.wav",
             48000,
             &|_| true,
-            &|_, _| {},
+            &|_| {},
         )
         .err()
         .unwrap();
