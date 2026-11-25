@@ -47,6 +47,10 @@ pub struct RecSpec {
 pub struct Segment {
     pub file: String,
     pub frames: u64,
+    /// Position du début du fichier dans la prise (trames depuis le début de la prise).
+    /// Égale à la somme des fichiers précédents, sauf après une erreur d'écriture : les
+    /// trames perdues entre deux fichiers sont un trou, pas un décalage.
+    pub start: u64,
 }
 
 #[derive(Debug)]
@@ -57,7 +61,18 @@ pub struct RecResult {
 }
 
 impl RecResult {
+    /// Durée couverte par la prise (fin du dernier fichier, trous compris).
     pub fn frames(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.start + s.frames)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Trames réellement écrites sur le disque.
+    #[cfg(test)]
+    pub fn written(&self) -> u64 {
         self.segments.iter().map(|s| s.frames).sum()
     }
 }
@@ -86,6 +101,8 @@ struct SegWriter {
     /// thread de synchronisation : jamais plus d'une demande en attente par fichier).
     file: Arc<File>,
     frames: u64,
+    /// Position du début de ce fichier dans la prise.
+    start: u64,
 }
 
 /// Consommateur séparé de l'état d'écriture (emprunts disjoints dans la boucle).
@@ -106,9 +123,9 @@ struct LaneState {
     done: Vec<Segment>,
     acc: PeakAccum,
     error: Option<String>,
-    /// Trames perdues depuis la fermeture sur erreur du fichier (remplacées par du
-    /// silence à la réouverture : les pistes restent alignées).
-    gap: u64,
+    /// Trames complètes écoulées depuis le début de la prise (écrites ou perdues) : position
+    /// du prochain fichier ouvert, pour que la piste reste calée après une erreur.
+    elapsed: u64,
     /// Prochain essai de réouverture après une erreur d'écriture.
     retry_at: Option<Instant>,
 }
@@ -126,6 +143,7 @@ fn open_segment(path: &Path, wav: WavSpec) -> std::io::Result<SegWriter> {
         w,
         file: Arc::new(sync),
         frames: 0,
+        start: 0,
     })
 }
 
@@ -151,14 +169,21 @@ impl LaneState {
             }
             // Écriture forcée sur le disque dans un thread à part : jamais de blocage ici.
             let _ = sync.send(file);
-            self.done.push(Segment { file: name, frames });
+            self.done.push(Segment {
+                file: name,
+                frames,
+                start: seg.start,
+            });
         }
     }
 
     fn open_next(&mut self, errors: &Errors) {
         let name = segment_name(&self.file, self.done.len() + 1);
         match open_segment(&self.dir.join(&name), self.wav) {
-            Ok(w) => self.cur = Some(w),
+            Ok(mut w) => {
+                w.start = self.elapsed;
+                self.cur = Some(w);
+            }
             Err(e) => {
                 self.fail(errors, format!("{name} : {e}"));
                 self.retry_at = Some(Instant::now() + RETRY_EVERY);
@@ -167,42 +192,18 @@ impl LaneState {
     }
 
     /// Après une erreur (disque plein puis libéré, clé rebranchée…) : nouveau fichier,
-    /// qui commence par le silence des trames perdues pour rester calé sur les autres.
-    fn retry(&mut self, format: RecFormat) {
+    /// posé à sa vraie place dans la prise (aucun silence à écrire : les trames perdues
+    /// restent un trou sur la timeline, la piste reste calée sur les autres).
+    fn retry(&mut self) {
         // Échecs répétés : l'erreur a déjà été signalée, on ne la répète pas chaque seconde.
         let name = segment_name(&self.file, self.done.len() + 1);
         match open_segment(&self.dir.join(&name), self.wav) {
-            Ok(w) => self.cur = Some(w),
-            Err(_) => {
-                self.retry_at = Some(Instant::now() + RETRY_EVERY);
-                return;
+            Ok(mut w) => {
+                w.start = self.elapsed;
+                self.retry_at = None;
+                self.cur = Some(w);
             }
-        }
-        let Some(seg) = self.cur.as_mut() else {
-            return;
-        };
-        let width = self.wav.channels as u64;
-        let mut res = Ok(());
-        for _ in 0..self.gap * width {
-            res = match format {
-                RecFormat::Int24 => seg.w.write_sample(0i32),
-                RecFormat::Float32 => seg.w.write_sample(0f32),
-            };
-            if res.is_err() {
-                break;
-            }
-        }
-        match res {
-            Ok(()) => {
-                seg.frames += self.gap;
-                self.gap = 0;
-            }
-            Err(_) => {
-                // Toujours pas de place : fichier abandonné, nouvel essai plus tard.
-                self.cur = None;
-                let _ = std::fs::remove_file(self.dir.join(&name));
-                self.retry_at = Some(Instant::now() + RETRY_EVERY);
-            }
+            Err(_) => self.retry_at = Some(Instant::now() + RETRY_EVERY),
         }
     }
 }
@@ -331,7 +332,7 @@ fn run(
                 done: Vec::new(),
                 acc: PeakAccum::default(),
                 error: None,
-                gap: 0,
+                elapsed: 0,
                 retry_at: None,
             };
             st.open_next(&errors);
@@ -389,12 +390,12 @@ fn run(
                     st.open_next(&errors);
                 }
                 if k == 0 && st.cur.is_none() && st.retry_at.is_some_and(|t| Instant::now() >= t) {
-                    st.retry(format);
+                    st.retry();
+                }
+                if k + 1 == width {
+                    st.elapsed += 1;
                 }
                 let Some(seg) = st.cur.as_mut() else {
-                    if k + 1 == width {
-                        st.gap += 1;
-                    }
                     continue;
                 };
                 let r = match format {
@@ -416,10 +417,6 @@ fn run(
                         // on réessaie régulièrement d'en ouvrir un nouveau.
                         st.close_current(&errors, &sync_tx);
                         st.retry_at = Some(Instant::now() + RETRY_EVERY);
-                        if k + 1 == width {
-                            // Trame incomplète sur le disque : comptée dans le trou.
-                            st.gap += 1;
-                        }
                     }
                 }
             }
@@ -757,7 +754,7 @@ mod tests {
     }
 
     /// Disque revenu (clé rebranchée, place libérée) : la piste reprend dans un nouveau
-    /// fichier, précédé du silence des trames perdues — elle reste calée sur les autres.
+    /// fichier posé à sa vraie place — elle reste calée sur les autres.
     #[test]
     fn lane_resumes_after_disk_error_and_stays_aligned() {
         let dir = std::env::temp_dir().join(format!("tp-retry-{}", std::process::id()));
@@ -788,14 +785,15 @@ mod tests {
         }
         drop(prod);
         let res = rec.finish().unwrap();
-        assert_eq!(
-            res[0].frames(),
-            5000,
-            "trou de 3000 trames comblé par du silence"
-        );
+        // Les 3000 premières trames sont perdues : le fichier repris commence à la trame
+        // 3000 de la prise (un trou, pas un décalage), sans silence écrit sur le disque.
+        assert_eq!(res[0].frames(), 5000);
+        assert_eq!(res[0].written(), 2000);
         assert_eq!(rec_errors_count(&res), 1);
-        let r = hound::WavReader::open(dir.join(&res[0].segments[0].file)).unwrap();
-        assert_eq!(r.duration(), 5000);
+        let seg = &res[0].segments[0];
+        assert_eq!((seg.start, seg.frames), (3000, 2000));
+        let r = hound::WavReader::open(dir.join(&seg.file)).unwrap();
+        assert_eq!(r.duration(), 2000);
         std::fs::remove_dir_all(dir).ok();
     }
 

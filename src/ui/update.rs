@@ -18,7 +18,10 @@ impl App {
         }
         // Le spectacle a repris pendant le téléchargement (lecture, prise, pad) : jamais
         // de fermeture surprise. L'installation attend un nouveau clic dans la fenêtre.
-        if self.update_install && (!self.is_stopped() || self.pads_status().0 > 0) {
+        // (Une prise en cours de finalisation n'annule rien : on attend simplement qu'elle
+        // soit terminée, plus bas.)
+        let active = !matches!(self.transport, crate::app::Transport::Stopped);
+        if self.update_install && (active || self.pads_status().0 > 0) {
             self.update_install = false;
             self.notify(
                 "Mise à jour reportée : installez-la depuis le menu quand vous serez prêt",
@@ -40,10 +43,12 @@ impl App {
                 return;
             }
             self.update_install = false;
-            // Tout est sauvegardé avant que l'installeur ne ferme l'application.
-            self.autosave();
+            // Tout est sauvegardé avant que l'installeur ne ferme l'application ; sinon
+            // (disque plein, clé retirée) on ne ferme pas.
             self.board_changed = Some(self.now);
-            self.save_board_now();
+            if !self.save_before_leaving() {
+                return;
+            }
             match update::launch_installer(&file) {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => self.updater.set(State::Failed(e)),

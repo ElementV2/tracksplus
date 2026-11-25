@@ -116,7 +116,13 @@ pub fn recover(project: &mut Project) -> Result<usize> {
             continue;
         }
         // Une prise longue peut s'étendre sur plusieurs fichiers (nom, nom_p2, nom_p3…).
-        let mut pos = j.start + j.play_offset;
+        // Fichiers supposés bout à bout (le journal ne connaît pas les trous laissés par une
+        // éventuelle erreur d'écriture), décalés de la latence comme une fin de prise normale.
+        let origin = j
+            .start
+            .saturating_add(j.play_offset)
+            .min(crate::project::MAX_POS);
+        let mut seg_start = 0u64;
         for k in 1.. {
             let file = crate::recorder::segment_name(&base, k);
             let path = project.audio_dir().join(&file);
@@ -136,12 +142,11 @@ pub fn recover(project: &mut Project) -> Result<usize> {
             }
             // Même recalage qu'à la fin normale d'une prise : début du premier fichier
             // sauté de la latence (vaut aussi pour placer les fichiers suivants).
-            let skip = if k == 1 {
-                j.latency
-                    .min(frames.saturating_sub(crate::project::MIN_CLIP))
-            } else {
-                0
-            };
+            let lat = j.latency.min(crate::project::MAX_POS);
+            let skip = lat
+                .saturating_sub(seg_start)
+                .min(frames.saturating_sub(crate::project::MIN_CLIP));
+            let pos = (origin + seg_start + skip).saturating_sub(lat).max(origin);
             let already = project
                 .tracks
                 .iter()
@@ -181,7 +186,7 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                     n += 1;
                 }
             }
-            pos += frames - skip;
+            seg_start += frames;
         }
     }
     project.dirty = true;

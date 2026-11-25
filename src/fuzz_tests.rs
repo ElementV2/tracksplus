@@ -258,6 +258,7 @@ fn fuzz_session_files_never_panic() {
 fn exercise_project(rng: &mut Rng, p: &mut Project) {
     for c in p.tracks.iter().flat_map(|t| &t.clips) {
         assert!(!c.file.contains(['/', '\\']), "{}", c.file);
+        assert!(!c.file.is_empty());
         assert!(c.fade_in.saturating_add(c.fade_out) <= c.len.max(1));
         let _ = c.end();
         let _ = c.fade_gain(rng.edgy());
@@ -365,5 +366,41 @@ fn fuzz_recovery_journal_never_panics() {
         // Session remise à zéro pour l'essai suivant.
         p.save().unwrap();
     }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Mesure : calcul de la forme d'onde d'une prise de 10 min (24 bits mono, 48 kHz).
+/// `cargo test --release -- --ignored --nocapture bench_peaks`
+#[test]
+#[ignore]
+fn bench_peaks_10_min_take() {
+    let dir = temp_dir("bench");
+    let p = dir.join("long.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 48000,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&p, spec).unwrap();
+    for i in 0..48000 * 600u32 {
+        w.write_sample(((i % 4800) as i32 - 2400) * 1000).unwrap();
+    }
+    w.finalize().unwrap();
+    let t = std::time::Instant::now();
+    let peaks = std::sync::Arc::new(parking_lot::RwLock::new(Default::default()));
+    crate::render::compute_peaks(&p, &peaks);
+    let secs = t.elapsed().as_secs_f64();
+    let mb = std::fs::metadata(&p).unwrap().len() as f64 / 1e6;
+    println!(
+        "forme d'onde : {mb:.0} Mo en {secs:.2} s ({:.0} Mo/s)",
+        mb / secs
+    );
+    let t = std::time::Instant::now();
+    let mut src = WavSource::open(&p).unwrap();
+    let mut buf = vec![0f32; 4096 * 2];
+    while src.read_frames(&mut buf, 2) > 0 {}
+    let secs = t.elapsed().as_secs_f64();
+    println!("lecture : {:.0}× le temps réel", 600.0 / secs);
     std::fs::remove_dir_all(dir).ok();
 }

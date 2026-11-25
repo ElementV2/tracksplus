@@ -463,6 +463,9 @@ impl Project {
             if t.name.trim().is_empty() {
                 t.name = format!("Piste {}", i + 1);
             }
+            // Prise sans nom de fichier utilisable : rien à lire, et elle ferait échouer
+            // « Enregistrer sous » (son chemin serait le dossier Audio lui-même).
+            t.clips.retain(|c| !safe_file_name(&c.file).is_empty());
             for c in &mut t.clips {
                 c.start = c.start.min(MAX_POS);
                 c.offset = c.offset.min(MAX_POS);
@@ -675,7 +678,6 @@ pub fn copy_synced(src: &Path, dst: &Path) -> Result<()> {
     res
 }
 
-/// Premier nom libre « nom (2).wav », « nom (3).wav »… (`taken` en minuscules).
 /// Ramène un nom de fichier de prise à un simple nom, sans dossier ni lecteur :
 /// « ../../x.wav », « C:\\x.wav » ou « \\\\hôte\\x.wav » deviennent « x.wav ».
 /// Renvoie une chaîne vide si rien d'utilisable ne reste (prise muette).
@@ -687,6 +689,7 @@ pub fn safe_file_name(file: &str) -> String {
     last.to_string()
 }
 
+/// Premier nom libre « nom (2).wav », « nom (3).wav »… (`taken` en minuscules).
 fn unique_name(file: &str, taken: &HashSet<String>) -> String {
     let p = Path::new(file);
     let stem = p

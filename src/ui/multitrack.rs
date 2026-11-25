@@ -1184,6 +1184,11 @@ impl App {
 
     /// Annule un geste en cours (prises remises dans leur état d'origine).
     fn revert_clip_drag(&mut self, drag: &ClipDrag) {
+        // Étape d'annulation empilée au début du geste : sans objet (une prise, elle, a
+        // déjà vidé l'historique).
+        if !self.is_recording() {
+            self.undo.pop();
+        }
         for (track_id, o) in &drag.origs {
             if let Some(t) = self.project.track_mut(*track_id)
                 && let Some(c) = t.clips.iter_mut().find(|c| c.id == o.id)

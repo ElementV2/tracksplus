@@ -38,6 +38,39 @@ fn parse_secs(t: &str) -> Option<f64> {
 /// Au-delà de cette taille, un son est copié dans la session en arrière-plan.
 const BIG_SOUND: u64 = 32 * 1024 * 1024;
 
+type CopyJob = (
+    PathBuf,
+    PathBuf,
+    std::sync::mpsc::Sender<Result<PathBuf, String>>,
+);
+
+/// Copies des sons dans les sessions, une à la fois dans un seul thread : deux fichiers
+/// de même nom déposés ensemble ne se disputent jamais le même nom de destination (le
+/// second voit le premier et prend un autre nom), et le disque n'est pas saturé.
+fn copy_worker(src: PathBuf, dir: PathBuf, done: std::sync::mpsc::Sender<Result<PathBuf, String>>) {
+    static JOBS: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<CopyJob>>> =
+        std::sync::OnceLock::new();
+    let jobs = JOBS.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<CopyJob>();
+        let _ = std::thread::Builder::new()
+            .name("tracksplus-copy".into())
+            .spawn(move || {
+                for (src, dir, done) in rx {
+                    let r = std::panic::catch_unwind(|| {
+                        crate::soundboard::copy_into_session(&src, &dir)
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                    .unwrap_or_else(|_| Err("copie interrompue (erreur interne)".into()));
+                    let _ = done.send(r);
+                }
+            });
+        std::sync::Mutex::new(tx)
+    });
+    if let Ok(tx) = jobs.lock() {
+        let _ = tx.send((src, dir, done));
+    }
+}
+
 /// Copie d'un gros son vers le dossier « Sons » de la session, en cours.
 pub struct PendingCopy {
     src: PathBuf,
@@ -300,12 +333,7 @@ impl App {
             let f = if outside {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let (src, dir) = (f.clone(), self.project.dir.clone());
-                std::thread::spawn(move || {
-                    let _ = tx.send(
-                        crate::soundboard::copy_into_session(&src, &dir)
-                            .map_err(|e| format!("{e:#}")),
-                    );
-                });
+                copy_worker(src, dir, tx);
                 self.sb.copies.push(PendingCopy {
                     src: f.clone(),
                     dir: self.project.dir.clone(),
@@ -416,6 +444,17 @@ impl App {
                         if used {
                             let _ = b.save_session(&dir);
                         }
+                    }
+                    // « Enregistrer sous » entre-temps : la session courante pointe encore
+                    // sur l'original, on le copie aussi chez elle.
+                    if self.board.all_pads().any(|(_, p)| p.path == src) {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        copy_worker(src.clone(), self.project.dir.clone(), tx);
+                        self.sb.copies.push(PendingCopy {
+                            src,
+                            dir: self.project.dir.clone(),
+                            rx,
+                        });
                     }
                 }
                 Ok(dst) => {

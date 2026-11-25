@@ -775,12 +775,13 @@ impl Engine {
         }
     }
 
-    pub fn start_playback(&self, cons: Consumer<f32>) {
+    /// `false` si la sortie ne répond pas (commande non transmise).
+    pub fn start_playback(&self, cons: Consumer<f32>) -> bool {
         // Remis à zéro ici et dans le callback : pas de saut de la tête au démarrage.
         self.shared.out_cb_ns.store(0, Ordering::Release);
         self.shared.out_frames.store(0, Ordering::Relaxed);
         self.shared.counting.store(true, Ordering::Relaxed);
-        self.send_out(OutCmd::Play(cons));
+        self.send_out(OutCmd::Play(cons))
     }
 
     /// Envoi fiable d'une commande de transport : si la file est momentanément pleine
@@ -1480,14 +1481,18 @@ where
             }
             let total = data.len() / ch;
             st.shared.out_block.store(total as u32, Ordering::Relaxed);
-            // Horodatage du début de ce bloc (lecture en cours seulement).
-            if st.cons.is_some() {
+            // Horodatage du début de ce bloc (lecture en cours seulement), par la sortie
+            // principale uniquement : celles du soundboard ou de l'écoute ne lisent jamais
+            // la lecture multipiste et ne doivent pas l'effacer.
+            if st.main {
                 let sh = &st.shared;
-                sh.out_cb_frames
-                    .store(sh.out_frames.load(Ordering::Relaxed), Ordering::Relaxed);
-                sh.out_cb_ns.store(sh.now_ns(), Ordering::Release);
-            } else {
-                st.shared.out_cb_ns.store(0, Ordering::Release);
+                if st.cons.is_some() {
+                    sh.out_cb_frames
+                        .store(sh.out_frames.load(Ordering::Relaxed), Ordering::Relaxed);
+                    sh.out_cb_ns.store(sh.now_ns(), Ordering::Release);
+                } else {
+                    sh.out_cb_ns.store(0, Ordering::Release);
+                }
             }
             let mut done = 0;
             while done < total {

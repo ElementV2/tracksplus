@@ -252,6 +252,9 @@ pub struct SbState {
     pub deleted: Option<(u16, crate::soundboard::Pad)>,
 }
 
+const OUTPUT_STALLED: &str =
+    "La sortie audio ne répond pas : vérifiez la carte son (Réglages audio pour la relancer)";
+
 pub struct App {
     pub tab: usize,
     pub project: Project,
@@ -302,6 +305,8 @@ pub struct App {
     pub save_error_at: f64,
     /// Dernier changement de session refusé faute de sauvegarde (voir `save_before_leaving`).
     pub leave_anyway_at: f64,
+    /// Mesure de l'espace disque libre en cours (thread).
+    pub disk_job: Option<std::sync::mpsc::Receiver<Option<u64>>>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
     /// La prise en cours est faite en écoutant les pistes existantes.
@@ -483,6 +488,7 @@ impl App {
             disk_stalled: false,
             save_error_at: f64::NEG_INFINITY,
             leave_anyway_at: f64::NEG_INFINITY,
+            disk_job: None,
             rec_latency: 0,
             rec_overdub: false,
             journal_pending: None,
@@ -626,7 +632,11 @@ impl App {
             self.playhead = self.selection.map_or(0, |s| s.0);
         }
         let (player, cons) = Player::start(&self.project, self.playhead, self.project.audible());
-        self.engine.start_playback(cons);
+        if !self.engine.start_playback(cons) {
+            // Jamais « lecture » à l'écran si le moteur n'a rien reçu.
+            self.notify(OUTPUT_STALLED, true);
+            return;
+        }
         self.player = Some(player);
         self.play_base = self.playhead;
         self.transport = Transport::Playing {
@@ -642,7 +652,11 @@ impl App {
             Transport::Playing { .. } => {
                 self.playhead = pos;
                 let (player, cons) = Player::start(&self.project, pos, self.project.audible());
-                self.engine.start_playback(cons);
+                if !self.engine.start_playback(cons) {
+                    self.notify(OUTPUT_STALLED, true);
+                    self.stop();
+                    return;
+                }
                 self.player = Some(player);
                 self.play_base = pos;
                 self.transport = Transport::Playing { start: pos };
@@ -830,7 +844,10 @@ impl App {
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
                 Player::start(&self.project, self.playhead, self.project.audible());
-            self.engine.start_playback(cons);
+            // Sortie bloquée : la prise se fait quand même, sans la lecture des pistes.
+            if !self.engine.start_playback(cons) {
+                self.notify(OUTPUT_STALLED, true);
+            }
             self.player = Some(player);
             self.play_base = self.playhead;
             self.rec_overdub = true;
@@ -1010,9 +1027,9 @@ impl App {
                 .find(|l| l.track_id == r.track_id)
                 .map(|l| l.peaks.clone());
             // Une prise longue peut être répartie sur plusieurs fichiers : une prise par
-            // fichier, posées bout à bout.
-            let mut pos = start;
-            for (k, seg) in r.segments.iter().enumerate() {
+            // fichier, chacune à sa position dans la prise (bout à bout, ou avec un trou
+            // après une erreur d'écriture).
+            for seg in &r.segments {
                 if seg.frames == 0 {
                     let _ = std::fs::remove_file(self.project.audio_dir().join(&seg.file));
                     continue;
@@ -1034,12 +1051,12 @@ impl App {
                         self.peaks.insert(id, pk);
                     }
                 }
-                // Début du premier fichier sauté de la latence : la prise tombe en place.
-                let skip = if k == 0 {
-                    lat.min(seg.frames.saturating_sub(project::MIN_CLIP))
-                } else {
-                    0
-                };
+                // Tout est décalé de la latence : le début de la prise (ce qui tombe avant
+                // la latence) est sauté, la prise tombe en place.
+                let skip = lat
+                    .saturating_sub(seg.start)
+                    .min(seg.frames.saturating_sub(project::MIN_CLIP));
+                let pos = (start + seg.start + skip).saturating_sub(lat).max(start);
                 if let Some(tr) = self.project.track_mut(r.track_id) {
                     tr.clips.push(Clip {
                         id,
@@ -1052,7 +1069,6 @@ impl App {
                         fade_out: 0,
                     });
                 }
-                pos += seg.frames - skip;
             }
             max_len = max_len.max(r.frames());
         }
@@ -1785,6 +1801,8 @@ impl App {
                     }
                 }
                 self.board = b;
+                // Le pad supprimé pointerait vers l'ancienne session.
+                self.sb.deleted = None;
                 self.retain_sounds();
                 let paths: Vec<PathBuf> =
                     self.board.all_pads().map(|(_, p)| p.path.clone()).collect();
@@ -2254,16 +2272,37 @@ impl App {
             m[0].update(v[0], now, dt);
             m[1].update(v[1], now, dt);
         }
-        if now - self.disk_checked > 2.0 {
-            self.disk_checked = now;
-            let mut p: &Path = &self.project.dir;
-            while !p.exists() {
-                match p.parent() {
-                    Some(pp) => p = pp,
-                    None => break,
+        // Espace libre mesuré dans un thread : un disque lent, en veille ou réseau
+        // déconnecté ne fige jamais l'interface (une seule mesure en cours à la fois).
+        if let Some(rx) = &self.disk_job {
+            match rx.try_recv() {
+                Ok(free) => {
+                    self.disk_free = free;
+                    self.disk_job = None;
                 }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.disk_job = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            self.disk_free = fs4::available_space(p).ok();
+        }
+        if now - self.disk_checked > 2.0 && self.disk_job.is_none() {
+            self.disk_checked = now;
+            let dir = self.project.dir.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("tracksplus-disk-space".into())
+                .spawn(move || {
+                    let mut p: &Path = &dir;
+                    while !p.exists() {
+                        match p.parent() {
+                            Some(pp) => p = pp,
+                            None => break,
+                        }
+                    }
+                    let _ = tx.send(fs4::available_space(p).ok());
+                });
+            if spawned.is_ok() {
+                self.disk_job = Some(rx);
+            }
         }
     }
 
