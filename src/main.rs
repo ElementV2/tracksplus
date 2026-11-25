@@ -229,7 +229,7 @@ fn main() -> eframe::Result {
         (END_WRITERS_CRASH, END_BACKUPS_CRASH)
     };
     recorder::emergency_finish(writers);
-    recorder::wait_backups(backups);
+    recorder::wait_backups(backups, backups);
     match res {
         Ok(r) => r,
         Err(_) => {

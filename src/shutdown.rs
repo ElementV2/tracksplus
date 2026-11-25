@@ -131,7 +131,7 @@ fn end_session_now() {
     if take_save_request() {
         write_pending_saves();
     }
-    crate::recorder::wait_backups(END_SESSION_BACKUPS);
+    crate::recorder::wait_backups(END_SESSION_BACKUPS, END_SESSION_BACKUPS);
     SESSION_ENDED.store(true, Ordering::Release);
 }
 

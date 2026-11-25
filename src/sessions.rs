@@ -18,6 +18,9 @@ pub struct SessionInfo {
     #[cfg_attr(not(test), allow(dead_code))]
     pub tracks: usize,
     pub takes: usize,
+    /// Un enregistrement n'y a pas été terminé (journal de secours présent) : ses prises
+    /// seront récupérées à l'ouverture.
+    pub interrupted: bool,
     /// Textes calculés une fois à la lecture (pas à chaque image) : date lisible,
     /// résumé « 4 pistes · 12 prises · 12:34 », nom en minuscules pour la recherche.
     pub date: String,
@@ -301,6 +304,10 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
                 takes: 0,
                 date: fmt_date(modified),
                 summary,
+                // Une prise interrompue reste à récupérer même si le fichier est abîmé.
+                interrupted: path
+                    .parent()
+                    .is_some_and(|d| crate::recovery::journal_path(d).exists()),
             });
         }
     };
@@ -308,9 +315,15 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
     let tracks = p.tracks.len();
     let takes = p.tracks.iter().map(|t| t.clips.len()).sum();
     let duration = p.end() as f64 / sr;
+    let interrupted = path
+        .parent()
+        .is_some_and(|d| crate::recovery::journal_path(d).exists());
     let mut summary = fmt_summary(tracks, takes, duration);
     if p.read_only.is_some() {
         summary += " · version plus récente (lecture seule)";
+    }
+    if interrupted {
+        summary = format!("Prise interrompue : ouvrir pour la récupérer · {summary}");
     }
     Some(SessionInfo {
         path: path.to_path_buf(),
@@ -319,6 +332,7 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
         modified,
         tracks,
         takes,
+        interrupted,
         date: fmt_date(modified),
         summary,
     })
@@ -408,6 +422,25 @@ mod tests {
         println!("accueil : {} sessions lues en {d:?}", infos.len());
         assert_eq!(infos.len(), 300);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Session dont un enregistrement n'est pas terminé : signalée dans l'accueil, même si
+    /// le fichier de session ne connaît encore aucune prise.
+    #[test]
+    fn info_flags_interrupted_recording() {
+        let dir = std::env::temp_dir().join(format!("tp-info-int-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("I".into(), dir.clone(), 48000);
+        p.add_track(None, Some(0));
+        p.save().unwrap();
+        let i = info(&p.file_path()).unwrap();
+        assert!(!i.interrupted);
+        assert_eq!(i.summary, "1 piste · vide");
+        std::fs::write(crate::recovery::journal_path(&dir), "{}").unwrap();
+        let i = info(&p.file_path()).unwrap();
+        assert!(i.interrupted);
+        assert!(i.summary.starts_with("Prise interrompue"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
