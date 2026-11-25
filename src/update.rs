@@ -143,7 +143,9 @@ impl Updater {
         if self.busy() {
             return;
         }
-        let dir = std::env::temp_dir().join("TracksPlus-update");
+        // Dossier propre à ce téléchargement, dans les données de l'utilisateur (pas dans
+        // %TEMP%, où tout programme dépose et remplace des fichiers).
+        let dir = update_root().join(random_name());
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join(sanitize_file_name(&name));
         // Écrit d'abord dans `<nom>.part` : l'installeur n'existe sous son vrai nom qu'une
@@ -189,6 +191,44 @@ impl Updater {
     }
 }
 
+/// Dossier des installeurs téléchargés : `%LOCALAPPDATA%\TracksPlus\update`.
+fn update_root() -> PathBuf {
+    dirs::data_local_dir()
+        .map(|d| d.join("TracksPlus").join("update"))
+        .unwrap_or_else(|| std::env::temp_dir().join("TracksPlus-update"))
+}
+
+/// Nom de dossier imprévisible (un autre programme ne peut pas le préparer à l'avance).
+fn random_name() -> String {
+    use sha2::{Digest, Sha256};
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = Sha256::new();
+    h.update(
+        COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    h.update(t.as_nanos().to_le_bytes());
+    h.update(std::process::id().to_le_bytes());
+    let local = 0u8;
+    h.update((&local as *const u8 as usize).to_le_bytes());
+    h.update(format!("{:?}", std::thread::current().id()).as_bytes());
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Retire les installeurs d'un lancement précédent (mis à jour ou abandonnés), ancien
+/// emplacement dans %TEMP% compris. À appeler au démarrage, avant tout téléchargement.
+pub fn clean_downloads() {
+    let _ = std::fs::remove_dir_all(update_root());
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("TracksPlus-update"));
+}
+
 /// Fichier temporaire d'un téléchargement : `<fichier>.part`.
 fn part_path(file: &Path) -> PathBuf {
     let mut n = file.file_name().unwrap_or_default().to_os_string();
@@ -217,9 +257,38 @@ fn verify_download(file: &Path, size: u64, sha256: Option<&str>) -> Result<(), S
 
 /// Empreinte SHA-256 d'un fichier (hexadécimal minuscule), lu par blocs.
 fn sha256_file(path: &Path) -> std::io::Result<String> {
+    sha256_reader(std::fs::File::open(path)?)
+}
+
+/// Ouvre l'installeur sans partage en écriture ni en suppression (Windows) : tant que le
+/// fichier rendu reste ouvert, personne ne peut le modifier, le remplacer ni le renommer.
+/// Son empreinte est vérifiée à travers ce même accès.
+fn open_verified(file: &Path, sha256: Option<&str>) -> Result<std::fs::File, String> {
+    let want = sha256.ok_or("empreinte inconnue : installeur impossible à vérifier")?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ seulement.
+        opts.share_mode(0x0000_0001);
+    }
+    let f = opts
+        .open(file)
+        .map_err(|e| format!("installeur inaccessible : {e}"))?;
+    let have = sha256_reader(&f).map_err(|e| format!("installeur illisible : {e}"))?;
+    if have != want {
+        return Err(
+            "installeur modifié depuis son téléchargement (empreinte SHA-256 différente) : \
+             mise à jour annulée"
+                .into(),
+        );
+    }
+    Ok(f)
+}
+
+fn sha256_reader(mut f: impl std::io::Read) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -288,7 +357,13 @@ fn install_mode(exe_dir: &Path, program_dirs: &[PathBuf]) -> &'static str {
 /// Lance l'installeur téléchargé en mode silencieux (fenêtre de progression seulement) ;
 /// il ferme l'ancienne version, installe à la même place, puis relance TracksPlus.
 /// L'application doit se fermer juste après.
-pub fn launch_installer(file: &Path) -> Result<(), String> {
+///
+/// L'installeur peut attendre des heures (installation reportée pendant le spectacle) : son
+/// empreinte est revérifiée juste avant, et le fichier reste verrouillé entre cette
+/// vérification et le lancement. Un programme qui l'aurait remplacé entre-temps ne reçoit
+/// jamais les droits que l'utilisateur accorde à la mise à jour.
+pub fn launch_installer(file: &Path, sha256: Option<&str>) -> Result<(), String> {
+    let locked = open_verified(file, sha256)?;
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
@@ -308,7 +383,7 @@ pub fn launch_installer(file: &Path) -> Result<(), String> {
             install_mode(&exe_dir, &program_dirs),
         ])
         .spawn()
-        .map(|_| ())
+        .map(|_| drop(locked))
         .map_err(|e| format!("impossible de lancer l'installeur : {e}"))
 }
 
@@ -658,6 +733,35 @@ mod tests {
                 .unwrap_err()
                 .contains("empreinte inconnue")
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Au lancement : empreinte revérifiée, et fichier verrouillé jusqu'au lancement (ni
+    /// modifiable, ni remplaçable, ni renommable entre-temps).
+    #[test]
+    fn installer_is_reverified_and_locked_before_launch() {
+        let dir = std::env::temp_dir().join(format!("tp-updlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("TracksPlus-Setup.exe");
+        std::fs::write(&f, b"abc").unwrap();
+        assert!(open_verified(&f, None).is_err());
+        let held = open_verified(&f, Some(ABC_SHA256)).unwrap();
+        #[cfg(windows)]
+        {
+            assert!(std::fs::OpenOptions::new().write(true).open(&f).is_err());
+            assert!(std::fs::rename(&f, dir.join("autre.exe")).is_err());
+            assert!(std::fs::remove_file(&f).is_err());
+        }
+        drop(held);
+        // Remplacé après le téléchargement : refusé.
+        std::fs::write(&f, b"abd").unwrap();
+        let e = open_verified(&f, Some(ABC_SHA256)).unwrap_err();
+        assert!(e.contains("modifié"), "{e}");
+        assert!(launch_installer(&f, Some(ABC_SHA256)).is_err());
+        // Dossiers de téléchargement imprévisibles.
+        assert_ne!(random_name(), random_name());
+        assert_eq!(random_name().len(), 16);
         std::fs::remove_dir_all(dir).ok();
     }
 

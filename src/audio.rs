@@ -572,7 +572,9 @@ impl Engine {
 
         let (garbage_tx, garbage_rx) = bounded(16);
         let (in_garbage_tx, in_garbage_rx) = bounded(16);
-        let (sample_garbage_tx, sample_garbage_rx) = bounded(256);
+        let (sample_garbage_tx, sample_garbage_rx) = bounded(crate::sampler::SAMPLE_GARBAGE);
+        // Vidée en continu, même quand l'interface est bloquée (sélecteur de fichiers).
+        crate::sampler::spawn_janitor(sample_garbage_rx.clone());
         let mut pad_tx = None;
         let mut status = EngineStatus {
             host: host_name,

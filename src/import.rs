@@ -2,25 +2,36 @@
 //! (WAV, AIFF, MP3, FLAC, Ogg, M4A…), conversion à la fréquence de la session, écriture
 //! d'un WAV 32 bits flottant dans le dossier « Audio » de la session. L'original n'est
 //! jamais modifié. Tout se fait par blocs : un morceau de plusieurs heures n'est jamais
-//! chargé en entier en mémoire.
+//! chargé en entier en mémoire. Comme une prise, un import long est découpé en fichiers
+//! de 2 Go au plus (`nom.wav`, `nom_p2.wav`…) : un WAV ne peut pas dépasser 4 Gio.
+//!
+//! Dans l'application, chaque fichier est décodé dans un processus fils (voir `isolate`) :
+//! un fichier piégé n'arrête que lui.
 
+use crate::decode::Converter;
+use crate::recorder::{MAX_SEGMENT_BYTES, segment_name};
 use anyhow::{Context, Result, anyhow, bail};
-use rubato::{FftFixedIn, Resampler};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 
-const CHUNK: usize = 8192;
-
 /// Un fichier importé, prêt à être posé sur une nouvelle piste.
 pub struct Imported {
     /// Nom de la piste (nom du fichier d'origine, sans extension).
     pub name: String,
-    /// Fichier écrit dans le dossier « Audio » de la session.
-    pub file: String,
-    pub frames: u64,
+    /// Fichiers écrits dans le dossier « Audio » de la session, dans l'ordre, avec leur
+    /// longueur (trames) : un par tranche de 2 Go, posés bout à bout sur la piste.
+    pub segments: Vec<(String, u64)>,
     pub stereo: bool,
+}
+
+impl Imported {
+    /// Longueur totale (trames).
+    #[cfg(test)]
+    pub fn frames(&self) -> u64 {
+        self.segments.iter().map(|(_, n)| n).sum()
+    }
 }
 
 /// Import annulé par l'utilisateur.
@@ -76,18 +87,35 @@ impl ImportJob {
                         );
                         !c2.load(Ordering::Relaxed)
                     };
-                    // Un fichier qui fait planter le décodeur ne fait pas planter l'import.
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        import_file(&src, &audio_dir, &file, sample_rate, &tick)
-                    }))
-                    .unwrap_or_else(|_| Err(anyhow!("fichier illisible (erreur du décodeur)")));
+                    // Dans un processus fils quand c'est possible : un fichier piégé n'arrête
+                    // que lui. Sinon ici, et un fichier qui fait planter le décodeur ne fait
+                    // pas planter l'import.
+                    let r =
+                        crate::isolate::import(&src, &audio_dir, &file, sample_rate, &tick, &c2)
+                            .unwrap_or_else(|| {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    import_file(
+                                        &src,
+                                        &audio_dir,
+                                        &file,
+                                        sample_rate,
+                                        &tick,
+                                        &|_| {},
+                                    )
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow!("fichier illisible (erreur du décodeur)"))
+                                })
+                            });
                     out.push((src, r));
                 }
                 // Annulé : les fichiers déjà convertis ne servent à rien, on les retire.
                 if c2.load(Ordering::Relaxed) {
                     for (_, r) in &mut out {
                         if let Ok(i) = r {
-                            let _ = std::fs::remove_file(audio_dir.join(&i.file));
+                            for (f, _) in &i.segments {
+                                let _ = std::fs::remove_file(audio_dir.join(f));
+                            }
                         }
                         *r = Err(Cancelled.into());
                     }
@@ -116,95 +144,213 @@ impl ImportJob {
     }
 }
 
-/// Fichier en cours d'écriture : supprimé s'il n'a pas été validé (erreur, annulation).
-struct Part(Option<PathBuf>);
+/// Retire les fichiers d'un import interrompu : segments terminés et fichiers « .part »
+/// (celui en cours d'écriture compris).
+pub fn remove_segments(audio_dir: &Path, file: &str, done: &[(String, u64)]) {
+    for (f, _) in done {
+        let _ = std::fs::remove_file(audio_dir.join(f));
+    }
+    for k in 1..=done.len() + 1 {
+        let _ = std::fs::remove_file(audio_dir.join(format!("{}.part", segment_name(file, k))));
+    }
+}
 
-impl Drop for Part {
+/// Étape d'un fichier de l'import (voir `import_file`).
+pub enum SegmentEvent<'a> {
+    /// Nom définitif encore libre : le fichier terminé va y être renommé.
+    Naming(&'a str),
+    /// Fichier terminé sous son nom définitif (nom, trames).
+    Done(&'a str, u64),
+}
+
+/// Écriture découpée en fichiers de `max_bytes` au plus. Tout fichier non validé
+/// (erreur, annulation) est retiré, segments déjà terminés compris.
+struct Segments<'a> {
+    dir: &'a Path,
+    base: &'a str,
+    spec: hound::WavSpec,
+    channels: usize,
+    /// Trames par fichier au plus.
+    max_frames: u64,
+    writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
+    frames: u64,
+    done: Vec<(String, u64)>,
+    on_segment: &'a dyn Fn(SegmentEvent<'_>),
+    committed: bool,
+}
+
+impl<'a> Segments<'a> {
+    fn new(
+        dir: &'a Path,
+        base: &'a str,
+        spec: hound::WavSpec,
+        max_bytes: u64,
+        on_segment: &'a dyn Fn(SegmentEvent<'_>),
+    ) -> Self {
+        let channels = spec.channels as usize;
+        // En-tête WAV (44 octets) compris ; 4 octets par échantillon.
+        let max_frames = (max_bytes.saturating_sub(44) / (4 * channels as u64)).max(1);
+        Self {
+            dir,
+            base,
+            spec,
+            channels,
+            max_frames,
+            writer: None,
+            frames: 0,
+            done: Vec::new(),
+            on_segment,
+            committed: false,
+        }
+    }
+
+    fn name(&self) -> String {
+        segment_name(self.base, self.done.len() + 1)
+    }
+
+    fn part(&self) -> PathBuf {
+        self.dir.join(format!("{}.part", self.name()))
+    }
+
+    fn write(&mut self, mut block: &[f32]) -> Result<()> {
+        while !block.is_empty() {
+            if self.writer.is_none() {
+                let part = self.part();
+                let _ = std::fs::remove_file(&part);
+                self.writer = Some(
+                    hound::WavWriter::create(&part, self.spec)
+                        .context("écriture dans le dossier Audio")?,
+                );
+                self.frames = 0;
+            }
+            let room = (self.max_frames - self.frames) as usize;
+            let n = (block.len() / self.channels).min(room);
+            let w = self.writer.as_mut().unwrap();
+            for &x in &block[..n * self.channels] {
+                w.write_sample(if x.is_finite() { x } else { 0.0 })
+                    .map_err(write_err)?;
+            }
+            self.frames += n as u64;
+            block = &block[n * self.channels..];
+            if self.frames >= self.max_frames {
+                self.close()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Termine le fichier en cours : en-tête, écriture forcée sur le disque, nom définitif.
+    fn close(&mut self) -> Result<()> {
+        let Some(w) = self.writer.take() else {
+            return Ok(());
+        };
+        let part = self.part();
+        let name = self.name();
+        let dst = self.dir.join(&name);
+        w.finalize().map_err(write_err)?;
+        // Écriture forcée sur le disque (Windows : le fichier doit être ouvert en écriture).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .and_then(|f| f.sync_all())
+            .context("écriture sur le disque")?;
+        // Annoncé avant le renommage : un processus fils arrêté juste après laisse un
+        // fichier que l'application sait être le sien (et retire).
+        (self.on_segment)(SegmentEvent::Naming(&name));
+        // Jamais par-dessus une prise existante (renommage qui refuse d'écraser).
+        match crate::project::rename_no_replace(&part, &dst) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("« {name} » existe déjà dans le dossier Audio")
+            }
+            r => r.context("écriture dans le dossier Audio")?,
+        }
+        self.done.push((name.clone(), self.frames));
+        (self.on_segment)(SegmentEvent::Done(&name, self.frames));
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<(String, u64)>> {
+        self.close()?;
+        self.committed = true;
+        Ok(std::mem::take(&mut self.done))
+    }
+}
+
+impl Drop for Segments<'_> {
     fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_file(p);
+        if !self.committed {
+            drop(self.writer.take());
+            remove_segments(self.dir, self.base, &self.done);
         }
     }
 }
 
 /// Décode `src`, le convertit à `sr` et l'écrit dans `audio_dir/file` (WAV 32 bits
-/// flottant, mono ou stéréo comme l'original ; au-delà de 2 canaux, les deux premiers).
-/// `on_progress(f)` renvoie `false` pour annuler.
+/// flottant, mono ou stéréo comme l'original ; au-delà de 2 canaux, les deux premiers),
+/// découpé en fichiers de 2 Go au plus. `on_progress(f)` renvoie `false` pour annuler ;
+/// `on_segment` suit chaque fichier : son nom juste avant qu'il n'y soit renommé, puis
+/// le fichier terminé.
 pub fn import_file(
     src: &Path,
     audio_dir: &Path,
     file: &str,
     sr: u32,
     on_progress: &dyn Fn(f64) -> bool,
+    on_segment: &dyn Fn(SegmentEvent<'_>),
+) -> Result<Imported> {
+    import_file_limited(
+        src,
+        audio_dir,
+        file,
+        sr,
+        on_progress,
+        on_segment,
+        MAX_SEGMENT_BYTES,
+    )
+}
+
+fn import_file_limited(
+    src: &Path,
+    audio_dir: &Path,
+    file: &str,
+    sr: u32,
+    on_progress: &dyn Fn(f64) -> bool,
+    on_segment: &dyn Fn(SegmentEvent<'_>),
+    max_bytes: u64,
 ) -> Result<Imported> {
     use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
     use symphonia::core::errors::Error as SymError;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
-    let f = std::fs::File::open(src).context("ouverture impossible")?;
-    let mss = MediaSourceStream::new(Box::new(f), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = src.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
+    if !crate::decode::VALID_SOURCE_RATES.contains(&sr) {
+        bail!("fréquence de la session invalide ({sr} Hz)");
     }
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| anyhow!("format non reconnu ({e})"))?;
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| anyhow!("aucune piste audio dans le fichier"))?;
-    let track_id = track.id;
-    let src_sr = track
-        .codec_params
-        .sample_rate
-        .ok_or_else(|| anyhow!("fréquence d'échantillonnage inconnue"))?;
-    let channels = track
-        .codec_params
-        .channels
-        .map_or(2, |c| c.count())
-        .clamp(1, 2);
-    let total = track.codec_params.n_frames;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| anyhow!("codec non pris en charge ({e})"))?;
+    let crate::decode::Opened {
+        mut format,
+        mut decoder,
+        track_id,
+        sample_rate,
+        channels,
+        n_frames: total,
+        mut trim,
+        ..
+    } = crate::decode::open(src)?;
+    // Fréquence déjà bornée par `decode::open` : un en-tête fantaisiste ne dimensionne
+    // jamais le rééchantillonneur.
+    let src_sr = sample_rate.ok_or_else(|| anyhow!("fréquence d'échantillonnage inconnue"))?;
+    let channels = channels.unwrap_or(2).clamp(1, 2);
+    let mut conv = Converter::new(channels, src_sr, sr)?;
 
     std::fs::create_dir_all(audio_dir).context("création du dossier Audio")?;
-    let dst = audio_dir.join(file);
-    let part_path = audio_dir.join(format!("{file}.part"));
-    let mut part = Part(Some(part_path.clone()));
     let spec = hound::WavSpec {
         channels: channels as u16,
         sample_rate: sr,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-    let mut writer =
-        hound::WavWriter::create(&part_path, spec).context("écriture dans le dossier Audio")?;
-    let mut conv = Converter::new(channels, src_sr, sr)?;
+    let mut out = Segments::new(audio_dir, file, spec, max_bytes, on_segment);
     let mut buf: Option<SampleBuffer<f32>> = None;
     let mut read = 0u64;
-    let mut written = 0u64;
-    let mut write = |block: &[f32]| -> Result<()> {
-        for &x in block {
-            writer
-                .write_sample(if x.is_finite() { x } else { 0.0 })
-                .map_err(write_err)?;
-        }
-        written += (block.len() / channels) as u64;
-        Ok(())
-    };
+    let mut write = |block: &[f32]| -> Result<()> { out.write(block) };
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -228,41 +374,28 @@ pub fn import_file(
             *b = SampleBuffer::new(decoded.capacity() as u64, dspec);
         }
         b.copy_interleaved_ref(decoded);
-        let frames = b.samples().len() / ch;
-        read += frames as u64;
-        conv.push(b.samples(), ch, &mut write)?;
+        // Délai d'encodeur et bourrage retirés : l'import reste calé sur l'original.
+        let kept = trim.apply(b.samples(), ch);
+        read += (kept.len() / ch) as u64;
+        conv.push(kept, ch, &mut write)?;
         let f = total.map_or(0.0, |t| read as f64 / t.max(1) as f64);
         if !on_progress(f) {
             return Err(Cancelled.into());
         }
     }
     conv.finish(&mut write)?;
-    if written == 0 {
+    drop(write);
+    if out.done.is_empty() && out.frames == 0 {
         bail!("le fichier ne contient pas de son");
     }
-    writer.finalize().map_err(write_err)?;
-    // Écriture forcée sur le disque (Windows : le fichier doit être ouvert en écriture).
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&part_path)
-        .and_then(|f| f.sync_all())
-        .context("écriture sur le disque")?;
-    // Jamais par-dessus un fichier existant (autre prise du même nom) : il serait perdu.
-    match crate::project::rename_no_replace(&part_path, &dst) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            bail!("un fichier « {file} » existe déjà dans le dossier Audio")
-        }
-        r => r.context("écriture dans le dossier Audio")?,
-    }
-    part.0 = None;
+    let segments = out.finish()?;
     let name = src
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Import".into());
     Ok(Imported {
         name,
-        file: file.to_string(),
-        frames: written,
+        segments,
         stereo: channels == 2,
     })
 }
@@ -273,148 +406,6 @@ fn write_err(e: hound::Error) -> anyhow::Error {
             anyhow!("disque plein : libérez de la place puis recommencez")
         }
         e => anyhow!("écriture dans le dossier Audio ({e})"),
-    }
-}
-
-/// Conversion par blocs : canaux (1 ou 2) puis fréquence, avec la longueur exacte.
-struct Converter {
-    channels: usize,
-    rs: Option<FftFixedIn<f32>>,
-    /// Échantillons en attente d'un bloc complet, par canal.
-    pending: Vec<Vec<f32>>,
-    out: Vec<Vec<f32>>,
-    skip: usize,
-    read: u64,
-    written: u64,
-    ratio: (u64, u64),
-    inter: Vec<f32>,
-}
-
-impl Converter {
-    fn new(channels: usize, from: u32, to: u32) -> Result<Self> {
-        let rs = if from != to {
-            Some(FftFixedIn::<f32>::new(
-                from as usize,
-                to as usize,
-                CHUNK,
-                2,
-                channels,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            channels,
-            skip: rs.as_ref().map_or(0, |r| r.output_delay()),
-            out: rs
-                .as_ref()
-                .map_or_else(Vec::new, |r| r.output_buffer_allocate(true)),
-            rs,
-            pending: vec![Vec::with_capacity(CHUNK * 2); channels],
-            read: 0,
-            written: 0,
-            ratio: (to as u64, from as u64),
-            inter: Vec::new(),
-        })
-    }
-
-    /// Ajoute des échantillons entrelacés sur `ch` canaux.
-    fn push(
-        &mut self,
-        samples: &[f32],
-        ch: usize,
-        sink: &mut impl FnMut(&[f32]) -> Result<()>,
-    ) -> Result<()> {
-        for frame in samples.chunks_exact(ch) {
-            for (j, p) in self.pending.iter_mut().enumerate() {
-                p.push(frame[j.min(ch - 1)]);
-            }
-        }
-        self.read += (samples.len() / ch) as u64;
-        if self.rs.is_none() {
-            return self.drain_direct(sink);
-        }
-        while self.pending[0].len() >= CHUNK {
-            self.process(CHUNK, false, sink)?;
-        }
-        Ok(())
-    }
-
-    fn drain_direct(&mut self, sink: &mut impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
-        let n = self.pending[0].len();
-        self.inter.clear();
-        for f in 0..n {
-            for p in &self.pending {
-                self.inter.push(p[f]);
-            }
-        }
-        for p in &mut self.pending {
-            p.clear();
-        }
-        self.written += n as u64;
-        sink(&self.inter)
-    }
-
-    fn process(
-        &mut self,
-        n: usize,
-        partial: bool,
-        sink: &mut impl FnMut(&[f32]) -> Result<()>,
-    ) -> Result<()> {
-        let Some(rs) = &mut self.rs else {
-            return Ok(());
-        };
-        let input: Vec<&[f32]> = self.pending.iter().map(|p| &p[..n]).collect();
-        let (_, got) = if partial {
-            rs.process_partial_into_buffer(Some(&input), &mut self.out, None)?
-        } else {
-            rs.process_into_buffer(&input, &mut self.out, None)?
-        };
-        for p in &mut self.pending {
-            p.drain(..n);
-        }
-        self.emit(got, sink)
-    }
-
-    fn emit(&mut self, got: usize, sink: &mut impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
-        let expected =
-            (self.read as u128 * self.ratio.0 as u128).div_ceil(self.ratio.1 as u128) as u64;
-        let start = self.skip.min(got);
-        self.skip -= start;
-        let take = ((got - start) as u64).min(expected.saturating_sub(self.written)) as usize;
-        if take == 0 {
-            return Ok(());
-        }
-        self.inter.clear();
-        for f in start..start + take {
-            for c in &self.out[..self.channels] {
-                self.inter.push(c[f]);
-            }
-        }
-        self.written += take as u64;
-        sink(&self.inter)
-    }
-
-    /// Fin du fichier : dernier bloc et latence du filtre.
-    fn finish(&mut self, sink: &mut impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
-        if self.rs.is_none() {
-            return self.drain_direct(sink);
-        }
-        let n = self.pending[0].len();
-        if n > 0 {
-            self.process(n, true, sink)?;
-        }
-        let expected =
-            (self.read as u128 * self.ratio.0 as u128).div_ceil(self.ratio.1 as u128) as u64;
-        let mut guard = 0;
-        while self.written < expected && guard < 64 {
-            let Some(rs) = &mut self.rs else { break };
-            let (_, got) =
-                rs.process_partial_into_buffer::<&[f32], _>(None, &mut self.out, None)?;
-            self.emit(got, sink)?;
-            guard += 1;
-        }
-        Ok(())
     }
 }
 
@@ -446,6 +437,15 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    fn no_part_left(audio: &Path) -> bool {
+        std::fs::read_dir(audio)
+            .map(|rd| {
+                rd.flatten()
+                    .all(|e| !e.file_name().to_string_lossy().ends_with(".part"))
+            })
+            .unwrap_or(true)
+    }
+
     #[test]
     fn imports_and_converts() {
         let d = tmp("conv");
@@ -458,31 +458,118 @@ mod tests {
             "chanson_001.wav",
             48000,
             &|_| true,
+            &|_| {},
         )
         .unwrap();
         assert!(i.stereo);
         assert_eq!(i.name, "chanson");
         let want = ((44100u64 * 3 + 17) * 48000).div_ceil(44100);
-        assert_eq!(i.frames, want);
+        assert_eq!(i.frames(), want);
+        assert_eq!(i.segments, vec![("chanson_001.wav".to_string(), want)]);
         let r = hound::WavReader::open(audio.join("chanson_001.wav")).unwrap();
         assert_eq!(r.spec().sample_rate, 48000);
         assert_eq!(r.spec().channels, 2);
         assert_eq!(r.duration() as u64, want);
         // Mono à la même fréquence : copie exacte de la longueur.
         write_wav(&d.join("voix.wav"), 48000, 1, 12345);
-        let i = import_file(&d.join("voix.wav"), &audio, "voix_001.wav", 48000, &|_| {
-            true
-        })
+        let i = import_file(
+            &d.join("voix.wav"),
+            &audio,
+            "voix_001.wav",
+            48000,
+            &|_| true,
+            &|_| {},
+        )
         .unwrap();
         assert!(!i.stereo);
-        assert_eq!(i.frames, 12345);
+        assert_eq!(i.frames(), 12345);
         // Aucun fichier temporaire laissé.
-        let parts = std::fs::read_dir(&audio)
+        assert!(no_part_left(&audio));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Import long : découpé en fichiers bornés (comme une prise), nommés `_p2`, `_p3`…,
+    /// chacun avec un en-tête juste. Sans cela, au-delà de 4 Gio, la taille 32 bits du WAV
+    /// déborde et la fin de l'import devient muette.
+    #[test]
+    fn long_import_is_split_into_segments() {
+        let d = tmp("split");
+        let audio = d.join("Audio");
+        write_wav(&d.join("concert.wav"), 48000, 2, 10_000);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let named = std::cell::RefCell::new(Vec::<String>::new());
+        // 1 000 trames stéréo flottantes par fichier (8 000 octets + en-tête).
+        let i = import_file_limited(
+            &d.join("concert.wav"),
+            &audio,
+            "concert_001.wav",
+            48000,
+            &|_| true,
+            &|e| match e {
+                // Chaque nom est annoncé avant que le fichier n'y soit renommé.
+                SegmentEvent::Naming(n) => {
+                    assert!(!audio.join(n).exists());
+                    named.borrow_mut().push(n.to_string());
+                }
+                SegmentEvent::Done(n, f) => {
+                    assert_eq!(named.borrow().last().map(String::as_str), Some(n));
+                    seen.borrow_mut().push((n.to_string(), f));
+                }
+            },
+            8_044,
+        )
+        .unwrap();
+        assert_eq!(i.frames(), 10_000);
+        assert_eq!(i.segments.len(), 10);
+        assert_eq!(i.segments[0].0, "concert_001.wav");
+        assert_eq!(i.segments[1].0, "concert_001_p2.wav");
+        assert_eq!(*seen.borrow(), i.segments);
+        assert_eq!(named.borrow().len(), 10);
+        for (f, n) in &i.segments {
+            let r = hound::WavReader::open(audio.join(f)).unwrap();
+            assert_eq!(r.duration() as u64, *n);
+        }
+        // Annulé au milieu : rien ne reste, segments terminés compris.
+        let calls = std::cell::Cell::new(0);
+        let e = import_file_limited(
+            &d.join("concert.wav"),
+            &audio,
+            "autre_001.wav",
+            48000,
+            &|_| {
+                calls.set(calls.get() + 1);
+                calls.get() < 3
+            },
+            &|_| {},
+            8_044,
+        )
+        .err()
+        .unwrap();
+        assert!(e.is::<Cancelled>());
+        let left: Vec<_> = std::fs::read_dir(&audio)
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
-            .count();
-        assert_eq!(parts, 0);
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("autre"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(no_part_left(&audio));
+        // Un segment ne remplace jamais une prise existante.
+        std::fs::write(audio.join("x_001_p2.wav"), b"prise").unwrap();
+        assert!(
+            import_file_limited(
+                &d.join("concert.wav"),
+                &audio,
+                "x_001.wav",
+                48000,
+                &|_| true,
+                &|_| {},
+                8_044,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(audio.join("x_001_p2.wav")).unwrap(), b"prise");
+        assert!(!audio.join("x_001.wav").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -491,21 +578,48 @@ mod tests {
         let d = tmp("bad");
         let audio = d.join("Audio");
         std::fs::write(d.join("faux.mp3"), b"pas du son").unwrap();
-        let e = import_file(&d.join("faux.mp3"), &audio, "faux_001.wav", 48000, &|_| {
-            true
-        })
+        let e = import_file(
+            &d.join("faux.mp3"),
+            &audio,
+            "faux_001.wav",
+            48000,
+            &|_| true,
+            &|_| {},
+        )
         .err()
         .unwrap();
         assert!(e.to_string().contains("format"), "{e:#}");
         write_wav(&d.join("long.wav"), 48000, 1, 48000 * 5);
-        let e = import_file(&d.join("long.wav"), &audio, "long_001.wav", 48000, &|_| {
-            false
-        })
+        let e = import_file(
+            &d.join("long.wav"),
+            &audio,
+            "long_001.wav",
+            48000,
+            &|_| false,
+            &|_| {},
+        )
         .err()
         .unwrap();
         assert!(e.is::<Cancelled>());
         let left = std::fs::read_dir(&audio).map(|r| r.count()).unwrap_or(0);
         assert_eq!(left, 0);
+        // Fréquence fantaisiste (nombre premier de 4 GHz) : refusée avant de créer le
+        // rééchantillonneur (qui réserverait des dizaines de Go).
+        write_wav(&d.join("piege.wav"), 48000, 1, 100);
+        let mut b = std::fs::read(d.join("piege.wav")).unwrap();
+        b[24..28].copy_from_slice(&4_294_967_291u32.to_le_bytes());
+        std::fs::write(d.join("piege.wav"), &b).unwrap();
+        let e = import_file(
+            &d.join("piege.wav"),
+            &audio,
+            "piege_001.wav",
+            48000,
+            &|_| true,
+            &|_| {},
+        )
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("fréquence"), "{e:#}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

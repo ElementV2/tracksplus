@@ -1545,6 +1545,9 @@ impl App {
         // Ouverture hors du thread de l'interface quand c'est sûr : pas de gel de l'écran
         // à chaque essai. Les pilotes ASIO (objets COM du système) et CoreAudio restent
         // ouverts ici, sur le thread principal, comme à l'ouverture normale.
+        // Fréquence « Auto » : on garde celle d'avant la perte (celle des sons des pads), pour
+        // ne pas tout redécoder à chaque reconnexion partielle.
+        let keep_rate = self.cache.sample_rate();
         #[cfg(not(target_os = "macos"))]
         if self.prefs.host.as_deref() != Some("ASIO") {
             let (prefs, pad) = (self.prefs.clone(), self.prefs.pad_out());
@@ -1552,7 +1555,7 @@ impl App {
             if std::thread::Builder::new()
                 .name("tracksplus-reconnect".into())
                 .spawn(move || {
-                    let _ = tx.send(Engine::open(&prefs, &pad));
+                    let _ = tx.send(Self::reopen_engine(&prefs, &pad, keep_rate));
                 })
                 .is_ok()
             {
@@ -1560,8 +1563,26 @@ impl App {
                 return;
             }
         }
-        let opened = Engine::open(&self.prefs, &self.prefs.pad_out());
+        let opened = Self::reopen_engine(&self.prefs, &self.prefs.pad_out(), keep_rate);
         self.finish_reconnect(opened, delay);
+    }
+
+    /// Réouverture après une perte : en mode « Auto », d'abord à la fréquence d'avant (sinon
+    /// une entrée encore absente ferait démarrer à celle de la sortie, puis revenir : tous
+    /// les sons redécodés deux fois) ; si la carte ne la propose plus, en « Auto ».
+    fn reopen_engine(
+        prefs: &crate::audio::AudioPrefs,
+        pad: &crate::audio::PadOut,
+        keep_rate: u32,
+    ) -> anyhow::Result<Engine> {
+        if prefs.sample_rate.is_none() && keep_rate > 0 {
+            let mut pinned = prefs.clone();
+            pinned.sample_rate = Some(keep_rate);
+            if let Ok(e) = Engine::open(&pinned, pad) {
+                return Ok(e);
+            }
+        }
+        Engine::open(prefs, pad)
     }
 
     fn finish_reconnect(&mut self, opened: anyhow::Result<Engine>, delay: f64) {
@@ -2247,12 +2268,7 @@ impl App {
     /// ouverts (sécurité, voir `Board::load_session`).
     fn park_network_pads(&mut self, paths: &[PathBuf]) {
         for p in paths {
-            self.cache.map.insert(
-                p.clone(),
-                crate::soundboard::LoadState::Failed(
-                    "Son sur un partage réseau, hors de la session : remplacez-le (clic droit) pour le copier dans la session".into(),
-                ),
-            );
+            self.cache.park(p);
         }
     }
 
@@ -2281,7 +2297,7 @@ impl App {
         if !network.is_empty() {
             self.park_network_pads(&network);
             warnings.push(format!(
-                "{} son(s) du soundboard sur un partage réseau non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
+                "{} son(s) du soundboard hors de la session (partage réseau ou chemin douteux) non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
                 network.len()
             ));
         }
@@ -2350,16 +2366,9 @@ impl App {
                 return;
             }
         };
-        for page in &mut b.pages {
-            for pad in page.pads.iter_mut().flatten() {
-                // Fichier reçu d'ailleurs : jamais de partage réseau ouvert tout seul.
-                if crate::soundboard::is_network_path(&pad.path) {
-                    b.network_pads.push(pad.path.clone());
-                } else if pad.path.is_relative() {
-                    pad.path = dir.join(&pad.path);
-                }
-            }
-        }
+        // Fichier reçu d'ailleurs : jamais de partage réseau ni de fichier hors de son
+        // dossier ouvert (ou copié) tout seul.
+        b.resolve_paths(&dir);
         // Copie des sons dans la session en arrière-plan (fenêtre d'attente).
         let dir = self.project.dir.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4146,18 +4155,24 @@ impl App {
                     }
                     _ => self.project.add_audio_track(i.name.clone(), i.stereo),
                 };
-                let cid = self.project.alloc_id();
-                if let Some(t) = self.project.track_mut(tid) {
-                    t.clips.push(Clip {
-                        id: cid,
-                        file: i.file,
-                        start: at,
-                        offset: 0,
-                        len: i.frames,
-                        src_len: i.frames,
-                        fade_in: 0,
-                        fade_out: 0,
-                    });
+                // Import long : un fichier par tranche de 2 Go, posés bout à bout (comme les
+                // segments d'une prise).
+                let mut start = at;
+                for (file, frames) in i.segments {
+                    let cid = self.project.alloc_id();
+                    if let Some(t) = self.project.track_mut(tid) {
+                        t.clips.push(Clip {
+                            id: cid,
+                            file,
+                            start,
+                            offset: 0,
+                            len: frames,
+                            src_len: frames,
+                            fade_in: 0,
+                            fade_out: 0,
+                        });
+                    }
+                    start += frames;
                 }
             }
             self.project.dirty = true;

@@ -17,19 +17,58 @@ $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
 Write-Host "== TracksPlus $version"
 
 # --- SDK ASIO
+# Ses sources sont compilées dans TracksPlus.exe, distribué à tous par la mise à jour
+# automatique : version épinglée, archive et sources vérifiées par leur empreinte SHA-256.
+# Nouvelle version du SDK : mettre à jour les trois valeurs ensemble, après vérification.
+$asioUrl = 'https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip'
+$asioZipSha256 = 'D5EBF0C20DD2C5F43771FD0C1418F4B361BF52434EE670097CFA6B3A335E2ECA'
+# Empreinte des sources (.cpp, .h, .c : chemin relatif et SHA-256, triés), voir Get-SdkTreeHash.
+$asioTreeSha256 = 'A766723D8D7D78BCD85A9F7F0F8ED5FF62A35620D1A58FBDB6864FF335AAE6A6'
+# Même SDK pris dans le miroir de build-windows.sh (commit épinglé, fins de ligne du dépôt).
+$asioMirrorTreeSha256 = '7D50CEAD9BC096C64253F33D60C3FC6C33531928724187E31B755E086F4BB090'
+
+function Get-SdkTreeHash($dir) {
+    $base = (Resolve-Path $dir).Path.TrimEnd('\') + '\'
+    [string[]]$lines = Get-ChildItem $dir -Recurse -File -Include *.cpp, *.h, *.c |
+        ForEach-Object { $_.FullName.Substring($base.Length).Replace('\', '/') + ':' + (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
+    [Array]::Sort($lines, [StringComparer]::Ordinal)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('X2') }) -join ''
+}
+
 $sdk = if ($env:CPAL_ASIO_DIR) { $env:CPAL_ASIO_DIR } else { Join-Path $root 'target\asio-sdk' }
 if (-not (Test-Path (Join-Path $sdk 'host\asiodrivers.h'))) {
     Write-Host "== Téléchargement du SDK ASIO (steinberg.net)"
     $tmp = Join-Path $root 'target\asio-sdk-download'
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $tmp | Out-Null
-    Invoke-WebRequest -Uri 'https://www.steinberg.net/asiosdk' -OutFile (Join-Path $tmp 'asiosdk.zip')
-    Expand-Archive (Join-Path $tmp 'asiosdk.zip') -DestinationPath (Join-Path $tmp 'x') -Force
+    $zipPath = Join-Path $tmp 'asiosdk.zip'
+    Invoke-WebRequest -Uri $asioUrl -OutFile $zipPath
+    $got = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+    if ($got -ne $asioZipSha256) {
+        Remove-Item -Recurse -Force $tmp
+        throw "SDK ASIO inattendu (SHA-256 $got au lieu de $asioZipSha256) : compilation arrêtée"
+    }
+    Expand-Archive $zipPath -DestinationPath (Join-Path $tmp 'x') -Force
     $header = Get-ChildItem (Join-Path $tmp 'x') -Recurse -Filter asiodrivers.h | Select-Object -First 1
     if (-not $header) { throw "asiodrivers.h introuvable dans le SDK ASIO" }
     Remove-Item -Recurse -Force $sdk -ErrorAction SilentlyContinue
     Move-Item $header.Directory.Parent.FullName $sdk
     Remove-Item -Recurse -Force $tmp
+}
+# Vérifié à chaque compilation, même avec un SDK déjà présent (copie locale modifiée) ou
+# donné par CPAL_ASIO_DIR. Une autre version ne passe que si TRACKSPLUS_ACCEPT_ASIO_SDK
+# donne son empreinte exacte.
+$tree = Get-SdkTreeHash $sdk
+if ($tree -ne $asioTreeSha256 -and $tree -ne $asioMirrorTreeSha256) {
+    if ($env:TRACKSPLUS_ACCEPT_ASIO_SDK -eq $tree) {
+        Write-Warning "SDK ASIO non épinglé accepté ($tree)"
+    } elseif ($env:CPAL_ASIO_DIR) {
+        throw "Sources du SDK ASIO de CPAL_ASIO_DIR différentes de la version épinglée ($tree) : posez TRACKSPLUS_ACCEPT_ASIO_SDK=$tree pour les accepter"
+    } else {
+        throw "Sources du SDK ASIO modifiées ($tree au lieu de $asioTreeSha256) : supprimez target\asio-sdk pour le retélécharger"
+    }
 }
 $env:CPAL_ASIO_DIR = $sdk
 

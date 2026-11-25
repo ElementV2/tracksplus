@@ -736,18 +736,13 @@ pub fn run_export(
     for (sink, u) in sinks.into_iter().zip(&units) {
         sink.finish().map_err(|e| write_error(e, &u.name))?;
     }
-    // Tous complets : ils prennent leur nom (remplace un export précédent du même nom).
-    let mut files = Vec::new();
-    for u in &units {
-        std::fs::rename(&u.part, &u.path).with_context(|| {
-            format!(
-                "Impossible de remplacer « {} » : le fichier est peut-être ouvert dans un autre \
-                 programme. Fermez-le puis relancez l'export.",
-                u.path.display()
-            )
-        })?;
-        files.push(u.path.clone());
-    }
+    // Tous complets : ils prennent leur nom (remplace un export précédent du même nom),
+    // tous ou aucun.
+    let pairs: Vec<(PathBuf, PathBuf)> = units
+        .iter()
+        .map(|u| (u.part.clone(), u.path.clone()))
+        .collect();
+    let files = commit_files(&pairs, &mut |a, b| std::fs::rename(a, b))?;
     parts.0.clear();
     progress.store(1000, Ordering::Relaxed);
 
@@ -773,6 +768,108 @@ pub fn run_export(
         })
         .collect();
     Ok(Outcome { files, warnings })
+}
+
+/// Copie de côté d'un fichier remplacé, le temps de valider un export.
+fn backup_of(p: &Path) -> PathBuf {
+    let mut n = p.file_name().unwrap_or_default().to_os_string();
+    n.push(".tracksplus-old");
+    p.with_file_name(n)
+}
+
+/// Donne leur nom définitif aux fichiers terminés (`(part, destination)`), tous ou aucun :
+/// 1. les fichiers d'un export précédent sont mis de côté (un fichier ouvert dans un autre
+///    programme refuse dès cette étape : rien n'est encore remplacé) ;
+/// 2. les nouveaux prennent leur nom ; en cas d'échec, ceux déjà en place sont retirés et
+///    les anciens remis ;
+/// 3. tout est en place : les anciens sont supprimés.
+///
+/// Le dossier ne mélange donc jamais deux exports. Si la remise en état elle-même échoue
+/// (disque retiré…), le message dit précisément où se trouve chaque fichier.
+fn commit_files(
+    pairs: &[(PathBuf, PathBuf)],
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Vec<PathBuf>> {
+    let name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let busy = |p: &Path| {
+        format!(
+            "Impossible de remplacer « {} » : le fichier est peut-être ouvert dans un autre \
+             programme. Fermez-le puis relancez l'export.",
+            p.display()
+        )
+    };
+    // Remet les anciens fichiers (indices de `pairs`) ; rend ceux qui n'ont pas pu l'être.
+    let restore = |moved: &[usize], rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>| {
+        let mut stuck = Vec::new();
+        for &i in moved.iter().rev() {
+            let dst = &pairs[i].1;
+            if rename(&backup_of(dst), dst).is_err() {
+                stuck.push(format!(
+                    "l'ancien « {} » est resté sous le nom « {} »",
+                    name(dst),
+                    name(&backup_of(dst))
+                ));
+            }
+        }
+        stuck
+    };
+    // 1. Anciens fichiers mis de côté.
+    let mut moved = Vec::new();
+    for (i, (_, dst)) in pairs.iter().enumerate() {
+        if !dst.exists() {
+            continue;
+        }
+        let old = backup_of(dst);
+        let _ = std::fs::remove_file(&old);
+        if rename(dst, &old).is_err() {
+            let stuck = restore(&moved, rename);
+            if stuck.is_empty() {
+                bail!("{} Aucun fichier n'a été remplacé.", busy(dst));
+            }
+            bail!(
+                "{} Aucun nouveau fichier n'a été mis en place, mais {}.",
+                busy(dst),
+                stuck.join(", ")
+            );
+        }
+        moved.push(i);
+    }
+    // 2. Nouveaux fichiers en place.
+    for (k, (part, dst)) in pairs.iter().enumerate() {
+        if rename(part, dst).is_ok() {
+            continue;
+        }
+        // Retour en arrière : les nouveaux déjà placés redeviennent des « .part » (supprimés
+        // ensuite), puis les anciens reprennent leur place.
+        let mut stuck = Vec::new();
+        for (j, (part, dst)) in pairs[..k].iter().enumerate().rev() {
+            // Avec un ancien fichier, sa remise en place (plus bas) remplace le nouveau.
+            if rename(dst, part).is_err() && !moved.contains(&j) {
+                stuck.push(format!(
+                    "« {} » (nouveau fichier) est resté en place",
+                    name(dst)
+                ));
+            }
+        }
+        stuck.extend(restore(&moved, rename));
+        if stuck.is_empty() {
+            bail!("{} Aucun fichier n'a été remplacé.", busy(dst));
+        }
+        bail!(
+            "{} Le dossier n'a pas pu être remis tout à fait dans son état d'avant : {}.",
+            busy(dst),
+            stuck.join(", ")
+        );
+    }
+    // 3. Anciens supprimés.
+    for &i in &moved {
+        let _ = std::fs::remove_file(backup_of(&pairs[i].1));
+    }
+    Ok(pairs.iter().map(|(_, d)| d.clone()).collect())
 }
 
 /// Pour les tests : l'export et la liste des fichiers.
@@ -2136,5 +2233,93 @@ mod safety_tests {
         assert_eq!(first(&files[1]), (1, 0.25, 48000));
         assert_eq!(first(&files[2]), (2, 0.5, 48000));
         let _ = std::fs::remove_dir_all(&p.dir);
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    fn setup(tag: &str) -> (PathBuf, Vec<(PathBuf, PathBuf)>) {
+        let d = std::env::temp_dir().join(format!("tp-commit-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut pairs = Vec::new();
+        for k in 1..=4 {
+            let dst = d.join(format!("{k:02} - Piste.wav"));
+            let part = d.join(format!("{k:02} - Piste.wav.part"));
+            std::fs::write(&part, format!("nouveau {k}")).unwrap();
+            // Les trois premiers existent déjà (export précédent), pas le quatrième.
+            if k < 4 {
+                std::fs::write(&dst, format!("ancien {k}")).unwrap();
+            }
+            pairs.push((part, dst));
+        }
+        (d, pairs)
+    }
+
+    fn content(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap_or_else(|_| "absent".into())
+    }
+
+    /// Renommage refusé pour `bad` (fichier ouvert dans un autre programme).
+    fn refusing(bad: PathBuf) -> impl FnMut(&Path, &Path) -> std::io::Result<()> {
+        move |a: &Path, b: &Path| {
+            if a == bad || b == bad {
+                Err(std::io::Error::other("ouvert ailleurs"))
+            } else {
+                std::fs::rename(a, b)
+            }
+        }
+    }
+
+    #[test]
+    fn all_files_replaced_together() {
+        let (d, pairs) = setup("ok");
+        let files = commit_files(&pairs, &mut |a, b| std::fs::rename(a, b)).unwrap();
+        assert_eq!(files.len(), 4);
+        for (k, (part, dst)) in pairs.iter().enumerate() {
+            assert_eq!(content(dst), format!("nouveau {}", k + 1));
+            assert!(!part.exists());
+            assert!(!backup_of(dst).exists());
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Ancien fichier ouvert ailleurs : refusé avant tout remplacement, rien n'a changé.
+    #[test]
+    fn busy_old_file_changes_nothing() {
+        let (d, pairs) = setup("busy");
+        let e = commit_files(&pairs, &mut refusing(pairs[2].1.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("03 - Piste.wav") && e.contains("Aucun fichier"),
+            "{e}"
+        );
+        for (k, (part, dst)) in pairs.iter().enumerate().take(3) {
+            assert_eq!(content(dst), format!("ancien {}", k + 1));
+            assert!(part.exists() && !backup_of(dst).exists());
+        }
+        assert!(!pairs[3].1.exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Échec en mettant un nouveau fichier en place : ceux déjà placés sont retirés et les
+    /// anciens remis, le dossier contient l'export précédent au complet.
+    #[test]
+    fn failed_placement_rolls_back() {
+        let (d, pairs) = setup("rollback");
+        // Le quatrième (sans ancien) ne peut pas prendre son nom.
+        let e = commit_files(&pairs, &mut refusing(pairs[3].0.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Aucun fichier"), "{e}");
+        for (k, (_, dst)) in pairs.iter().enumerate().take(3) {
+            assert_eq!(content(dst), format!("ancien {}", k + 1));
+            assert!(!backup_of(dst).exists());
+        }
+        assert!(!pairs[3].1.exists());
+        let _ = std::fs::remove_dir_all(d);
     }
 }
