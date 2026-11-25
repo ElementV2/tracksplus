@@ -502,6 +502,19 @@ struct Toast {
     until: f64,
 }
 
+/// Lignes du journal des incidents affichées au plus (les plus récentes).
+const INCIDENTS_SHOWN: usize = 500;
+
+/// Durée d'affichage d'un message selon son importance (s).
+fn toast_secs(level: Level) -> f64 {
+    match level {
+        Level::Info => 3.5,
+        Level::Device => 6.0,
+        Level::Warn => 8.0,
+        Level::Critical => 15.0,
+    }
+}
+
 /// Importance d'un message : quand il y en a trop, les moins importants partent d'abord.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -1245,6 +1258,8 @@ pub struct App {
     /// Rectangle de sélection des prises en cours (glisser sur les pistes).
     pub marquee: Option<crate::ui::multitrack::Marquee>,
     pub settings_dlg: Option<SettingsDialog>,
+    /// Fenêtre du journal des incidents ouverte (lignes, les plus récentes d'abord).
+    pub incidents_dlg: Option<Vec<String>>,
     pub export_dlg: Option<ExportDialog>,
     pub export_job: Option<ExportJob>,
     pub new_dlg: Option<NewSessionDialog>,
@@ -1382,6 +1397,7 @@ impl App {
             playhead_drag: false,
             scrub_at: 0.0,
             settings_dlg: None,
+            incidents_dlg: None,
             export_dlg: None,
             export_job: None,
             new_dlg: None,
@@ -1622,20 +1638,23 @@ impl App {
         if matches!(level, Level::Device | Level::Critical) {
             self.incident(text.clone());
         }
-        // Une erreur pas encore lue n'est jamais effacée par un nouveau message (ex. « prise
-        // arrêtée, carte perdue » puis « carte reconnectée ») : il s'ajoute à la suite.
+        // Une alerte encore affichée n'est jamais effacée par un nouveau message (ex. « prise
+        // arrêtée, carte perdue » puis « carte reconnectée ») : il s'ajoute à la suite. Les
+        // messages partent seuls (plus longtemps affichés s'ils sont importants) ; tout ce
+        // qui compte reste dans le journal des incidents.
+        let until = self.now + toast_secs(level);
         if let Some(t) = &mut self.toast
             && t.error
-            && t.until.is_infinite()
+            && self.now < t.until
         {
             push_toast(&mut t.items, level, text);
+            t.until = t.until.max(until);
             return;
         }
-        let error = level > Level::Info;
         self.toast = Some(Toast {
             items: vec![(level, text)],
-            error,
-            until: if error { f64::INFINITY } else { self.now + 3.5 },
+            error: level > Level::Info,
+            until,
         });
     }
 
@@ -4992,8 +5011,97 @@ impl App {
         self.sb.confirm_delete_page = None;
     }
 
+    /// Fichier du journal des incidents de la session ouverte (voir `incident`).
+    fn incidents_path(&self) -> Option<PathBuf> {
+        let dir = if self.start_screen || self.project.read_only.is_some() {
+            dirs::config_dir()?.join("TracksPlus")
+        } else {
+            self.project.dir.clone()
+        };
+        Some(dir.join(crate::incidents::FILE))
+    }
+
+    /// Ouvre la fenêtre du journal des incidents (lignes les plus récentes d'abord).
+    pub fn open_incidents(&mut self) {
+        let lines = self
+            .incidents_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| {
+                let mut v: Vec<String> = t.lines().map(str::to_string).collect();
+                v.reverse();
+                v.truncate(INCIDENTS_SHOWN);
+                v
+            })
+            .unwrap_or_default();
+        self.incidents_dlg = Some(lines);
+    }
+
+    fn incidents_dialog(&mut self, ctx: &egui::Context) {
+        let Some(lines) = &self.incidents_dlg else {
+            return;
+        };
+        let mut close = false;
+        let mut open_file = false;
+        egui::Modal::new(egui::Id::unique("incidents_dlg"))
+            .frame(t::window_frame())
+            .show(ctx, |ui| {
+                ui.set_width(640.0);
+                ui.label(
+                    egui::RichText::new("JOURNAL DES INCIDENTS")
+                        .font(t::semibold(12.0))
+                        .color(t::TEXT_2),
+                );
+                ui.add_space(8.0);
+                if lines.is_empty() {
+                    ui.label(egui::RichText::new("Aucun incident").color(t::TEXT_3));
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(380.0)
+                        .show(ui, |ui| {
+                            for l in lines {
+                                // « AAAA-MM-JJ HH:MM:SS  texte » : l'heure en retrait.
+                                let (when, what) = l.split_once("  ").unwrap_or(("", l.as_str()));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(when)
+                                            .font(egui::FontId::monospace(11.0))
+                                            .color(t::TEXT_3),
+                                    );
+                                    ui.label(egui::RichText::new(what).font(t::medium(12.0)));
+                                });
+                            }
+                        });
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Ouvrir le fichier").clicked() {
+                        open_file = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if w::primary_button(ui, None, "Fermer", true).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if open_file && let Some(p) = self.incidents_path() {
+            if p.is_file() {
+                open_in_file_manager(&p);
+            } else {
+                self.notify("Aucun incident", false);
+            }
+        }
+        if close {
+            self.incidents_dlg = None;
+        }
+    }
+
     pub fn dialog_open(&self) -> bool {
-        self.settings_dlg.is_some()
+        self.incidents_dlg.is_some()
+            || self.settings_dlg.is_some()
             || self.tracks_dlg.is_some()
             || self.export_dlg.is_some()
             || self.new_dlg.is_some()
@@ -5575,6 +5683,10 @@ impl App {
         if ui.button("Afficher le dossier").clicked() {
             let _ = self.project.ensure_dirs();
             open_in_file_manager(&self.project.dir);
+        }
+        if ui.button("Journal des incidents").clicked() {
+            ui.close();
+            self.open_incidents();
         }
         if ui
             .add_enabled(
@@ -7051,10 +7163,12 @@ impl App {
         }
         let fade = ((tt.until - self.now) / 0.3).min(1.0) as f32;
         let mut dismiss = false;
+        let mut hovered = false;
+        // Sous les fenêtres (réglages, export…) : un message ne cache jamais leurs boutons.
         egui::Area::new(egui::Id::unique("toast"))
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -48.0))
-            .order(egui::Order::Tooltip)
-            .interactable(tt.error)
+            .order(egui::Order::Middle)
+            .interactable(true)
             .show(ctx, |ui| {
                 let col = if tt.error { t::REC } else { t::ACCENT };
                 let resp = egui::Frame::new()
@@ -7099,21 +7213,19 @@ impl App {
                     },
                     col.gamma_multiply(fade),
                 );
-                if tt.error
-                    && ui
-                        .interact(
-                            r,
-                            ui.make_persistent_id("toast_close"),
-                            egui::Sense::click(),
-                        )
-                        .on_hover_text("Clic pour fermer")
-                        .clicked()
-                {
-                    dismiss = true;
-                }
+                // Clic : fermé tout de suite. Souris dessus : il reste le temps de le lire.
+                let resp = ui.interact(
+                    r,
+                    ui.make_persistent_id("toast_close"),
+                    egui::Sense::click(),
+                );
+                hovered = resp.hovered();
+                dismiss = resp.clicked();
             });
         if dismiss {
             self.toast = None;
+        } else if hovered && let Some(t) = &mut self.toast {
+            t.until = t.until.max(self.now + 1.5);
         }
     }
 }
@@ -7596,6 +7708,7 @@ impl App {
         }
 
         self.settings_dialog(&ctx);
+        self.incidents_dialog(&ctx);
         self.export_dialog(&ctx);
         self.new_session_dialog(&ctx);
         self.new_tracks_dialog(&ctx);
