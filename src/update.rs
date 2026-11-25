@@ -28,6 +28,8 @@ pub struct Release {
     pub installer: Option<(String, String, u64)>,
     /// Empreinte SHA-256 de l'installeur (hexadécimal minuscule), si GitHub la fournit.
     pub sha256: Option<String>,
+    /// Adresse de la signature de l'éditeur (`<installeur>.sig`, voir `release_sig`).
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -161,6 +163,8 @@ impl Updater {
         let me = self.clone();
         let ctx = ctx.clone();
         let digest = release.sha256.clone();
+        let sig_url = release.signature.clone();
+        let version = release.version.clone();
         std::thread::spawn(move || {
             let res = curl(
                 &[
@@ -175,6 +179,19 @@ impl Updater {
                 &url,
             )
             .and_then(|_| verify_download(&part, size, digest.as_deref()))
+            // Signature de l'éditeur : le fichier vient bien de TracksPlus, pour cette version.
+            .and_then(|_| {
+                let url = sig_url
+                    .as_deref()
+                    .ok_or("version non signée par l'éditeur")?;
+                let sig = curl(
+                    &["-sSfL", "--max-time", "60", "--max-filesize", "4096"],
+                    None,
+                    url,
+                )?;
+                let sha = digest.as_deref().unwrap_or_default();
+                crate::release_sig::verify(&name, &version, sha, &sig)
+            })
             .and_then(|_| {
                 std::fs::rename(&part, &file)
                     .map_err(|e| format!("impossible d'enregistrer l'installeur : {e}"))
@@ -471,9 +488,20 @@ fn parse_release(json: &str) -> Result<Release, String> {
         .and_then(parse_digest);
     // Installation automatique seulement pour un installeur publié sur le dépôt officiel
     // et accompagné de son empreinte SHA-256 ; sinon on renvoie vers la page de la version.
+    // Signature de l'éditeur publiée à côté de l'installeur (`<installeur>.sig`).
+    let signature = asset.and_then(|inst| {
+        let want = format!("{}.sig", inst.name.to_lowercase());
+        r.assets
+            .iter()
+            .find(|a| a.name.to_lowercase() == want)
+            .filter(|a| a.browser_download_url.starts_with(&download_prefix()))
+            .map(|a| a.browser_download_url.clone())
+    });
+    // Installation automatique seulement si la version est signée par l'éditeur : sinon,
+    // renvoi vers la page de la version (installation à la main).
     let installer = asset
         .filter(|a| a.browser_download_url.starts_with(&download_prefix()))
-        .filter(|_| sha256.is_some())
+        .filter(|_| sha256.is_some() && signature.is_some())
         .map(|a| (a.name.clone(), a.browser_download_url.clone(), a.size));
     let page = if r
         .html_url
@@ -489,6 +517,7 @@ fn parse_release(json: &str) -> Result<Release, String> {
         page,
         installer,
         sha256,
+        signature,
     })
 }
 
@@ -670,21 +699,44 @@ mod tests {
 
     #[test]
     fn only_official_signed_installer_is_auto_installed() {
-        let json = |url: &str, digest: bool| {
+        let json_sig = |url: &str, digest: bool, sig: Option<&str>| {
             let d = if digest {
                 format!(r#","digest":"sha256:{ABC_SHA256}""#)
             } else {
                 String::new()
             };
+            let s = sig.map_or(String::new(), |u| {
+                format!(
+                    r#",{{"name":"TracksPlus-Setup-9.0.0.exe.sig","browser_download_url":"{u}","size":129}}"#
+                )
+            });
             format!(
                 r#"{{"tag_name":"v9.0.0","html_url":"https://github.com/{REPO}/releases/tag/v9.0.0","assets":[
-                {{"name":"TracksPlus-Setup-9.0.0.exe","browser_download_url":"{url}","size":3{d}}}]}}"#
+                {{"name":"TracksPlus-Setup-9.0.0.exe","browser_download_url":"{url}","size":3{d}}}{s}]}}"#
             )
         };
         let official = format!("{}v9.0.0/TracksPlus-Setup-9.0.0.exe", download_prefix());
+        let official_sig = format!("{official}.sig");
+        let json = |url: &str, digest: bool| json_sig(url, digest, Some(&official_sig));
         let r = parse_release(&json(&official, true)).unwrap();
         assert_eq!(r.installer.map(|i| i.1), Some(official.clone()));
+        assert_eq!(r.signature.as_deref(), Some(official_sig.as_str()));
         assert!(r.page.starts_with("https://github.com/"));
+        // Sans signature de l'éditeur (ou signature hébergée ailleurs) : jamais installé
+        // automatiquement.
+        assert!(
+            parse_release(&json_sig(&official, true, None))
+                .unwrap()
+                .installer
+                .is_none()
+        );
+        let evil_sig = "https://evil.example/x.sig";
+        assert!(
+            parse_release(&json_sig(&official, true, Some(evil_sig)))
+                .unwrap()
+                .installer
+                .is_none()
+        );
         assert!(
             parse_release(&json(&official, false))
                 .unwrap()

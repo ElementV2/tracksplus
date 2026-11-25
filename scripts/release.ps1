@@ -10,8 +10,12 @@
 # L'application compare cette version à la sienne : une version plus récente est proposée
 # à tous les utilisateurs (pastille « Version x.y.z » en haut à droite).
 #
-# Prérequis : GitHub CLI connecté (winget install GitHub.cli, puis gh auth login), et les
-# prérequis de scripts\package-windows.ps1.
+# Prérequis : GitHub CLI connecté (winget install GitHub.cli, puis gh auth login), les
+# prérequis de scripts\package-windows.ps1, et la clé privée de signature de l'éditeur
+# (%USERPROFILE%\.tracksplus\release-signing-key.txt, ou $env:TRACKSPLUS_SIGNING_KEY).
+# Chaque fichier publié est accompagné de sa signature (<fichier>.sig) : l'application
+# refuse toute mise à jour qui n'est pas signée par cette clé. Sans elle, plus aucune mise
+# à jour automatique n'est possible : gardez-en une copie de sauvegarde hors de ce PC.
 param(
     [Parameter(Mandatory = $true)][string]$Notes
 )
@@ -21,6 +25,8 @@ Set-Location $root
 
 if (-not (Test-Path $Notes)) { throw "Notes de version introuvables : $Notes" }
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "GitHub CLI introuvable : winget install GitHub.cli" }
+$key = if ($env:TRACKSPLUS_SIGNING_KEY) { $env:TRACKSPLUS_SIGNING_KEY } else { Join-Path $env:USERPROFILE '.tracksplus\release-signing-key.txt' }
+if (-not (Test-Path $key)) { throw "Clé de signature introuvable : $key (sans elle, les mises à jour seraient refusées)" }
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 $tag = "v$version"
@@ -41,7 +47,14 @@ $setup = Join-Path $root "dist\TracksPlus-Setup-$version.exe"
 $zip = Join-Path $root "dist\TracksPlus-$version-windows-portable.zip"
 foreach ($f in $setup, $zip) { if (-not (Test-Path $f)) { throw "Fichier manquant : $f" } }
 
+Write-Host "== Signature de l'éditeur"
+$sigs = foreach ($f in $setup, $zip) {
+    cargo run -q --release --example sign_release -- sign $key $f $version
+    if ($LASTEXITCODE -ne 0) { throw "Signature impossible : $f" }
+    "$f.sig"
+}
+
 Write-Host "== Création de la release $tag"
-gh release create $tag $setup $zip --target (git rev-parse HEAD) --title "TracksPlus $version" --notes-file $Notes
+gh release create $tag $setup $zip @sigs --target (git rev-parse HEAD) --title "TracksPlus $version" --notes-file $Notes
 if ($LASTEXITCODE -ne 0) { throw "La création de la release a échoué" }
 Write-Host "OK : https://github.com/ElementV2/tracksplus/releases/tag/$tag"

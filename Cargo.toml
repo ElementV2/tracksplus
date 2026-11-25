@@ -25,6 +25,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # Vérification des installeurs téléchargés (empreinte publiée par GitHub).
 sha2 = "0.10"
+# Signature des versions publiées (src/release_sig.rs).
+ed25519-dalek = "2.2"
 keepawake = "0.6.1"
 # Export : FLAC (pur Rust), MP3 (LAME, LGPL), Ogg Vorbis (libvorbis), mesure EBU R128.
 flacenc = { version = "0.5.1", default-features = false }
@@ -48,6 +50,8 @@ raw-window-handle = "0.6.2"
 [dev-dependencies]
 # Tests : aucune allocation dans les callbacks audio (règle n°1 du temps réel).
 assert_no_alloc = "1.1"
+# Génération de la clé de signature (examples/sign_release.rs).
+getrandom = "0.4"
 
 [build-dependencies]
 # Icône et informations de version intégrées à l'exécutable Windows.

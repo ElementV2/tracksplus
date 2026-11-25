@@ -20,6 +20,7 @@ mod player;
 mod project;
 mod recorder;
 mod recovery;
+mod release_sig;
 mod render;
 mod sampler;
 mod sessions;
