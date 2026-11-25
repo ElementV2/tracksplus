@@ -258,6 +258,10 @@ pub struct App {
     pub transport: Transport,
     pub playhead: u64,
     pub player: Option<Player>,
+    /// Position de la timeline où la lecture en cours a commencé (trame 0 du moteur).
+    play_base: u64,
+    /// Rendus remplacés (mute / solo) : gardés le temps que le moteur bascule.
+    retired: Vec<(Player, f64)>,
     pub recorder: Option<Recorder>,
     pub live: Vec<LiveTake>,
     pub peaks: HashMap<u64, Peaks>,
@@ -415,6 +419,8 @@ impl App {
             transport: Transport::Stopped,
             playhead: 0,
             player: None,
+            play_base: 0,
+            retired: Vec::new(),
             track_meters: HashMap::new(),
             meters_pos: 0,
             audio_import: None,
@@ -617,6 +623,7 @@ impl App {
         let (player, cons) = Player::start(&self.project, self.playhead, self.project.audible());
         self.engine.start_playback(cons);
         self.player = Some(player);
+        self.play_base = self.playhead;
         self.transport = Transport::Playing {
             start: self.playhead,
         };
@@ -632,17 +639,36 @@ impl App {
                 let (player, cons) = Player::start(&self.project, pos, self.project.audible());
                 self.engine.start_playback(cons);
                 self.player = Some(player);
+                self.play_base = pos;
                 self.transport = Transport::Playing { start: pos };
             }
             Transport::Recording { .. } => {}
         }
     }
 
+    /// Mute / solo changés. Le lecteur lit jusqu'à 3 s en avance (sécurité disque) :
+    /// pendant la lecture, un nouveau rendu démarre ~0,2 s devant ce qu'on entend et le
+    /// moteur bascule dessus à cette trame précise, avec un fondu court. Le changement
+    /// s'entend ainsi aussitôt, sans coupure ni saut.
     pub fn update_audible(&mut self) {
-        if let Some(p) = &self.player {
-            for (a, v) in p.audible.iter().zip(self.project.audible()) {
-                a.store(v, Ordering::Relaxed);
-            }
+        let audible = self.project.audible();
+        let Some(p) = &self.player else {
+            return;
+        };
+        // Repli : l'ancien rendu applique aussi le changement (au-delà de son avance).
+        for (a, v) in p.audible.iter().zip(&audible) {
+            a.store(*v, Ordering::Relaxed);
+        }
+        if self.is_stopped() {
+            return;
+        }
+        let margin = self.project.sample_rate as u64 / 5;
+        let at = self.engine.shared.out_frames.load(Ordering::Relaxed) + margin;
+        let (player, cons) = Player::start_ahead(&self.project, self.play_base + at, audible);
+        if self.engine.switch_playback(cons, at)
+            && let Some(old) = self.player.replace(player)
+        {
+            self.retired.push((old, self.now + 5.0));
         }
     }
 
@@ -801,6 +827,7 @@ impl App {
                 Player::start(&self.project, self.playhead, self.project.audible());
             self.engine.start_playback(cons);
             self.player = Some(player);
+            self.play_base = self.playhead;
             self.rec_overdub = true;
             self.rec_latency = self.engine.round_trip_latency() as u64;
         }
@@ -2094,6 +2121,8 @@ impl App {
 
     fn update_meters(&mut self) {
         self.sync_monitoring();
+        let now_t = self.now;
+        self.retired.retain(|(_, until)| *until > now_t);
         // Temps réellement écoulé depuis l'image précédente (et non la durée « prévue »
         // d'egui, fausse quand l'affichage ne tourne pas à 60 images/s) : la vitesse de
         // retour des vumètres est exacte quelle que soit la cadence.
@@ -2126,9 +2155,10 @@ impl App {
             }
             let v = self
                 .player
-                .as_ref()
+                .iter()
+                .chain(self.retired.iter().rev().map(|(p, _)| p))
                 .filter(|_| playing)
-                .and_then(|p| p.meters.peak(i, from, pos))
+                .find_map(|p| p.meters.peak(i, from, pos))
                 .unwrap_or([0.0; 2]);
             let m = self.track_meters.entry(t.id).or_default();
             m[0].update(v[0], now, dt);

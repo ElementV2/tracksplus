@@ -873,6 +873,51 @@ pub fn view_tabs_resps(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool
     (changed, resps)
 }
 
+/// Icône de l'application (la même que celle de la fenêtre et de l'exécutable), chargée
+/// une seule fois.
+pub fn app_icon(ui: &mut Ui, size: f32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    paint_app_icon(ui, rect);
+    resp
+}
+
+/// Dessine l'icône de l'application dans `rect`.
+pub fn paint_app_icon(ui: &Ui, rect: Rect) {
+    let id = egui::Id::unique("tracksplus_app_icon");
+    let tex = ui.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(id));
+    let tex = match tex {
+        Some(t) => t,
+        None => {
+            let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!(
+                "../../assets/icon/tracksplus.png"
+            )) else {
+                return;
+            };
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            let t = ui.ctx().load_texture(
+                "tracksplus_app_icon",
+                img,
+                // Réduite proprement à toutes les tailles (menu, accueil, fenêtres).
+                egui::TextureOptions {
+                    mipmap_mode: Some(egui::TextureFilter::Linear),
+                    ..egui::TextureOptions::LINEAR
+                },
+            );
+            ui.ctx().data_mut(|d| d.insert_temp(id, t.clone()));
+            t
+        }
+    };
+    ui.painter().image(
+        tex.id(),
+        rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
+
 /// Contrôle segmenté plat (choix exclusif court).
 pub fn segmented<T: PartialEq + Copy>(
     ui: &mut Ui,

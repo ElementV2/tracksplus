@@ -164,16 +164,7 @@ impl App {
     fn welcome_left(ui: &mut egui::Ui, wl: &mut Welcome, action: &mut Option<Action>) {
         ui.spacing_mut().item_spacing.y = 8.0;
         ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-            ui.painter()
-                .rect_filled(r, CornerRadius::same(t::R_PANEL), t::ACCENT);
-            for (i, wdt) in [14.0, 10.0, 12.0].into_iter().enumerate() {
-                let y = r.top() + 8.0 + i as f32 * 5.0;
-                ui.painter().line_segment(
-                    [pos2(r.left() + 6.0, y), pos2(r.left() + 6.0 + wdt, y)],
-                    Stroke::new(2.0, Color32::BLACK),
-                );
-            }
+            w::app_icon(ui, 34.0);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;

@@ -73,6 +73,22 @@ impl TrackMeters {
         }
     }
 
+    /// Piste muette (mute / solo) : niveau nul sur `frames` trames depuis `pos` (le vumètre
+    /// tombe en même temps que le son).
+    fn store_silent(&self, track: usize, pos: u64, frames: usize) {
+        let Some(slots) = self.slots.get(track) else {
+            return;
+        };
+        for j in 0..frames.div_ceil(SUB) {
+            let idx = (pos + (j * SUB) as u64 - self.start) / SUB as u64;
+            let s = &slots[(idx % SLOTS) as usize];
+            s.tag.store(0, Ordering::Relaxed);
+            s.l.store(0, Ordering::Relaxed);
+            s.r.store(0, Ordering::Relaxed);
+            s.tag.store(idx + 1, Ordering::Release);
+        }
+    }
+
     /// Crête (gauche, droite) de la piste `track` entendue entre les positions `from` et
     /// `to` ; `None` si rien n'a été joué (piste muette, pas encore lue).
     pub fn peak(&self, track: usize, from: u64, to: u64) -> Option<[f32; 2]> {
@@ -125,6 +141,7 @@ impl Mixer {
         self.mix.fill(0.0);
         for (i, t) in &mut self.tracks {
             if !self.audible[*i].load(Ordering::Relaxed) {
+                self.meters.store_silent(*i, self.pos, BLOCK);
                 continue;
             }
             let ch = t.channels();
@@ -154,6 +171,16 @@ impl Mixer {
 impl Player {
     /// Prépare la lecture à partir de `pos`. Le consommateur est à donner au moteur.
     pub fn start(project: &Project, pos: u64, audible: Vec<bool>) -> (Self, Consumer<f32>) {
+        Self::spawn(project, pos, audible, true)
+    }
+
+    /// Nouveau rendu en avance sur la lecture en cours (mute / solo) : pas d'attente, le
+    /// moteur ne bascule que lorsqu'il a assez d'avance.
+    pub fn start_ahead(project: &Project, pos: u64, audible: Vec<bool>) -> (Self, Consumer<f32>) {
+        Self::spawn(project, pos, audible, false)
+    }
+
+    fn spawn(project: &Project, pos: u64, audible: Vec<bool>, wait: bool) -> (Self, Consumer<f32>) {
         let sr = project.sample_rate as usize;
         let cap = (sr * RING_SECS).max(BLOCK * 4) * 2;
         let audible: Arc<Vec<AtomicBool>> =
@@ -188,7 +215,7 @@ impl Player {
         // trou au démarrage, et une attente bornée pour ne pas figer l'interface.
         let prefill = (sr * PREFILL_MS / 1000).min(cap / 2 - BLOCK) * 2;
         let deadline = Instant::now() + PREFILL_WAIT;
-        while cons.slots() < prefill && Instant::now() < deadline && !handle.is_finished() {
+        while wait && cons.slots() < prefill && Instant::now() < deadline && !handle.is_finished() {
             std::thread::sleep(Duration::from_millis(1));
         }
         (
@@ -235,6 +262,12 @@ mod tests {
         assert_eq!(m.peak(0, 1000, 1500), Some([0.0, 0.0]));
         assert_eq!(m.peak(0, 1500, 1000 + BLOCK as u64 + 10), Some([0.8, 0.8]));
         assert_eq!(m.peak(1, 1000, 2000), Some([0.5, 0.25]));
+        // Piste muette : niveau nul (et non « inconnu »).
+        m.store_silent(0, 1000 + 2 * BLOCK as u64, BLOCK);
+        assert_eq!(
+            m.peak(0, 1000 + 2 * BLOCK as u64, 1000 + 2 * BLOCK as u64 + 10),
+            Some([0.0, 0.0])
+        );
         // Avant le début, ou passage pas encore lu : rien.
         assert_eq!(m.peak(0, 0, 500), None);
         assert_eq!(

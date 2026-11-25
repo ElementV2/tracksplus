@@ -2370,7 +2370,7 @@ impl App {
         p.text(
             pos2(full.left() + 12.0, full.top() + 12.0),
             Align2::LEFT_CENTER,
-            "ENTRÉES",
+            "PISTES",
             t::caps(10.0),
             t::TEXT_3,
         );
@@ -2394,6 +2394,7 @@ impl App {
                     // Aucune allocation par image : on lit les pistes en place, et les
                     // colonnes hors de la zone visible ne sont pas dessinées.
                     let mut reset: Option<[Option<u16>; 2]> = None;
+                    let mut reset_track: Option<u64> = None;
                     let mut select = None;
                     for idx in 0..self.project.tracks.len() {
                         let (r, resp) =
@@ -2414,8 +2415,14 @@ impl App {
                             }
                             _ => MeterState::default(),
                         };
-                        let stereo = chans[1].is_some();
-                        let (m0, m1) = (meter(chans[0]), meter(chans[1]));
+                        // Piste audio : niveau de lecture ; piste d'enregistrement : entrée.
+                        let audio_tr = tr.is_audio();
+                        let (m0, m1, stereo) = if audio_tr {
+                            let m = self.track_meters.get(&id).copied().unwrap_or_default();
+                            (m[0], m[1], tr.stereo)
+                        } else {
+                            (meter(chans[0]), meter(chans[1]), chans[1].is_some())
+                        };
                         let merged = if stereo { m0.merge(m1) } else { m0 };
                         let p = ui.painter();
                         let sel = self.selected_tracks.contains(&id);
@@ -2467,6 +2474,7 @@ impl App {
                         let resp = resp.on_hover_ui(|ui| {
                             let tr = &self.project.tracks[idx];
                             let label = match tr.input {
+                                _ if tr.is_audio() => "piste audio, niveau de lecture".into(),
                                 Some(i) if tr.stereo => format!("entrées {}-{}", i + 1, i + 2),
                                 Some(i) => format!("entrée {}", i + 1),
                                 None => "pas d'entrée".into(),
@@ -2477,7 +2485,11 @@ impl App {
                             && let Some(pp) = resp.interact_pointer_pos()
                         {
                             if pr.contains(pp) {
-                                reset = Some(chans);
+                                if audio_tr {
+                                    reset_track = Some(id);
+                                } else {
+                                    reset = Some(chans);
+                                }
                             } else {
                                 select = Some(id);
                             }
@@ -2489,6 +2501,10 @@ impl App {
                                 mm.reset();
                             }
                         }
+                    }
+                    if let Some(m) = reset_track.and_then(|id| self.track_meters.get_mut(&id)) {
+                        m[0].reset();
+                        m[1].reset();
                     }
                     if let Some(id) = select {
                         self.selected_tracks.clear();

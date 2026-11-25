@@ -343,6 +343,9 @@ enum InCmd {
 
 enum OutCmd {
     Play(Consumer<f32>),
+    /// Même lecture, re-rendue (mute / solo changés) : le nouveau tampon commence à la
+    /// trame `at` de la lecture en cours et prend le relais à ce moment précis.
+    Switch(Consumer<f32>, u64),
     Stop,
 }
 
@@ -621,7 +624,7 @@ impl Engine {
                 OutState::new(
                     channels as usize,
                     0,
-                    bounded::<OutCmd>(1).1,
+                    bounded::<OutCmd>(4).1,
                     gt,
                     sh,
                     Sampler::new(prx, sgt, (pad.left as usize).min(last), sample_rate),
@@ -651,7 +654,7 @@ impl Engine {
                 OutState::new(
                     channels as usize,
                     0,
-                    bounded::<OutCmd>(1).1,
+                    bounded::<OutCmd>(4).1,
                     gt,
                     sh,
                     Sampler::new(bounded::<PadCmd>(1).1, sample_garbage_tx, 0, sample_rate),
@@ -744,6 +747,14 @@ impl Engine {
         if let Some(tx) = &self.out_tx {
             let _ = tx.try_send(OutCmd::Play(cons));
         }
+    }
+
+    /// Bascule sans coupure vers un nouveau rendu de la lecture en cours, qui commence à la
+    /// trame `at` de cette lecture (mute / solo). `false` si la commande n'a pas pu partir.
+    pub fn switch_playback(&self, cons: Consumer<f32>, at: u64) -> bool {
+        self.out_tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(OutCmd::Switch(cons, at)).is_ok())
     }
 
     pub fn stop_playback(&self) {
@@ -964,6 +975,9 @@ struct OutState {
     left: usize,
     rx: Receiver<OutCmd>,
     cons: Option<Consumer<f32>>,
+    /// Rendu qui prendra le relais (mute / solo) et trame de la bascule.
+    next: Option<(Consumer<f32>, u64)>,
+    nbuf: Vec<f32>,
     garbage: Sender<Consumer<f32>>,
     shared: Arc<Shared>,
     sampler: Sampler,
@@ -978,6 +992,19 @@ struct OutState {
     /// Flux d'écoute principal : c'est lui qui mesure la latence de sortie.
     main: bool,
     sample_rate: u32,
+}
+
+/// Lit exactement `dst.len()` échantillons (disponibles) du tampon.
+fn read_into(c: &mut Consumer<f32>, dst: &mut [f32]) {
+    if dst.is_empty() {
+        return;
+    }
+    if let Ok(chunk) = c.read_chunk(dst.len()) {
+        let (a, b) = chunk.as_slices();
+        dst[..a.len()].copy_from_slice(a);
+        dst[a.len()..a.len() + b.len()].copy_from_slice(b);
+        chunk.commit_all();
+    }
 }
 
 /// Fondu de sortie sur les `fade` dernières trames de `buf[..n]` (stéréo entrelacé).
@@ -1135,6 +1162,8 @@ impl OutState {
             left,
             rx,
             cons: None,
+            next: None,
+            nbuf: vec![0.0; MAX_BLOCK * 2],
             garbage,
             shared,
             sampler,
@@ -1170,15 +1199,89 @@ impl OutState {
                 std::mem::forget(e.into_inner());
             }
         }
+        self.release_next();
+    }
+
+    fn release_next(&mut self) {
+        if let Some((c, _)) = self.next.take()
+            && let Err(e) = self.garbage.try_send(c)
+        {
+            std::mem::forget(e.into_inner());
+        }
+    }
+
+    /// Bascule vers le rendu suivant si sa trame de départ tombe dans ce bloc (ou est
+    /// passée) et qu'il a déjà assez d'avance : l'ancien rendu joue jusqu'à la bascule,
+    /// puis fondu enchaîné court vers le nouveau (pas de clic). `true` si le bloc a été
+    /// joué ainsi. Sinon, l'ancien rendu continue (il a des secondes d'avance) et on
+    /// réessaie au bloc suivant, toujours calé sur la même trame.
+    fn try_switch(&mut self, frames: usize) -> bool {
+        let played = self.shared.out_frames.load(Ordering::Relaxed);
+        let Some((ncons, at)) = self.next.as_ref() else {
+            return false;
+        };
+        let at = *at;
+        if at >= played + frames as u64 {
+            return false;
+        }
+        let k = at.saturating_sub(played) as usize;
+        let late = played.saturating_sub(at) as usize;
+        let want = frames - k;
+        if ncons.slots() / 2 < late + want {
+            return false;
+        }
+        let (mut ncons, _) = self.next.take().unwrap();
+        let play = &mut self.play[..frames * 2];
+        play.fill(0.0);
+        let xf = MON_FADE.min(want);
+        let mut old_n = 0;
+        if let Some(c) = self.cons.as_mut() {
+            old_n = (k + xf).min(c.slots() / 2);
+            read_into(c, &mut play[..old_n * 2]);
+        }
+        if late > 0
+            && let Ok(ch) = ncons.read_chunk(late * 2)
+        {
+            ch.commit_all();
+        }
+        let nb = &mut self.nbuf[..want * 2];
+        read_into(&mut ncons, nb);
+        for i in 0..want {
+            let g = if i < xf {
+                (i + 1) as f32 / (xf + 1) as f32
+            } else {
+                1.0
+            };
+            for c in 0..2 {
+                let idx = (k + i) * 2 + c;
+                let old = if k + i < old_n { play[idx] } else { 0.0 };
+                play[idx] = old * (1.0 - g) + nb[i * 2 + c] * g;
+            }
+        }
+        if let Some(c) = self.cons.take()
+            && let Err(e) = self.garbage.try_send(c)
+        {
+            std::mem::forget(e.into_inner());
+        }
+        self.cons = Some(ncons);
+        self.play_fade_in = false;
+        self.shared
+            .out_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+        true
     }
 
     /// Calcule `frames` trames (≤ MAX_BLOCK) dans `self.mix`.
     fn process(&mut self, frames: usize) {
         let ch = self.channels;
+        let switched = self.try_switch(frames);
         let sh = &*self.shared;
         let play = &mut self.play[..frames * 2];
-        play.fill(0.0);
-        if let Some(cons) = self.cons.as_mut() {
+        if !switched {
+            play.fill(0.0);
+        }
+        if switched {
+        } else if let Some(cons) = self.cons.as_mut() {
             let n = frames.min(cons.slots() / 2);
             if n < frames && !cons.is_abandoned() {
                 sh.underruns.fetch_add(1, Ordering::Relaxed);
@@ -1282,6 +1385,10 @@ where
             }
             while let Ok(cmd) = st.rx.try_recv() {
                 match cmd {
+                    OutCmd::Switch(c, at) => {
+                        st.release_next();
+                        st.next = Some((c, at));
+                    }
                     OutCmd::Play(c) => {
                         st.release();
                         st.cons = Some(c);
@@ -1353,7 +1460,7 @@ mod tests {
         let st = OutState::new(
             channels,
             0,
-            bounded::<OutCmd>(1).1,
+            bounded::<OutCmd>(4).1,
             gt,
             Arc::new(Shared::new()),
             Sampler::new(bounded::<PadCmd>(1).1, sgt, 0, 48000),
@@ -1503,6 +1610,48 @@ mod tests {
         st.process(128);
         assert!(st.mix[0] < 0.02, "reprise : fondu d'entrée");
         assert_eq!(st.mix[100 * 2], 0.5);
+    }
+
+    /// Mute / solo pendant la lecture : l'ancien rendu joue jusqu'à la trame de bascule,
+    /// puis fondu court vers le nouveau, sans décalage ; si le nouveau n'a pas encore assez
+    /// d'avance, l'ancien continue et la bascule se fait plus tard, à la même position.
+    #[test]
+    fn playback_switch_is_seamless() {
+        let (mut st, _p) = monitor_state(2, 0);
+        st.monitor = None;
+        let (mut old_p, old_c) = rtrb::RingBuffer::new(8192);
+        st.cons = Some(old_c);
+        // Ancien rendu : la trame n vaut n (repère de position), sur 1000 trames.
+        for n in 0..1000 {
+            old_p.push(n as f32).unwrap();
+            old_p.push(n as f32).unwrap();
+        }
+        st.process(100);
+        assert_eq!(st.shared.out_frames.load(Ordering::Relaxed), 100);
+        // Nouveau rendu à partir de la trame 300, pas encore rempli.
+        let (mut new_p, new_c) = rtrb::RingBuffer::new(8192);
+        st.next = Some((new_c, 300));
+        st.process(100);
+        st.process(100);
+        // Trames 200 à 299 : toujours l'ancien rendu.
+        assert_eq!(st.mix[99 * 2], 299.0);
+        st.process(100);
+        // Bascule impossible (nouveau vide) : l'ancien continue, toujours calé.
+        assert_eq!(st.mix[0], 300.0);
+        assert!(st.next.is_some());
+        // Le nouveau rendu arrive (valeurs négatives : -n à la trame n).
+        for n in 300..1000 {
+            new_p.push(-(n as f32)).unwrap();
+            new_p.push(-(n as f32)).unwrap();
+        }
+        st.process(100);
+        assert!(st.next.is_none(), "bascule faite");
+        // Trames 400 à 499 : le retard (300 → 400) a été sauté, fondu puis nouveau rendu.
+        assert_eq!(st.mix[99 * 2], -499.0);
+        assert!(st.mix[0] > -400.0 && st.mix[0] < 400.0, "fondu enchaîné");
+        assert_eq!(st.shared.out_frames.load(Ordering::Relaxed), 500);
+        st.process(100);
+        assert_eq!(st.mix[0], -500.0);
     }
 
     /// Une erreur du pilote ne bloque jamais le flux, même si l'interface tient le verrou.

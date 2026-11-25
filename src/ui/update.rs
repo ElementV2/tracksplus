@@ -121,11 +121,15 @@ impl App {
     /// Entrées du menu principal.
     pub fn update_menu(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.label(
-            egui::RichText::new(format!("TRACKSPLUS {}", update::CURRENT))
-                .font(t::semibold(10.5))
-                .color(t::TEXT_3),
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            w::app_icon(ui, 14.0);
+            ui.label(
+                egui::RichText::new(format!("TRACKSPLUS {}", update::CURRENT))
+                    .font(t::semibold(10.5))
+                    .color(t::TEXT_3),
+            );
+        });
         if let Some(v) = self.offered_version() {
             if ui
                 .button(egui::RichText::new(format!("Mettre à jour vers la {v}…")).color(t::ACCENT))
@@ -178,19 +182,25 @@ impl App {
                         ui.ctx().request_repaint();
                     }
                     State::UpToDate => {
-                        ui.label(
-                            egui::RichText::new("TracksPlus est à jour")
-                                .font(t::semibold(16.0))
-                                .color(t::TEXT),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Vous avez la dernière version ({}).",
-                                update::CURRENT
-                            ))
-                            .color(t::TEXT_2),
-                        );
+                        ui.horizontal(|ui| {
+                            w::app_icon(ui, 40.0);
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("TracksPlus est à jour")
+                                        .font(t::semibold(16.0))
+                                        .color(t::TEXT),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Vous avez la dernière version ({}).",
+                                        update::CURRENT
+                                    ))
+                                    .color(t::TEXT_2),
+                                );
+                            });
+                        });
                     }
                     State::Failed(e) => {
                         ui.label(
@@ -316,17 +326,23 @@ impl App {
     }
 
     fn release_header(ui: &mut egui::Ui, version: &str) {
-        ui.label(
-            egui::RichText::new(format!("TracksPlus {version} est disponible"))
-                .font(t::semibold(16.0))
-                .color(t::TEXT),
-        );
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(format!("Vous avez la version {}", update::CURRENT))
-                .font(t::regular(11.5))
-                .color(t::TEXT_3),
-        );
+        ui.horizontal(|ui| {
+            w::app_icon(ui, 40.0);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("TracksPlus {version} est disponible"))
+                        .font(t::semibold(16.0))
+                        .color(t::TEXT),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!("Vous avez la version {}", update::CURRENT))
+                        .font(t::regular(11.5))
+                        .color(t::TEXT_3),
+                );
+            });
+        });
     }
 
     fn release_notes(ui: &mut egui::Ui, notes: &str) {

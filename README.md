@@ -66,7 +66,8 @@ ou archiver d'un bloc :
   temps restant sur le disque, écoute des pistes existantes pendant la prise.
 - **Vumètres** crête IEC 60268-18 : vert / jaune (−12 dB) / rouge (−3 dB), maintien, crête max
   en dB, voyant de saturation (clic pour remettre à zéro). Un par piste, un master stéréo, et
-  un bandeau de toutes les entrées.
+  un bandeau de toutes les pistes (entrée pour les pistes d'enregistrement, lecture pour les
+  pistes audio).
 
 ### Pistes audio (musique, sons)
 
