@@ -34,6 +34,10 @@ pub struct StartupPrefs {
     /// Dernier dossier où des sons ont été choisis (explorateur de sons).
     #[serde(default)]
     pub sound_dir: Option<PathBuf>,
+    /// Copie de sécurité des prises sur un second disque (dossier racine) : chaque
+    /// session y a son double, ouvrable tel quel.
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
 }
 
 impl StartupPrefs {

@@ -12,13 +12,13 @@ use crate::project::RecFormat;
 use crate::render::{PeakAccum, Peaks};
 use crossbeam_channel::Sender;
 use hound::WavSpec;
-use rtrb::Consumer;
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,10 @@ pub struct Recorder {
     /// Erreurs disque survenues pendant la prise (affichées en direct).
     errors: Errors,
     handle: Option<JoinHandle<Vec<RecResult>>>,
+    /// Copie de sécurité sur un second disque (son propre thread et ses propres tampons).
+    backup: Option<Box<Recorder>>,
+    /// Échantillons que la copie n'a pas pu recevoir (second disque trop lent).
+    copy_lost: Arc<AtomicU64>,
 }
 
 struct SegWriter {
@@ -130,6 +134,48 @@ struct SegWriter {
 struct Lane {
     cons: Consumer<f32>,
     st: LaneState,
+    /// Copie de sécurité (second disque) : mêmes échantillons, vers un autre thread.
+    copy: Option<CopyOut>,
+}
+
+/// Envoi des échantillons vers l'enregistreur de la copie de sécurité. Jamais bloquant :
+/// si le second disque ne suit pas, la copie perd des échantillons (remplacés par du
+/// silence, elle reste calée), l'enregistrement principal n'est jamais ralenti.
+struct CopyOut {
+    prod: Producer<f32>,
+    /// Échantillons perdus, à remplacer par du silence dès qu'il y a de la place.
+    pending: usize,
+    lost: Arc<AtomicU64>,
+}
+
+impl CopyOut {
+    fn forward(&mut self, a: &[f32], b: &[f32]) {
+        if self.prod.is_abandoned() {
+            return;
+        }
+        if self.pending > 0 {
+            let z = self.pending.min(self.prod.slots());
+            if let Ok(c) = self.prod.write_chunk_uninit(z) {
+                c.fill_from_iter(std::iter::repeat_n(0.0f32, z));
+            }
+            self.pending -= z;
+        }
+        let total = a.len() + b.len();
+        let n = if self.pending > 0 {
+            0
+        } else {
+            total.min(self.prod.slots())
+        };
+        if n > 0
+            && let Ok(c) = self.prod.write_chunk_uninit(n)
+        {
+            c.fill_from_iter(a.iter().chain(b).copied().take(n));
+        }
+        if n < total {
+            self.pending += total - n;
+            self.lost.fetch_add((total - n) as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 struct LaneState {
@@ -153,6 +199,8 @@ struct LaneState {
     /// TimeReference du BWF.
     take_time: chrono::NaiveDateTime,
     time_ref: u64,
+    /// Copie de sécurité : un fichier homonyme existant est mis de côté.
+    move_aside: bool,
 }
 
 /// Fichier WAV d'une prise, au format BWF : en-tête `fmt`, bloc `bext` (date, heure et
@@ -243,12 +291,29 @@ fn open_segment(
     wav: WavSpec,
     bext: &dyn Fn(u64) -> Vec<u8>,
     start: u64,
+    move_aside: bool,
 ) -> std::io::Result<SegWriter> {
-    // Jamais d'écrasement : si le fichier existe déjà, c'est une erreur signalée.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    // Jamais d'écrasement : si le fichier existe déjà, c'est une erreur signalée — sauf
+    // dans la copie de sécurité, où l'ancien fichier homonyme est mis de côté (renommé,
+    // jamais supprimé) pour que la copie porte le même nom que l'original.
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let file = match create() {
+        Err(e) if move_aside && e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let mut aside = path.as_os_str().to_os_string();
+            aside.push(format!(".ancien-{secs}"));
+            std::fs::rename(path, &aside)?;
+            create()?
+        }
+        r => r?,
+    };
     let sync = file.try_clone()?;
     let w = TakeWav::create(file, wav, &bext(start))?;
     Ok(SegWriter {
@@ -309,6 +374,7 @@ impl LaneState {
             self.wav,
             &|at| self.bext(at),
             self.elapsed,
+            self.move_aside,
         ) {
             Ok(mut w) => {
                 w.start = self.elapsed;
@@ -332,6 +398,7 @@ impl LaneState {
             self.wav,
             &|at| self.bext(at),
             self.elapsed,
+            self.move_aside,
         ) {
             Ok(mut w) => {
                 w.start = self.elapsed;
@@ -348,7 +415,15 @@ impl LaneState {
     }
 }
 
+/// Erreurs signalées avant le démarrage du thread (copie impossible…) ajoutées à celles
+/// du thread principal.
+fn errors_merge(into: &Errors, early: &Errors) {
+    let early = std::mem::take(&mut *early.lock());
+    into.lock().splice(0..0, early);
+}
+
 impl Recorder {
+    #[cfg(test)]
     pub fn start(
         specs: Vec<RecSpec>,
         sample_rate: u32,
@@ -357,11 +432,90 @@ impl Recorder {
         Self::start_with_limit(specs, sample_rate, format, MAX_SEGMENT_BYTES)
     }
 
+    #[cfg(test)]
     pub fn start_with_limit(
         specs: Vec<RecSpec>,
         sample_rate: u32,
         format: RecFormat,
         max_bytes: u64,
+    ) -> std::io::Result<Self> {
+        Self::spawn(specs, sample_rate, format, max_bytes, None)
+    }
+
+    /// Enregistrement avec copie de sécurité simultanée dans `backup` (dossier Audio d'une
+    /// session sur un second disque), comme les enregistreurs pro (Reaper, Pyramix, Sound
+    /// Devices). La copie a son thread et ses tampons : un second disque lent, plein ou
+    /// débranché ne touche jamais l'enregistrement principal.
+    pub fn start_with_backup(
+        specs: Vec<RecSpec>,
+        sample_rate: u32,
+        format: RecFormat,
+        backup: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        Self::spawn(specs, sample_rate, format, MAX_SEGMENT_BYTES, backup)
+    }
+
+    fn spawn(
+        specs: Vec<RecSpec>,
+        sample_rate: u32,
+        format: RecFormat,
+        max_bytes: u64,
+        backup: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let errors: Errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let copy_lost = Arc::new(AtomicU64::new(0));
+        let mut copies = Vec::new();
+        let mut backup_rec = None;
+        if let Some(dir) = backup {
+            // Tampon de la copie : 3 à 10 s dans un budget de 128 Mo.
+            let channels: usize = specs.iter().map(|s| s.channels.max(1) as usize).sum();
+            let per_sec = sample_rate as usize * channels.max(1) * 4;
+            let secs = ((128usize << 20) / per_sec.max(1)).clamp(3, 10);
+            let mut bspecs = Vec::new();
+            for s in &specs {
+                let width = s.channels.max(1) as usize;
+                let (prod, cons) = RingBuffer::new(sample_rate as usize * secs * width);
+                copies.push(Some(CopyOut {
+                    prod,
+                    pending: 0,
+                    lost: copy_lost.clone(),
+                }));
+                bspecs.push(RecSpec {
+                    track_id: s.track_id,
+                    file: s.file.clone(),
+                    path: dir.join(&s.file),
+                    peaks: Default::default(),
+                    cons,
+                    channels: s.channels,
+                });
+            }
+            match Self::spawn_writer(bspecs, sample_rate, format, max_bytes, Some(dir), vec![]) {
+                Ok(r) => backup_rec = Some(Box::new(r)),
+                Err(e) => {
+                    copies.clear();
+                    errors
+                        .lock()
+                        .push(format!("copie de sécurité impossible : {e}"));
+                }
+            }
+        }
+        let mut me = Self::spawn_writer(specs, sample_rate, format, max_bytes, None, copies)?;
+        me.backup = backup_rec;
+        me.copy_lost = copy_lost;
+        errors_merge(&me.errors, &errors);
+        Ok(me)
+    }
+
+    /// Thread d'écriture d'un ensemble de pistes. `backup_dir` : copie de sécurité (le
+    /// dossier est créé dans ce thread — un second disque en veille ne retarde jamais le
+    /// départ de la prise — et un fichier homonyme déjà présent est mis de côté).
+    fn spawn_writer(
+        specs: Vec<RecSpec>,
+        sample_rate: u32,
+        format: RecFormat,
+        max_bytes: u64,
+        backup_dir: Option<PathBuf>,
+        copies: Vec<Option<CopyOut>>,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -371,19 +525,52 @@ impl Recorder {
             .name("tracksplus-disk-writer".into())
             .spawn(move || {
                 raise_disk_thread_priority();
-                run(specs, sample_rate, format, max_bytes, stop2, errors2)
+                let move_aside = backup_dir.is_some();
+                if let Some(d) = &backup_dir {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                run(
+                    specs,
+                    sample_rate,
+                    format,
+                    max_bytes,
+                    stop2,
+                    errors2,
+                    copies,
+                    move_aside,
+                )
             })?;
         Ok(Self {
             stop,
             errors,
             handle: Some(handle),
+            backup: None,
+            copy_lost: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Copie de sécurité en cours.
+    #[cfg(test)]
+    pub fn has_backup(&self) -> bool {
+        self.backup.is_some()
     }
 
     /// Erreurs disque survenues depuis le début de la prise (sans doublons).
     pub fn errors(&self) -> Vec<String> {
         let mut v = self.errors.lock().clone();
         v.dedup();
+        if let Some(b) = &self.backup {
+            for e in b.errors() {
+                v.push(format!("copie de sécurité : {e}"));
+            }
+            if !b.is_alive() && !self.stop.load(Ordering::Relaxed) {
+                v.push("copie de sécurité arrêtée (erreur interne)".into());
+            }
+        }
+        let lost = self.copy_lost.load(Ordering::Relaxed);
+        if lost > 0 {
+            v.push("copie de sécurité : le second disque ne suit pas (silence inséré)".into());
+        }
         v
     }
 
@@ -398,6 +585,21 @@ impl Recorder {
     /// N'attend jamais indéfiniment : si le disque ne répond plus, on rend la main à
     /// l'interface (les fichiers seront réparés par la récupération).
     pub fn finish(mut self) -> Result<Vec<RecResult>, FinishError> {
+        let backup = self.backup.take();
+        let res = self.finish_main();
+        // La copie se termine à part (son disque peut être lent) : l'enregistrement
+        // principal rend la main sans l'attendre.
+        if let Some(b) = backup {
+            let _ = std::thread::Builder::new()
+                .name("tracksplus-backup-finish".into())
+                .spawn(move || {
+                    let _ = b.finish();
+                });
+        }
+        res
+    }
+
+    fn finish_main(&mut self) -> Result<Vec<RecResult>, FinishError> {
         self.stop.store(true, Ordering::Release);
         let Some(h) = self.handle.take() else {
             return Err(FinishError::Panicked);
@@ -447,6 +649,7 @@ fn wav_spec(format: RecFormat, sample_rate: u32, channels: u16) -> WavSpec {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     specs: Vec<RecSpec>,
     sample_rate: u32,
@@ -454,7 +657,10 @@ fn run(
     max_bytes: u64,
     stop: Arc<AtomicBool>,
     errors: Errors,
+    copies: Vec<Option<CopyOut>>,
+    move_aside: bool,
 ) -> Vec<RecResult> {
+    let mut copies = copies.into_iter();
     // Heure du début de la prise (la même pour toutes les pistes : elles restent calées
     // entre elles dans un logiciel qui place les fichiers à leur heure).
     let take_time = chrono::Local::now().naive_local();
@@ -488,11 +694,13 @@ fn run(
                 retry_at: None,
                 take_time,
                 time_ref,
+                move_aside,
             };
             st.open_next(&errors);
             Lane {
                 cons: spec.cons,
                 st,
+                copy: copies.next().flatten(),
             }
         })
         .collect();
@@ -528,6 +736,9 @@ fn run(
             let bytes_per_frame = (st.wav.bits_per_sample / 8) as u64 * width as u64;
             let max_frames = (max_bytes.saturating_sub(1024) / bytes_per_frame).max(1);
             let (a, b) = chunk.as_slices();
+            if let Some(c) = &mut lane.copy {
+                c.forward(a, b);
+            }
             for &s in a.iter().chain(b) {
                 // Position dans la trame, indépendante de l'état du fichier : même après
                 // une erreur d'écriture, les canaux restent dans le bon ordre.
@@ -1046,6 +1257,78 @@ mod tests {
         assert_eq!(crate::recovery::repair_wav(&path).unwrap(), 1500);
         assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 1500);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Copie de sécurité : fichiers identiques sur le second disque ; un second disque
+    /// absent n'empêche jamais l'enregistrement principal (erreur signalée).
+    #[test]
+    fn backup_copy_is_identical_and_never_blocks_main() {
+        let base = std::env::temp_dir().join(format!("tp-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (main, copy) = (base.join("main"), base.join("copie/Audio"));
+        std::fs::create_dir_all(&main).unwrap();
+        // Un fichier à la place du dossier parent : la copie ne peut pas être créée.
+        std::fs::write(base.join("bloque"), b"x").unwrap();
+        // Fichier homonyme d'une ancienne session sur le second disque : mis de côté.
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("a.wav"), b"ancien").unwrap();
+        for (backup, ok) in [(copy.clone(), true), (base.join("bloque/Audio"), false)] {
+            let file = if ok { "a.wav" } else { "b.wav" };
+            let (mut prod, cons) = rtrb::RingBuffer::new(100_000);
+            let rec = Recorder::start_with_backup(
+                vec![RecSpec {
+                    track_id: 1,
+                    file: file.into(),
+                    path: main.join(file),
+                    peaks: Arc::new(RwLock::new(PeakData::default())),
+                    cons,
+                    channels: 2,
+                }],
+                48000,
+                RecFormat::Int24,
+                Some(backup.clone()),
+            )
+            .unwrap();
+            assert!(rec.has_backup());
+            for i in 0..2 * 30_000 {
+                prod.push(((i % 97) as f32 - 48.0) / 100.0).unwrap();
+            }
+            drop(prod);
+            if !ok {
+                // Erreur signalée par le thread de la copie, sans toucher au principal.
+                let t0 = Instant::now();
+                while !rec.errors().iter().any(|e| e.contains("copie de sécurité"))
+                    && t0.elapsed() < Duration::from_secs(3)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(rec.errors().iter().any(|e| e.contains("copie de sécurité")));
+            }
+            let res = rec.finish().unwrap();
+            assert_eq!(res[0].frames(), 30_000);
+            assert!(res[0].error.is_none(), "principal intact");
+            if ok {
+                // La copie se termine dans son propre thread.
+                let t0 = Instant::now();
+                let read = |p: &Path| -> Option<Vec<i32>> {
+                    let mut r = hound::WavReader::open(p).ok()?;
+                    (r.duration() == 30_000)
+                        .then(|| r.samples::<i32>().map(|x| x.unwrap()).collect())
+                };
+                let mut got = None;
+                while t0.elapsed() < Duration::from_secs(5) && got.is_none() {
+                    got = read(&backup.join(file));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert_eq!(got, read(&main.join(file)), "copie identique");
+                let aside = std::fs::read_dir(&backup)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("a.wav.ancien-"));
+                assert!(aside, "ancien fichier gardé de côté");
+            }
+        }
+        std::fs::remove_dir_all(base).ok();
     }
 
     fn rec_errors_count(res: &[RecResult]) -> usize {

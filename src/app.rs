@@ -317,6 +317,10 @@ pub struct App {
     pub save_error_at: f64,
     /// Dernier changement de session refusé faute de sauvegarde (voir `save_before_leaving`).
     pub leave_anyway_at: f64,
+    /// Dossier de la copie de sécurité des prises (second disque), réglage de l'ordinateur.
+    pub backup_root: Option<PathBuf>,
+    /// Problèmes de la copie de sécurité pendant la dernière prise (affichés à la fin).
+    pub backup_warn: Vec<String>,
     /// Carte son perdue : prochain essai de réouverture (secondes) et délai courant.
     pub reconnect: Option<(f64, f64)>,
     /// Mesure de l'espace disque libre en cours (thread).
@@ -502,6 +506,8 @@ impl App {
             disk_stalled: false,
             save_error_at: f64::NEG_INFINITY,
             leave_anyway_at: f64::NEG_INFINITY,
+            backup_root: crate::sessions::StartupPrefs::load().backup_dir,
+            backup_warn: Vec::new(),
             reconnect: None,
             disk_job: None,
             rec_latency: 0,
@@ -840,7 +846,25 @@ impl App {
                 true,
             );
         }
-        let recorder = match Recorder::start(specs, sr, self.project.rec_format) {
+        // Copie de sécurité : double de la session (fichier de session et journal compris)
+        // sur le second disque, écrit dans un thread — un disque en veille ne retarde pas
+        // la prise ; s'il est absent, la prise principale se fait quand même.
+        let backup = self.backup_session_dir();
+        if let Some(bdir) = &backup {
+            let (mut copy, j, bdir) = (self.project.clone(), journal_copy.clone(), bdir.clone());
+            std::thread::spawn(move || {
+                copy.dir = bdir.clone();
+                let _ = copy.save();
+                let _ = recovery::write_journal(&bdir, &j);
+            });
+        }
+        self.backup_warn.clear();
+        let recorder = match Recorder::start_with_backup(
+            specs,
+            sr,
+            self.project.rec_format,
+            backup.map(|d| d.join(project::AUDIO_DIR)),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 recovery::remove_journal(&self.project.dir);
@@ -931,6 +955,11 @@ impl App {
                 self.awake = None;
                 match self.recorder.take() {
                     Some(rec) => {
+                        self.backup_warn = rec
+                            .errors()
+                            .into_iter()
+                            .filter(|e| e.starts_with("copie"))
+                            .collect();
                         let (tx, rx) = std::sync::mpsc::channel();
                         std::thread::spawn(move || {
                             let _ = tx.send(rec.finish());
@@ -1109,6 +1138,7 @@ impl App {
         if save.is_ok() {
             // Les prises sont référencées dans la session : le journal n'est plus utile.
             recovery::remove_journal(&self.project.dir);
+            self.sync_backup_session();
         }
         let overruns = self.engine.shared.overruns.swap(0, Ordering::Relaxed);
         // Décrochages du pilote pendant la prise (ils restent affichés en bas d'écran).
@@ -1132,6 +1162,15 @@ impl App {
                     "Prise enregistrée · {} · mais le pilote audio a signalé {xruns} décrochage{} : augmentez le buffer ou passez en ASIO",
                     fmt_time(max_len, self.sr()),
                     if xruns > 1 { "s" } else { "" }
+                ),
+                true,
+            );
+        } else if !self.backup_warn.is_empty() {
+            let w = std::mem::take(&mut self.backup_warn);
+            self.notify(
+                format!(
+                    "Prise enregistrée sur le disque principal · Copie de sécurité incomplète : {}",
+                    w.join(" ; ")
                 ),
                 true,
             );
@@ -1204,6 +1243,42 @@ impl App {
             // tant que la carte est absente.
             Err(_) => self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0))),
         }
+    }
+
+    fn set_backup_root(&mut self, d: Option<PathBuf>) {
+        let mut prefs = crate::sessions::StartupPrefs::load();
+        prefs.backup_dir = d.clone();
+        prefs.save();
+        self.notify(
+            match &d {
+                Some(d) => format!("Copie de sécurité activée : {}", d.display()),
+                None => "Copie de sécurité désactivée".to_string(),
+            },
+            false,
+        );
+        self.backup_root = d;
+    }
+
+    /// Dossier de la session dans la copie de sécurité (`<second disque>/<session>`).
+    pub fn backup_session_dir(&self) -> Option<PathBuf> {
+        self.backup_root
+            .as_ref()
+            .map(|r| r.join(project::sanitize(&self.project.name)))
+    }
+
+    /// Met à jour le double de la session sur le second disque (prises de la dernière
+    /// prise comprises) et y retire le journal, dans un thread.
+    fn sync_backup_session(&self) {
+        let Some(bdir) = self.backup_session_dir() else {
+            return;
+        };
+        let mut copy = self.project.clone();
+        std::thread::spawn(move || {
+            copy.dir = bdir.clone();
+            if copy.save().is_ok() {
+                recovery::remove_journal(&bdir);
+            }
+        });
     }
 
     /// Prise illisible pendant la lecture (fichier absent, déplacé ou abîmé) : elle est
@@ -2736,6 +2811,44 @@ impl App {
                 self.project.rec_format = f;
                 self.project.dirty = true;
             }
+        }
+        // Copie de sécurité simultanée sur un second disque (comme Reaper, Pyramix ou
+        // les enregistreurs Sound Devices) : si le disque principal lâche, tout est là.
+        let label = match &self.backup_root {
+            Some(d) => format!("Copie de sécurité : {}", d.display()),
+            None => "Copie de sécurité sur un second disque…".to_string(),
+        };
+        if ui
+            .add_enabled(stopped, egui::Button::new(label))
+            .on_hover_text(
+                "Enregistre chaque prise en même temps sur un second disque (clé, SSD externe), \
+                 avec un double de la session ouvrable tel quel. Un second disque lent, plein \
+                 ou débranché ne gêne jamais l'enregistrement principal.\nClic : choisir le dossier.",
+            )
+            .clicked()
+        {
+            ui.close();
+            if let Some(d) = rfd::FileDialog::new()
+                .set_title("Dossier de la copie de sécurité (second disque)")
+                .pick_folder()
+            {
+                if d.starts_with(&self.project.dir) || self.project.dir.starts_with(&d) {
+                    self.notify(
+                        "Choisissez un dossier sur un autre disque que celui de la session",
+                        true,
+                    );
+                } else {
+                    self.set_backup_root(Some(d));
+                }
+            }
+        }
+        if self.backup_root.is_some()
+            && ui
+                .add_enabled(stopped, egui::Button::new("Arrêter la copie de sécurité"))
+                .clicked()
+        {
+            ui.close();
+            self.set_backup_root(None);
         }
         ui.separator();
         ui.label(
