@@ -986,6 +986,10 @@ pub struct ReconnectJob {
 /// Flux muet depuis plus longtemps que ça (s) : considéré comme perdu et rouvert.
 const STREAM_STALL: f64 = 3.0;
 
+/// ASIO : pilote ouvert qui n'a toujours pas démarré ce temps-là après l'alerte (s) :
+/// relâché, puis réessayé plus tard (`App::watch_streams`).
+const NOT_STARTED_RELEASE: f64 = 2.0;
+
 /// Pendant une prise, l'entrée muette sans erreur du pilote (horloge Dante perdue) garde
 /// la prise ouverte (alerte rouge, silence comblé à la reprise) ; arrêt seulement au-delà.
 const REC_STALL_STOP: f64 = 20.0;
@@ -1161,8 +1165,14 @@ pub struct App {
     /// Virtual Soundcard sans horloge sur le réseau) n'est pas « perdu » : on l'attend.
     open_seen: u8,
     started: u8,
-    /// Flux ouverts qui attendent leur premier bloc depuis plus de `STREAM_STALL`.
+    /// Flux ouverts qui attendent leur premier bloc depuis plus de `STREAM_STALL`, et
+    /// depuis quand.
     not_started: u8,
+    not_started_since: f64,
+    /// Pilote ASIO relâché faute de démarrer (Dante Virtual Soundcard sans horloge) :
+    /// réessayé de temps en temps, sans le garder (il resterait verrouillé, ses réglages
+    /// grisés), et sans répéter les messages.
+    clockless: bool,
     /// Dernière réouverture : instant et délai d'attente d'alors (flux reperdu juste après :
     /// les essais restent espacés).
     last_reopen: Option<(f64, f64)>,
@@ -1415,6 +1425,8 @@ impl App {
             open_seen: 0,
             started: 0,
             not_started: 0,
+            not_started_since: 0.0,
+            clockless: false,
             announce: false,
             last_reopen: None,
             take_split: false,
@@ -3061,13 +3073,24 @@ impl App {
         let stalled = stalled & self.started;
         let waiting = never | (self.not_started & open & !self.started);
         if waiting != 0 && self.not_started == 0 {
-            let msg = self.not_started_message(waiting);
-            self.device_notice(msg);
-        } else if waiting == 0 && self.not_started != 0 && open != 0 {
+            self.not_started_since = now;
+            if !self.clockless {
+                let msg = self.not_started_message(waiting);
+                self.device_notice(msg);
+            }
+        } else if waiting == 0 && (self.not_started != 0 || self.clockless) && beating & open != 0 {
+            self.clockless = false;
             self.device_note.clear();
             self.notify("Carte son prête", false);
         }
         self.not_started = waiting;
+        // ASIO : un pilote qui ne démarre pas n'est pas gardé (l'application du pilote,
+        // Dante Virtual Soundcard par exemple, resterait verrouillée, ses réglages grisés).
+        // Relâché, puis réessayé de temps en temps (essais de plus en plus espacés).
+        let release = waiting != 0
+            && self.prefs.host.as_deref() == Some("ASIO")
+            && now - self.not_started_since > NOT_STARTED_RELEASE
+            && !self.take_in_progress();
         let sh = &self.engine.shared;
         // (Un flux fermé n'est plus « seulement muet » : il est rouvert ou absent.)
         self.stalled &= open;
@@ -3080,6 +3103,15 @@ impl App {
             self.announce = true;
         }
         self.awaiting &= !beating;
+        if release {
+            self.clockless = true;
+            self.not_started = 0;
+            self.engine.pad(PadCmd::StopAll);
+            self.engine.release();
+            self.hb = [(0, now); audio::SLOTS];
+            self.open_seen = 0;
+            self.started = 0;
+        }
     }
 
     /// Message pour des flux ouverts qui n'ont jamais démarré (`watch_streams`).
@@ -3346,12 +3378,15 @@ impl App {
                 _ => 1.0,
             };
             self.reconnect = Some((self.now + delay, delay));
-            let what = self.engine.problems(lost).join(" · ");
-            self.device_notice(if lost != 0 {
-                format!("Carte son perdue ({what}) : reconnexion automatique…")
-            } else {
-                format!("Carte son : {what} — en attente de son retour…")
-            });
+            // Pilote relâché faute d'horloge : son message est déjà affiché.
+            if !self.clockless {
+                let what = self.engine.problems(lost).join(" · ");
+                self.device_notice(if lost != 0 {
+                    format!("Carte son perdue ({what}) : reconnexion automatique…")
+                } else {
+                    format!("Carte son : {what} — en attente de son retour…")
+                });
+            }
         }
         let Some((at, delay)) = self.reconnect else {
             return;
@@ -3547,7 +3582,7 @@ impl App {
             self.reconnect = None;
         } else {
             self.reconnect = Some((self.now + delay, next_delay(delay, asio)));
-            if touched != 0 {
+            if touched != 0 && !self.clockless {
                 let what = self.engine.problems(lost).join(" · ");
                 self.device_notice(format!("Carte son : {what} — nouvel essai automatique…"));
             }
@@ -4905,6 +4940,7 @@ impl App {
         self.last_reopen = None;
         self.open_seen = 0;
         self.not_started = 0;
+        self.clockless = false;
         self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();

@@ -71,6 +71,7 @@ lto = "thin"
 strip = "debuginfo"
 
 # Copie locale de asio-sys : permet la compilation croisée Windows (MinGW) avec ASIO.
-# Seule modification : voir vendor/asio-sys/build.rs (« TracksPlus »).
+# Modifications marquées « TracksPlus » : vendor/asio-sys/build.rs (compilation MinGW) et
+# src/bindings/mod.rs (pilote qui refuse de démarrer toujours relâché).
 [patch.crates-io]
 asio-sys = { path = "vendor/asio-sys" }

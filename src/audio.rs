@@ -1733,6 +1733,19 @@ impl Engine {
     }
 
     /// Essai de réouverture perdu (thread mort) : ses flux manquent, à réessayer.
+    /// Ferme tous les flux sans oublier ce qui est voulu : le pilote est relâché (ASIO : son
+    /// application n'est plus verrouillée), et la reconnexion les rouvrira (`missing`).
+    pub fn release(&mut self) {
+        self.in_tx = None;
+        self.pad_tx = None;
+        for s in 0..SLOTS {
+            self.out_tx[s] = None;
+            self.streams[s] = None;
+            self.opened[s] = None;
+        }
+        self.refresh_status();
+    }
+
     pub fn reopen_lost(&mut self, slots: u8) {
         self.reopening &= !slots;
         self.refresh_status();

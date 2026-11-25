@@ -467,7 +467,14 @@ impl Asio {
                 false => Err(LoadDriverError::LoadDriverFailed),
                 true => {
                     // Initialize ASIO.
-                    asio_result!(ai::ASIOInit(driver_info.as_mut_ptr()))?;
+                    // TracksPlus : un pilote qui refuse de démarrer (Dante Virtual Soundcard
+                    // arrêtée ou en mode WDM, carte absente) est relâché aussitôt. Le SDK
+                    // oublie alors son pointeur mais garde le pilote chargé : il resterait
+                    // dans le processus, et l'application du pilote resterait verrouillée.
+                    if let Err(e) = asio_result!(ai::ASIOInit(driver_info.as_mut_ptr())) {
+                        ai::remove_current_driver();
+                        return Err(e.into());
+                    }
                     let _driver_info = driver_info.assume_init();
                     let mut rate: c_double = 0.0;
                     let _ = asio_result!(ai::get_sample_rate(&mut rate));
@@ -992,8 +999,10 @@ impl DriverState {
             self.dispose_buffers()?;
         }
         unsafe {
-            asio_result!(ai::ASIOExit())?;
+            // TracksPlus : le pilote est relâché même si ASIOExit signale une erreur.
+            let exit = asio_result!(ai::ASIOExit());
             ai::remove_current_driver();
+            exit?;
         }
         Ok(())
     }
