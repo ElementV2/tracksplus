@@ -116,10 +116,13 @@ impl Pad {
 }
 
 pub fn db_to_gain(db: f32) -> f32 {
-    if db <= -60.0 {
+    // Valeur abîmée (NaN) : gain neutre ; au-delà de +24 dB, borné (fichier fabriqué).
+    if db.is_nan() {
+        1.0
+    } else if db <= -60.0 {
         0.0
     } else {
-        10f32.powf(db / 20.0)
+        10f32.powf(db.min(24.0) / 20.0)
     }
 }
 
@@ -646,9 +649,18 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
             return Err(anyhow!("Son trop long : 30 min maximum pour un pad"));
         }
         data.try_reserve(b.samples().len() / ch * 2).map_err(oom)?;
+        // NaN / infini (fichier abîmé) : silence. Sans cela, un seul pad abîmé rendrait
+        // tout le mixage de sortie NaN — donc muet — pendant qu'il joue.
+        let clean = |x: f32| {
+            if x.is_finite() {
+                x.clamp(-16.0, 16.0)
+            } else {
+                0.0
+            }
+        };
         for frame in b.samples().chunks(ch) {
-            data.push(frame[0]);
-            data.push(if ch > 1 { frame[1] } else { frame[0] });
+            data.push(clean(frame[0]));
+            data.push(clean(if ch > 1 { frame[1] } else { frame[0] }));
         }
     }
     // Décodeur et tampons libérés avant le rééchantillonnage.

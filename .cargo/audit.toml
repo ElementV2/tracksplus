@@ -1,0 +1,28 @@
+# Configuration de `cargo audit` (base RustSec).
+#
+# Alertes examinées et sans effet sur TracksPlus (revue de novembre 2026) :
+#
+# - heapless 0.8 (RUSTSEC-2026-0574 à 0582, « unsound ») : dépendance de flacenc (export
+#   FLAC). flacenc n'utilise que `heapless::Vec<f64|i32, 32>` dans le calcul LPC ; les
+#   défauts signalés portent sur Deque, IndexMap, Spsc, la pile de Treiber,
+#   SortedLinkedList et un Drop qui panique — rien de cela n'est utilisé. À retirer dès
+#   qu'une version de flacenc passe à heapless ≥ 0.9.4.
+# - chrono, ttf-parser, zbus_names, zvariant(_derive) : « non maintenus », sans faille
+#   connue ; aucune version de remplacement n'existe aujourd'hui.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]

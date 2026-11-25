@@ -757,13 +757,20 @@ impl Engine {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        // Attente par sondage (pas de `recv_timeout`) : sans récepteur endormi, l'envoi
+        // côté callback audio ne prend aucun verrou et ne réveille aucun thread.
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match self.in_garbage_rx.recv_timeout(left) {
+            match self.in_garbage_rx.try_recv() {
                 // Liste vide = celle remplacée au démarrage ; on attend celle de la prise.
                 Ok(v) if v.is_empty() => continue,
                 Ok(_) => return true,
-                Err(_) => return false,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if std::time::Instant::now() > deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
         }
     }
@@ -914,12 +921,17 @@ where
             let sh = &*st.shared;
             sh.in_block.store(frames as u32, Ordering::Relaxed);
 
-            for c in 0..ch.min(MAX_INPUTS) {
-                let mut peak = 0f32;
-                for f in 0..frames {
-                    peak = peak.max(data[f * ch + c].to_sample::<f32>().abs());
+            // Crêtes par canal en un seul passage dans l'ordre de la mémoire (au lieu d'un
+            // passage par canal en sautant de trame en trame : 64× moins de lectures).
+            let mc = ch.min(MAX_INPUTS);
+            let mut peaks = [0f32; MAX_INPUTS];
+            for frame in data.chunks_exact(ch) {
+                for (p, s) in peaks[..mc].iter_mut().zip(&frame[..mc]) {
+                    *p = p.max(s.to_sample::<f32>().abs());
                 }
-                sh.meters[c].fetch_max(peak.to_bits(), Ordering::Relaxed);
+            }
+            for (m, p) in sh.meters.iter().zip(&peaks[..mc]) {
+                m.fetch_max(p.to_bits(), Ordering::Relaxed);
             }
 
             // Monitoring direct : mix stéréo des canaux écoutés vers la sortie.
@@ -1004,7 +1016,12 @@ fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize, usize) -
     if n > 0
         && let Ok(chunk) = t.prod.write_chunk_uninit(n * w)
     {
-        chunk.fill_from_iter((0..n * w).map(|i| sample(i / w, i % w)));
+        // Cas courants spécialisés (pas de division par échantillon).
+        match w {
+            1 => chunk.fill_from_iter((0..n).map(|f| sample(f, 0))),
+            2 => chunk.fill_from_iter((0..n).flat_map(|f| [sample(f, 0), sample(f, 1)])),
+            _ => chunk.fill_from_iter((0..n * w).map(|i| sample(i / w, i % w))),
+        };
     }
     if n < frames {
         t.pending += frames - n;

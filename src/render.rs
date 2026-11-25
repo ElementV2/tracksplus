@@ -334,7 +334,13 @@ impl WavSource {
         let file = File::open(path)?;
         let reader = WavReader::new(BufReader::with_capacity(WAV_BUF, file))?;
         let spec = reader.spec();
-        let frames = reader.duration() as u64;
+        // En-tête annonçant plus de données que le fichier n'en contient (fichier tronqué
+        // ou abîmé) : on s'en tient à ce qui existe vraiment, sinon des milliards
+        // d'échantillons « illisibles » seraient lus un par un.
+        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX);
+        let frame_bytes =
+            (spec.channels.max(1) as u64) * (spec.bits_per_sample.div_ceil(8).max(1) as u64);
+        let frames = (reader.duration() as u64).min(file_len / frame_bytes);
         Ok(Self {
             float: spec.sample_format == SampleFormat::Float,
             // En-tête abîmé : nombre de bits borné (pas de décalage hors limites).
@@ -385,29 +391,37 @@ impl WavSource {
         let errs = std::cell::Cell::new(0u64);
         let n = if self.float {
             fill(
-                self.reader.samples::<f32>().take(total).map(|s| match s {
-                    // NaN / infini dans un fichier flottant abîmé : silence (ils
-                    // contamineraient mixage, vumètres et formes d'onde).
-                    // Bornés à +24 dB : la somme de deux canaux ne peut pas déborder.
-                    Ok(v) if v.is_finite() => v.clamp(-16.0, 16.0),
-                    Ok(_) => 0.0,
-                    Err(_) => {
-                        errs.set(errs.get() + 1);
-                        0.0
-                    }
-                }),
+                self.reader
+                    .samples::<f32>()
+                    .take(total)
+                    .map_while(|s| match s {
+                        // NaN / infini dans un fichier flottant abîmé : silence (ils
+                        // contamineraient mixage, vumètres et formes d'onde).
+                        // Bornés à +24 dB : la somme de deux canaux ne peut pas déborder.
+                        Ok(v) if v.is_finite() => Some(v.clamp(-16.0, 16.0)),
+                        Ok(_) => Some(0.0),
+                        // Erreur de lecture (fin de fichier prématurée) : on s'arrête là.
+                        Err(_) => {
+                            errs.set(errs.get() + 1);
+                            None
+                        }
+                    }),
                 fc,
                 out_ch,
                 out,
             )
         } else {
             fill(
-                self.reader.samples::<i32>().take(total).map(|s| {
-                    s.map(|v| v as f32 * scale).unwrap_or_else(|_| {
-                        errs.set(errs.get() + 1);
-                        0.0
-                    })
-                }),
+                self.reader
+                    .samples::<i32>()
+                    .take(total)
+                    .map_while(|s| match s {
+                        Ok(v) => Some(v as f32 * scale),
+                        Err(_) => {
+                            errs.set(errs.get() + 1);
+                            None
+                        }
+                    }),
                 fc,
                 out_ch,
                 out,
@@ -415,6 +429,10 @@ impl WavSource {
         };
         self.read_errors += errs.get();
         self.pos += n as u64;
+        if errs.get() > 0 {
+            // Plus rien de lisible au-delà : la suite est du silence, sans relire.
+            self.frames = self.pos;
+        }
         n
     }
 }

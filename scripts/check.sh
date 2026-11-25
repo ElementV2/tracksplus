@@ -7,6 +7,11 @@ cd "$(dirname "$0")/.."
 echo "== Formatage";      cargo fmt --check
 echo "== Lint";           cargo clippy --all-targets -- -D warnings
 echo "== Tests";          cargo test
+if command -v cargo-audit >/dev/null; then
+  echo "== Failles connues des dépendances (RustSec)"; cargo audit -q
+else
+  echo "== cargo audit ignoré (cargo install cargo-audit --locked)"
+fi
 echo "== Charge 64 pistes temps réel (10 s)"
 cargo test --release -- --ignored realtime_64_tracks
 echo "== Build release Linux"; cargo build --release
