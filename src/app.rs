@@ -252,6 +252,16 @@ pub struct SbState {
     pub deleted: Option<(u16, crate::soundboard::Pad)>,
 }
 
+/// Secondes de tampon disque par piste : comme les enregistreurs pro (Ardour 10 s par
+/// défaut, jusqu'à 20 s sur disque lent), le plus possible dans un budget de 256 Mo,
+/// entre 4 et 15 s. Un disque qui a un trou d'une dizaine de secondes (veille, analyse
+/// antivirus, réindexation) ne fait rien perdre.
+fn record_buffer_secs(sr: u32, channels: usize) -> usize {
+    const BUDGET: usize = 256 << 20;
+    let per_sec = sr as usize * channels.max(1) * std::mem::size_of::<f32>();
+    (BUDGET / per_sec.max(1)).clamp(4, 15)
+}
+
 const OUTPUT_STALLED: &str =
     "La sortie audio ne répond pas : vérifiez la carte son (Réglages audio pour la relancer)";
 
@@ -305,6 +315,8 @@ pub struct App {
     pub save_error_at: f64,
     /// Dernier changement de session refusé faute de sauvegarde (voir `save_before_leaving`).
     pub leave_anyway_at: f64,
+    /// Carte son perdue : prochain essai de réouverture (secondes) et délai courant.
+    pub reconnect: Option<(f64, f64)>,
     /// Mesure de l'espace disque libre en cours (thread).
     pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
@@ -488,6 +500,7 @@ impl App {
             disk_stalled: false,
             save_error_at: f64::NEG_INFINITY,
             leave_anyway_at: f64::NEG_INFINITY,
+            reconnect: None,
             disk_job: None,
             rec_latency: 0,
             rec_overdub: false,
@@ -772,13 +785,13 @@ impl App {
         let mut targets = Vec::new();
         let mut used = HashSet::new();
         self.live.clear();
+        let ring_secs = record_buffer_secs(sr, armed.iter().map(|a| if a.3 { 2 } else { 1 }).sum());
         for (track_id, name, input, stereo) in armed {
             // Nom unique sur le disque et dans cette prise, sans tenir compte de la casse.
             let file = self.project.new_take_file_avoiding(&name, &used);
             used.insert(file.to_lowercase());
             let width: u16 = if stereo { 2 } else { 1 };
-            // 4 s de tampon par piste, quel que soit le nombre de canaux.
-            let (prod, cons) = rtrb::RingBuffer::new(sr as usize * 4 * width as usize);
+            let (prod, cons) = rtrb::RingBuffer::new(sr as usize * ring_secs * width as usize);
             let peaks: Peaks = Arc::new(RwLock::new(PeakData::default()));
             specs.push(RecSpec {
                 track_id,
@@ -1153,6 +1166,43 @@ impl App {
     }
 
     /// Alertes en direct pendant un enregistrement (bandeau rouge en haut).
+    /// Carte son disparue (DVS relancé, câble USB, pilote réinitialisé) : comme les
+    /// logiciels pro, on la rouvre tout seul. Jamais pendant une prise (elle se termine
+    /// proprement par Stop, la suite est récupérable) ; la lecture, elle, est arrêtée.
+    fn watch_device(&mut self) {
+        let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
+        if lost && self.reconnect.is_none() {
+            self.reconnect = Some((self.now + 1.0, 1.0));
+            if matches!(self.transport, Transport::Playing { .. }) {
+                self.stop();
+            }
+            if !self.is_recording() {
+                self.notify("Carte son perdue : reconnexion automatique…", true);
+            }
+        }
+        let Some((at, delay)) = self.reconnect else {
+            return;
+        };
+        if self.now < at || !self.is_stopped() {
+            return;
+        }
+        self.engine.pad(PadCmd::StopAll);
+        // L'ancien pilote est libéré avant (ASIO n'en accepte qu'un à la fois).
+        self.engine = Engine::offline();
+        match Engine::open(&self.prefs, &self.prefs.pad_out()) {
+            Ok(e) => {
+                self.engine = e;
+                self.reconnect = None;
+                self.cache.set_sample_rate(self.engine.status.sample_rate);
+                self.sync_engine_to_board();
+                self.notify("Carte son reconnectée", false);
+            }
+            // Essais de plus en plus espacés (jusqu'à 10 s) : l'interface ne saccade pas
+            // tant que la carte est absente.
+            Err(_) => self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0))),
+        }
+    }
+
     /// Prise illisible pendant la lecture (fichier absent, déplacé ou abîmé) : elle est
     /// jouée en silence, on le dit au lieu de laisser croire à une piste vide.
     fn poll_play_errors(&mut self) {
@@ -4105,6 +4155,7 @@ impl eframe::App for App {
             self.poll_finishing(false);
             self.poll_save_as();
             self.poll_play_errors();
+            self.watch_device();
             self.poll_import();
             self.soundboard_background(ctx);
             self.update_background(ctx);

@@ -212,6 +212,7 @@ impl Player {
         let handle = std::thread::Builder::new()
             .name("tracksplus-disk-reader".into())
             .spawn(move || {
+                crate::recorder::raise_disk_thread_priority();
                 while !stop2.load(Ordering::Acquire) && !prod.is_abandoned() {
                     if !mixer.fill(&mut prod) {
                         std::thread::sleep(Duration::from_millis(3));

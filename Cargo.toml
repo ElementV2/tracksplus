@@ -33,6 +33,10 @@ id3 = { version = "1.17.4", default-features = false }
 
 # Une seule instance : ramener au premier plan la fenêtre déjà ouverte.
 [target.'cfg(windows)'.dependencies]
+# WASAPI : thread audio en priorité « Pro Audio » (MMCSS), comme les logiciels pro.
+# Sans cette option, cpal laisse le callback en priorité normale (risque de décrochages
+# dès que l'interface ou l'antivirus travaillent).
+cpal = { version = "0.18.2", features = ["realtime"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [build-dependencies]

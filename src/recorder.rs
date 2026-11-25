@@ -83,6 +83,20 @@ pub fn start_sidecar(file: &str) -> String {
     format!("{file}.start")
 }
 
+/// Threads disque (écriture des prises, lecture des pistes) : priorité haute, juste
+/// sous celle des callbacks audio, comme dans les logiciels pro — l'interface, l'export
+/// ou l'antivirus ne doivent jamais les retarder au point de vider leurs tampons.
+pub fn raise_disk_thread_priority() {
+    #[cfg(windows)]
+    // SAFETY : appel sans pointeur sur le thread courant.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+}
+
 /// Nom du k-ième fichier d'une prise (k = 1 : nom de base).
 pub fn segment_name(base: &str, k: usize) -> String {
     if k <= 1 {
@@ -240,7 +254,10 @@ impl Recorder {
         let errors2 = errors.clone();
         let handle = std::thread::Builder::new()
             .name("tracksplus-disk-writer".into())
-            .spawn(move || run(specs, sample_rate, format, max_bytes, stop2, errors2))?;
+            .spawn(move || {
+                raise_disk_thread_priority();
+                run(specs, sample_rate, format, max_bytes, stop2, errors2)
+            })?;
         Ok(Self {
             stop,
             errors,

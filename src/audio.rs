@@ -226,6 +226,9 @@ pub struct Shared {
     /// n'ont aucune conséquence (et certains pilotes, surtout virtuels, en signalent).
     pub counting: AtomicBool,
     pub last_error: Mutex<Option<String>>,
+    /// Carte son disparue ou flux invalidé (DVS relancé, USB débranché, périphérique par
+    /// défaut changé, fréquence modifiée dans le pilote) : l'interface la rouvre.
+    pub device_lost: AtomicBool,
     /// Crêtes L/R de la lecture multipiste (bits f32).
     pub master_play: [AtomicU32; 2],
     /// Crêtes L/R du soundboard (bits f32).
@@ -262,6 +265,7 @@ impl Shared {
             in_block: AtomicU32::new(0),
             out_block: AtomicU32::new(0),
             last_error: Mutex::new(None),
+            device_lost: AtomicBool::new(false),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
             master_mon: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -315,6 +319,14 @@ impl Shared {
     }
 
     fn on_error(&self, err: cpal::Error) {
+        if matches!(
+            err.kind(),
+            cpal::ErrorKind::DeviceNotAvailable
+                | cpal::ErrorKind::StreamInvalidated
+                | cpal::ErrorKind::DeviceChanged
+        ) {
+            self.device_lost.store(true, Ordering::Release);
+        }
         if err.kind() == cpal::ErrorKind::Xrun {
             if self.counting.load(Ordering::Relaxed) {
                 self.xruns.fetch_add(1, Ordering::Relaxed);
@@ -1790,6 +1802,11 @@ mod tests {
         drop(guard);
         sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into());
         assert!(sh.last_error.lock().is_some());
+        // Carte disparue : signalée pour la reconnexion automatique (un décrochage, non).
+        assert!(sh.device_lost.load(Ordering::Acquire));
+        let sh2 = Shared::new();
+        sh2.on_error(cpal::ErrorKind::Xrun.into());
+        assert!(!sh2.device_lost.load(Ordering::Acquire));
     }
 
     #[test]
