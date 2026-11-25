@@ -919,7 +919,7 @@ impl App {
     /// décalage mesuré et la latence, pour qu'une prise récupérée après un crash tombe en
     /// place elle aussi.
     fn complete_journal(&mut self) {
-        if !self.is_recording() || self.engine.shared.rec_frames.load(Ordering::Relaxed) == 0 {
+        if !self.is_recording() || self.engine.shared.rec_frames.load(Ordering::Acquire) == 0 {
             return;
         }
         let Some(mut j) = self.journal_pending.take() else {

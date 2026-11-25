@@ -134,6 +134,14 @@ pub fn recover(project: &mut Project) -> Result<usize> {
             if frames == 0 {
                 continue;
             }
+            // Même recalage qu'à la fin normale d'une prise : début du premier fichier
+            // sauté de la latence (vaut aussi pour placer les fichiers suivants).
+            let skip = if k == 1 {
+                j.latency
+                    .min(frames.saturating_sub(crate::project::MIN_CLIP))
+            } else {
+                0
+            };
             let already = project
                 .tracks
                 .iter()
@@ -158,14 +166,6 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                         hound::WavReader::open(&path).is_ok_and(|r| r.spec().channels >= 2);
                     project.add_track_ch(Some(format!("{name} (récupérée)")), None, stereo)
                 };
-                // Même recalage qu'à la fin normale d'une prise : début du premier fichier
-                // sauté de la latence.
-                let skip = if k == 1 {
-                    j.latency
-                        .min(frames.saturating_sub(crate::project::MIN_CLIP))
-                } else {
-                    0
-                };
                 let id = project.alloc_id();
                 if let Some(t) = project.track_mut(track_id) {
                     t.clips.push(Clip {
@@ -180,10 +180,8 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                     });
                     n += 1;
                 }
-                pos += frames - skip;
-                continue;
             }
-            pos += frames;
+            pos += frames - skip;
         }
     }
     project.dirty = true;

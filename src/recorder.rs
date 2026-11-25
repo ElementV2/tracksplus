@@ -27,6 +27,8 @@ pub const MAX_SEGMENT_BYTES: u64 = 2_000_000_000;
 const FLUSH_EVERY: Duration = Duration::from_secs(2);
 const SYNC_EVERY: Duration = Duration::from_secs(10);
 /// À l'arrêt, abandon seulement si plus rien n'avance pendant ce délai.
+/// Délai entre deux essais de réouverture d'un fichier après une erreur d'écriture.
+const RETRY_EVERY: Duration = Duration::from_secs(1);
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_BUFFER: usize = 256 * 1024;
 
@@ -80,8 +82,9 @@ pub struct Recorder {
 
 struct SegWriter {
     w: WavWriter<BufWriter<File>>,
-    /// Second accès au fichier pour forcer l'écriture sur le disque.
-    file: File,
+    /// Second accès au fichier pour forcer l'écriture sur le disque (partagé avec le
+    /// thread de synchronisation : jamais plus d'une demande en attente par fichier).
+    file: Arc<File>,
     frames: u64,
 }
 
@@ -103,6 +106,11 @@ struct LaneState {
     done: Vec<Segment>,
     acc: PeakAccum,
     error: Option<String>,
+    /// Trames perdues depuis la fermeture sur erreur du fichier (remplacées par du
+    /// silence à la réouverture : les pistes restent alignées).
+    gap: u64,
+    /// Prochain essai de réouverture après une erreur d'écriture.
+    retry_at: Option<Instant>,
 }
 
 fn open_segment(path: &Path, wav: WavSpec) -> std::io::Result<SegWriter> {
@@ -116,7 +124,7 @@ fn open_segment(path: &Path, wav: WavSpec) -> std::io::Result<SegWriter> {
         .map_err(std::io::Error::other)?;
     Ok(SegWriter {
         w,
-        file: sync,
+        file: Arc::new(sync),
         frames: 0,
     })
 }
@@ -128,7 +136,7 @@ impl LaneState {
     }
 
     /// Ferme le fichier en cours (en-tête final + fsync).
-    fn close_current(&mut self, errors: &Errors, sync: &Sender<File>) {
+    fn close_current(&mut self, errors: &Errors, sync: &Sender<Arc<File>>) {
         if let Some(seg) = self.cur.take() {
             let name = segment_name(&self.file, self.done.len() + 1);
             let mut frames = seg.frames;
@@ -151,7 +159,50 @@ impl LaneState {
         let name = segment_name(&self.file, self.done.len() + 1);
         match open_segment(&self.dir.join(&name), self.wav) {
             Ok(w) => self.cur = Some(w),
-            Err(e) => self.fail(errors, format!("{name} : {e}")),
+            Err(e) => {
+                self.fail(errors, format!("{name} : {e}"));
+                self.retry_at = Some(Instant::now() + RETRY_EVERY);
+            }
+        }
+    }
+
+    /// Après une erreur (disque plein puis libéré, clé rebranchée…) : nouveau fichier,
+    /// qui commence par le silence des trames perdues pour rester calé sur les autres.
+    fn retry(&mut self, format: RecFormat) {
+        // Échecs répétés : l'erreur a déjà été signalée, on ne la répète pas chaque seconde.
+        let name = segment_name(&self.file, self.done.len() + 1);
+        match open_segment(&self.dir.join(&name), self.wav) {
+            Ok(w) => self.cur = Some(w),
+            Err(_) => {
+                self.retry_at = Some(Instant::now() + RETRY_EVERY);
+                return;
+            }
+        }
+        let Some(seg) = self.cur.as_mut() else {
+            return;
+        };
+        let width = self.wav.channels as u64;
+        let mut res = Ok(());
+        for _ in 0..self.gap * width {
+            res = match format {
+                RecFormat::Int24 => seg.w.write_sample(0i32),
+                RecFormat::Float32 => seg.w.write_sample(0f32),
+            };
+            if res.is_err() {
+                break;
+            }
+        }
+        match res {
+            Ok(()) => {
+                seg.frames += self.gap;
+                self.gap = 0;
+            }
+            Err(_) => {
+                // Toujours pas de place : fichier abandonné, nouvel essai plus tard.
+                self.cur = None;
+                let _ = std::fs::remove_file(self.dir.join(&name));
+                self.retry_at = Some(Instant::now() + RETRY_EVERY);
+            }
         }
     }
 }
@@ -280,6 +331,8 @@ fn run(
                 done: Vec::new(),
                 acc: PeakAccum::default(),
                 error: None,
+                gap: 0,
+                retry_at: None,
             };
             st.open_next(&errors);
             Lane {
@@ -291,7 +344,7 @@ fn run(
 
     // fsync dans un thread dédié : même lent (disque USB, Windows), il ne bloque jamais
     // le vidage des tampons.
-    let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<File>();
+    let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<Arc<File>>();
     let syncer = std::thread::Builder::new()
         .name("tracksplus-fsync".into())
         .spawn(move || {
@@ -335,7 +388,13 @@ fn run(
                     st.close_current(&errors, &sync_tx);
                     st.open_next(&errors);
                 }
+                if k == 0 && st.cur.is_none() && st.retry_at.is_some_and(|t| Instant::now() >= t) {
+                    st.retry(format);
+                }
                 let Some(seg) = st.cur.as_mut() else {
+                    if k + 1 == width {
+                        st.gap += 1;
+                    }
                     continue;
                 };
                 let r = match format {
@@ -353,8 +412,14 @@ fn run(
                     Err(e) => {
                         let msg = format!("{} : {e}", st.file);
                         st.fail(&errors, msg);
-                        // Le fichier reste valide jusqu'ici : on le ferme proprement.
+                        // Le fichier reste valide jusqu'ici : on le ferme proprement, puis
+                        // on réessaie régulièrement d'en ouvrir un nouveau.
                         st.close_current(&errors, &sync_tx);
+                        st.retry_at = Some(Instant::now() + RETRY_EVERY);
+                        if k + 1 == width {
+                            // Trame incomplète sur le disque : comptée dans le trou.
+                            st.gap += 1;
+                        }
                     }
                 }
             }
@@ -377,8 +442,10 @@ fn run(
                 if let Some(seg) = &mut st.cur {
                     if let Err(e) = seg.w.flush() {
                         err = Some(format!("{} : {e}", st.file));
-                    } else if sync && let Ok(f) = seg.file.try_clone() {
-                        let _ = sync_tx.send(f);
+                    } else if sync && Arc::strong_count(&seg.file) == 1 {
+                        // Disque lent : la synchronisation précédente n'est pas finie, on
+                        // ne l'empile pas (descripteurs de fichiers limités, macOS : 256).
+                        let _ = sync_tx.send(seg.file.clone());
                     }
                 }
                 if let Some(msg) = err {
@@ -687,6 +754,53 @@ mod tests {
         assert!(res[1].error.is_some());
         assert_eq!(res[1].frames(), 0);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Disque revenu (clé rebranchée, place libérée) : la piste reprend dans un nouveau
+    /// fichier, précédé du silence des trames perdues — elle reste calée sur les autres.
+    #[test]
+    fn lane_resumes_after_disk_error_and_stays_aligned() {
+        let dir = std::env::temp_dir().join(format!("tp-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut prod, cons) = rtrb::RingBuffer::new(100_000);
+        let rec = Recorder::start(
+            vec![RecSpec {
+                track_id: 1,
+                file: "r.wav".into(),
+                path: dir.join("r.wav"),
+                peaks: Arc::new(RwLock::new(PeakData::default())),
+                cons,
+                channels: 2,
+            }],
+            48000,
+            RecFormat::Int24,
+        )
+        .unwrap();
+        for _ in 0..3000 * 2 {
+            prod.push(0.1).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rec.errors().len(), 1);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::thread::sleep(RETRY_EVERY + Duration::from_millis(200));
+        for _ in 0..2000 * 2 {
+            prod.push(0.1).unwrap();
+        }
+        drop(prod);
+        let res = rec.finish().unwrap();
+        assert_eq!(
+            res[0].frames(),
+            5000,
+            "trou de 3000 trames comblé par du silence"
+        );
+        assert_eq!(rec_errors_count(&res), 1);
+        let r = hound::WavReader::open(dir.join(&res[0].segments[0].file)).unwrap();
+        assert_eq!(r.duration(), 5000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn rec_errors_count(res: &[RecResult]) -> usize {
+        res.iter().filter(|r| r.error.is_some()).count()
     }
 }
 

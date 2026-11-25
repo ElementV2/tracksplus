@@ -206,6 +206,12 @@ pub struct Shared {
     /// Position de lecture (trames depuis son début) au moment où la prise a vraiment
     /// commencé dans le callback d'entrée : sert à poser une prise faite en écoutant.
     pub rec_play_offset: AtomicU64,
+    /// Début du dernier bloc de lecture demandé par le pilote : valeur de `out_frames`
+    /// et instant (ns depuis `epoch`, 0 = pas de lecture). Permet de situer la lecture à
+    /// l'échantillon près entre deux callbacks de sortie (prises faites en écoutant).
+    pub out_cb_frames: AtomicU64,
+    pub out_cb_ns: AtomicU64,
+    epoch: std::time::Instant,
     /// Données perdues car le disque n'a pas suivi.
     pub overruns: AtomicU32,
     /// Trous de lecture.
@@ -246,6 +252,9 @@ impl Shared {
             rec_frames: AtomicU64::new(0),
             out_frames: AtomicU64::new(0),
             rec_play_offset: AtomicU64::new(0),
+            out_cb_frames: AtomicU64::new(0),
+            out_cb_ns: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
             overruns: AtomicU32::new(0),
             underruns: AtomicU32::new(0),
             xruns: AtomicU32::new(0),
@@ -284,6 +293,25 @@ impl Shared {
             .get(ch)
             .map(|m| f32::from_bits(m.swap(0, Ordering::Relaxed)))
             .unwrap_or(0.0)
+    }
+
+    fn now_ns(&self) -> u64 {
+        // Jamais 0 (réservé à « pas de lecture »).
+        (self.epoch.elapsed().as_nanos() as u64).max(1)
+    }
+
+    /// Position de lecture (trames) à l'instant présent, interpolée depuis le début du
+    /// dernier bloc de sortie, sans jamais dépasser ce qui a déjà été demandé.
+    fn play_position_now(&self, sample_rate: u32) -> u64 {
+        let ns = self.out_cb_ns.load(Ordering::Acquire);
+        let base = self.out_cb_frames.load(Ordering::Relaxed);
+        let cur = self.out_frames.load(Ordering::Relaxed);
+        if ns == 0 || cur < base {
+            return cur;
+        }
+        let dt = self.now_ns().saturating_sub(ns);
+        let ahead = (dt as u128 * sample_rate as u128 / 1_000_000_000) as u64;
+        (base + ahead).min(cur)
     }
 
     fn on_error(&self, err: cpal::Error) {
@@ -742,10 +770,32 @@ impl Engine {
 
     pub fn start_playback(&self, cons: Consumer<f32>) {
         // Remis à zéro ici et dans le callback : pas de saut de la tête au démarrage.
+        self.shared.out_cb_ns.store(0, Ordering::Release);
         self.shared.out_frames.store(0, Ordering::Relaxed);
         self.shared.counting.store(true, Ordering::Relaxed);
-        if let Some(tx) = &self.out_tx {
-            let _ = tx.try_send(OutCmd::Play(cons));
+        self.send_out(OutCmd::Play(cons));
+    }
+
+    /// Envoi fiable d'une commande de transport : si la file est momentanément pleine
+    /// (callback en retard), on réessaie un court instant au lieu de perdre un Stop
+    /// (la lecture continuerait) ou un Play (l'interface croirait lire).
+    fn send_out(&self, mut cmd: OutCmd) -> bool {
+        let Some(tx) = &self.out_tx else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match tx.try_send(cmd) {
+                Ok(()) => return true,
+                Err(crossbeam_channel::TrySendError::Full(c)) => {
+                    if std::time::Instant::now() > deadline {
+                        return false;
+                    }
+                    cmd = c;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
+            }
         }
     }
 
@@ -758,9 +808,7 @@ impl Engine {
     }
 
     pub fn stop_playback(&self) {
-        if let Some(tx) = &self.out_tx {
-            let _ = tx.try_send(OutCmd::Stop);
-        }
+        self.send_out(OutCmd::Stop);
     }
 
     /// À appeler régulièrement depuis l'interface.
@@ -846,7 +894,7 @@ where
                 match cmd {
                     InCmd::Record(t) => {
                         st.shared.rec_play_offset.store(
-                            st.shared.out_frames.load(Ordering::Relaxed),
+                            st.shared.play_position_now(st.sample_rate),
                             Ordering::Relaxed,
                         );
                         let old = std::mem::replace(&mut st.targets, t);
@@ -925,7 +973,7 @@ where
                         sh.overruns.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                sh.rec_frames.fetch_add(frames as u64, Ordering::Relaxed);
+                sh.rec_frames.fetch_add(frames as u64, Ordering::Release);
             }
         },
         move |e| err_shared.on_error(e),
@@ -1367,6 +1415,16 @@ fn start_output(
     Ok((s, channels))
 }
 
+/// Échantillon envoyé à la carte : fini et dans [-1, 1[ (aucun format ne déborde).
+#[inline]
+fn out_sample(s: f32) -> f32 {
+    if s.is_finite() {
+        s.clamp(-1.0, 1.0 - 1.0 / 8_388_608.0)
+    } else {
+        0.0
+    }
+}
+
 fn build_output<T>(dev: &cpal::Device, cfg: StreamConfig, mut st: OutState) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
@@ -1405,14 +1463,25 @@ where
             }
             let total = data.len() / ch;
             st.shared.out_block.store(total as u32, Ordering::Relaxed);
+            // Horodatage du début de ce bloc (lecture en cours seulement).
+            if st.cons.is_some() {
+                let sh = &st.shared;
+                sh.out_cb_frames
+                    .store(sh.out_frames.load(Ordering::Relaxed), Ordering::Relaxed);
+                sh.out_cb_ns.store(sh.now_ns(), Ordering::Release);
+            } else {
+                st.shared.out_cb_ns.store(0, Ordering::Release);
+            }
             let mut done = 0;
             while done < total {
                 let n = (total - done).min(MAX_BLOCK);
                 st.process(n);
                 let out = &mut data[done * ch..(done + n) * ch];
                 for (d, &s) in out.iter_mut().zip(&st.mix[..n * ch]) {
-                    // Jamais de NaN / infini vers la carte (sécurité des enceintes).
-                    *d = T::from_sample(if s.is_finite() { s } else { 0.0 });
+                    // Jamais de NaN / infini vers la carte (sécurité des enceintes), et
+                    // écrêtage à la pleine échelle : la conversion f32 → 24 bits ne sature
+                    // pas, un dépassement y reviendrait en craquement pleine échelle.
+                    *d = T::from_sample(out_sample(s));
                 }
                 done += n;
             }
@@ -1425,6 +1494,42 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn play_position_is_interpolated_between_output_blocks() {
+        let sh = super::Shared::new();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Pas de lecture horodatée : on garde le compteur tel quel.
+        sh.out_frames.store(1024, Ordering::Relaxed);
+        assert_eq!(sh.play_position_now(48000), 1024);
+        // Bloc [1024, 2048[ demandé il y a ~10 ms : position ≈ 1024 + 480.
+        sh.out_cb_frames.store(1024, Ordering::Relaxed);
+        sh.out_frames.store(2048, Ordering::Relaxed);
+        let t = sh.now_ns().saturating_sub(10_000_000).max(1);
+        sh.out_cb_ns.store(t, Ordering::Release);
+        let p = sh.play_position_now(48000);
+        assert!((1024 + 470..1024 + 600).contains(&p), "{p}");
+        // Jamais au-delà de ce que le pilote a demandé.
+        sh.out_cb_ns.store(1, Ordering::Release);
+        assert_eq!(sh.play_position_now(48000), 2048);
+        // Compteur remis à zéro (nouvelle lecture) : pas d'interpolation sur l'ancien bloc.
+        sh.out_frames.store(0, Ordering::Relaxed);
+        assert_eq!(sh.play_position_now(48000), 0);
+    }
+
+    #[test]
+    fn output_never_wraps_on_24_bit_cards() {
+        use cpal::Sample;
+        for s in [1.0f32, 1.5, 3.0, 1e9] {
+            let v = cpal::I24::from_sample(super::out_sample(s)).to_sample::<f32>();
+            assert!(v > 0.99, "{s} → {v}");
+            let v = cpal::I24::from_sample(super::out_sample(-s)).to_sample::<f32>();
+            assert!(v < -0.99, "-{s} → {v}");
+        }
+        assert_eq!(super::out_sample(f32::NAN), 0.0);
+        assert_eq!(super::out_sample(f32::INFINITY), 0.0);
+        assert_eq!(i16::from_sample(super::out_sample(2.0)), i16::MAX);
+    }
+
     use super::*;
 
     /// Après une saturation, la piste reçoit du silence à la place des trames perdues :
