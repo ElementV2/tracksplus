@@ -83,12 +83,15 @@ pub struct SettingsDialog {
     /// Pilote ASIO ouvert par le moteur à l'ouverture des réglages (les autres pilotes
     /// ASIO ne peuvent pas être interrogés pendant ce temps, voir `list_devices_in_use`).
     pub asio_in_use: Option<String>,
+    /// Interroger les pilotes ASIO maintenant (`App::probe_asio`).
+    pub probe: bool,
 }
 
 impl SettingsDialog {
     fn new(prefs: &AudioPrefs, asio_in_use: Option<String>) -> Self {
         let mut d = Self {
             asio_in_use,
+            probe: false,
             prefs: prefs.clone(),
             hosts: audio::host_names(),
             ins: Vec::new(),
@@ -4844,6 +4847,32 @@ impl App {
         }
     }
 
+    /// Interroge tous les pilotes ASIO (nombre de canaux, paires de sorties, fréquences) :
+    /// le pilote en service est fermé le temps de la lecture (une application n'en charge
+    /// qu'un à la fois), puis la carte est rouverte avec les réglages en cours.
+    fn probe_asio(&mut self, dlg: &mut SettingsDialog) {
+        if dlg.prefs.host.as_deref() != Some("ASIO") || self.asio_in_use().is_none() {
+            // Hors ASIO, ou aucun pilote ASIO en service : tous répondent déjà.
+            dlg.asio_in_use = None;
+            dlg.refresh();
+            return;
+        }
+        if self.editing_locked() || !self.stuck_jobs.is_empty() || self.reconnect_job.is_some() {
+            // Jamais pendant une prise ni pendant une réouverture de la carte.
+            dlg.refresh();
+            return;
+        }
+        let prefs = self.prefs.clone();
+        self.engine.pad(PadCmd::StopAll);
+        self.engine = Engine::offline();
+        dlg.asio_in_use = None;
+        dlg.refresh();
+        if let Err(e) = self.apply_audio(prefs) {
+            dlg.error = Some(e);
+        }
+        dlg.asio_in_use = self.asio_in_use();
+    }
+
     pub fn open_export(&mut self) {
         if self.editing_locked() {
             self.notify("Export indisponible pendant l'enregistrement", true);
@@ -5817,12 +5846,14 @@ impl App {
                     // Carte branchée, Dante Virtual Soundcard passée en ASIO… après
                     // l'ouverture des réglages : la liste est relue à la demande.
                     ui.label("");
-                    if ui
-                        .small_button("Actualiser la liste")
-                        .on_hover_text("Relit les cartes son et les pilotes présents")
-                        .clicked()
-                    {
-                        dlg.refresh();
+                    if ui.small_button("Actualiser").clicked() {
+                        // ASIO : tous les pilotes sont interrogés (celui en service est fermé
+                        // un instant, une application n'en charge qu'un à la fois).
+                        if dlg.prefs.host.as_deref() == Some("ASIO") {
+                            dlg.probe = true;
+                        } else {
+                            dlg.refresh();
+                        }
                     }
                     ui.end_row();
                     if dlg.listed_host != dlg.prefs.host {
@@ -5837,14 +5868,16 @@ impl App {
                             dlg.prefs.input = None;
                         }
                         for d in &dlg.ins {
-                            let txt = match (&d.note, d.channels) {
-                                (None, ch) => format!("{}   {ch} canaux", d.name),
-                                (Some(n), 0) => format!("{}   ({n})", d.name),
-                                (Some(n), ch) => format!("{}   {ch} canaux ({n})", d.name),
+                            let txt = if d.channels > 0 {
+                                format!("{}   {} canaux", d.name, d.channels)
+                            } else {
+                                d.name.clone()
                             };
                             // L'entrée ne touche jamais aux sorties : chacune se règle à part.
                             if ui.selectable_label(dlg.prefs.input.as_deref() == Some(&d.name), txt).clicked() {
                                 dlg.prefs.input = Some(d.name.clone());
+                                // Pilote pas encore interrogé : il l'est tout de suite.
+                                dlg.probe |= d.note.is_some();
                             }
                         }
                     });
@@ -5864,15 +5897,15 @@ impl App {
                     );
                     ui.label(egui::RichText::new("Main multipiste").color(t::TEXT_2))
                         .on_hover_text("Lecture des pistes");
-                    dest_combo(ui, "out_main", combo_w, &outs, &mut dlg.prefs.output, &mut dlg.prefs.out_left, "Par défaut (Windows)", &default_out);
+                    dlg.probe |= dest_combo(ui, "out_main", combo_w, &outs, &mut dlg.prefs.output, &mut dlg.prefs.out_left, "Par défaut (Windows)", &default_out);
                     ui.end_row();
                     ui.label(egui::RichText::new("Monitoring multipiste").color(t::TEXT_2))
                         .on_hover_text("Écoute en direct des entrées (bouton casque des pistes)");
-                    dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, "Comme le main multipiste", "Comme le main multipiste");
+                    dlg.probe |= dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, "Comme le main multipiste", "Comme le main multipiste");
                     ui.end_row();
                     ui.label(egui::RichText::new("Soundboard").color(t::TEXT_2))
                         .on_hover_text("Lecture des pads");
-                    dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, "Comme le main multipiste", "Comme le main multipiste");
+                    dlg.probe |= dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, "Comme le main multipiste", "Comme le main multipiste");
                     ui.end_row();
                     ui.add_space(4.0);
                     ui.label("");
@@ -6049,6 +6082,9 @@ impl App {
             });
         if recheck {
             self.reload_audio();
+        }
+        if std::mem::take(&mut dlg.probe) {
+            self.probe_asio(&mut dlg);
         }
         if apply {
             match self.apply_audio(dlg.prefs.clone()) {
@@ -7639,7 +7675,8 @@ fn dest_combo(
     left: &mut u16,
     none_item: &str,
     none_text: &str,
-) {
+) -> bool {
+    let mut unprobed = false;
     let cur = match device.as_ref() {
         Some(name) => {
             let ch = outs
@@ -7662,17 +7699,19 @@ fn dest_combo(
             for d in outs {
                 for l in (0..d.channels.max(2)).step_by(2) {
                     let sel = device.as_deref() == Some(&d.name) && *left == l;
-                    let label = match &d.note {
-                        None => out_dest_label(&d.name, d.channels, l),
-                        Some(n) => format!("{}   ({n})", out_dest_label(&d.name, d.channels, l)),
-                    };
-                    if ui.selectable_label(sel, label).clicked() {
+                    if ui
+                        .selectable_label(sel, out_dest_label(&d.name, d.channels, l))
+                        .clicked()
+                    {
                         *device = Some(d.name.clone());
                         *left = l;
+                        // Pilote pas encore interrogé : il l'est tout de suite.
+                        unprobed |= d.note.is_some();
                     }
                 }
             }
         });
+    unprobed
 }
 
 /// Libellé d'une destination de sortie : le nom du périphérique s'il n'a que deux
