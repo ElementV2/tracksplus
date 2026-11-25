@@ -83,6 +83,9 @@ pub struct FileBrowser {
     nav_at: std::time::Instant,
     /// Raccourcis de gauche, calculés à l'ouverture (test des lecteurs A: à Z:).
     places: Vec<Place>,
+    /// Lecture du dossier en cours, dans un thread : un disque réseau déconnecté ou un
+    /// dossier énorme ne figent jamais l'interface (le spectacle continue derrière).
+    loading: Option<std::sync::mpsc::Receiver<(PathBuf, std::io::Result<Vec<Entry>>)>>,
 }
 
 /// Raccourci de la colonne de gauche.
@@ -120,6 +123,7 @@ impl FileBrowser {
             scroll_top: true,
             nav_at: std::time::Instant::now(),
             places: places(session_dir, kind),
+            loading: None,
         };
         b.open_dir(start);
         b
@@ -131,17 +135,46 @@ impl FileBrowser {
         self.filter.clear();
         self.scroll_top = true;
         self.nav_at = std::time::Instant::now();
-        match read_entries(&dir, self.kind) {
-            Ok(e) => {
-                self.entries = e;
-                self.error = None;
-            }
-            Err(e) => {
-                self.entries.clear();
-                self.error = Some(format!("Dossier illisible : {e}"));
-            }
+        self.entries.clear();
+        self.error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (d, kind) = (dir.clone(), self.kind);
+        let spawned = std::thread::Builder::new()
+            .name("tracksplus-browse".into())
+            .spawn(move || {
+                let r = read_entries(&d, kind);
+                let _ = tx.send((d, r));
+            });
+        self.loading = spawned.is_ok().then_some(rx);
+        if self.loading.is_none() {
+            self.error = Some("Dossier illisible".into());
         }
         self.dir = dir;
+    }
+
+    /// Résultat de la lecture du dossier, s'il est arrivé (celui d'un dossier quitté
+    /// entre-temps est ignoré).
+    fn poll(&mut self) {
+        let Some(rx) = &self.loading else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((d, r)) => {
+                self.loading = None;
+                if d != self.dir {
+                    return;
+                }
+                match r {
+                    Ok(e) => self.entries = e,
+                    Err(e) => self.error = Some(format!("Dossier illisible : {e}")),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.loading = None;
+                self.error = Some("Dossier illisible".into());
+            }
+        }
     }
 
     fn chosen(&self) -> Vec<PathBuf> {
@@ -338,6 +371,10 @@ impl App {
         let Some(mut b) = self.browser.take() else {
             return;
         };
+        b.poll();
+        if b.loading.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         let session = b.kind == Kind::Session;
         let places = std::mem::take(&mut b.places);
         let mut outcome = None;
@@ -483,7 +520,9 @@ impl App {
                         ui.add_space(40.0);
                         ui.vertical_centered(|ui| {
                             let msg = b.error.clone().unwrap_or_else(|| {
-                                if needle.is_empty() {
+                                if b.loading.is_some() {
+                                    "Lecture du dossier…".into()
+                                } else if needle.is_empty() {
                                     if session {
                                         "Aucune session ni dossier ici".into()
                                     } else {
@@ -718,6 +757,7 @@ mod tests {
             },
             scroll_top: false,
             places: Vec::new(),
+            loading: None,
             nav_at: std::time::Instant::now(),
         };
         let vis = [0, 1, 2, 3];
