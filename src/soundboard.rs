@@ -706,11 +706,6 @@ impl SampleCache {
         }
     }
 
-    /// Fréquence à laquelle les sons sont décodés (celle de la carte).
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
     /// Met un son de côté sans jamais l'ouvrir (sécurité, voir `Board::resolve_paths`).
     pub fn park(&mut self, path: &Path) {
         let why = if is_network_path(path) {

@@ -383,6 +383,8 @@ impl App {
             self.zoom_to_fit();
         }
         if esc {
+            // Échap annule aussi une relance automatique de prise en attente.
+            self.cancel_resume();
             self.selection = None;
             self.ruler_anchor = None;
             self.selected_tracks.clear();
