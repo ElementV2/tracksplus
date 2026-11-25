@@ -93,9 +93,22 @@ pub fn s_curve(x: f32) -> f32 {
     s * s
 }
 
+/// Sorte de piste.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TrackKind {
+    /// Piste d'enregistrement : entrée de la carte, armement, monitoring.
+    #[default]
+    Record,
+    /// Piste audio : fichiers importés (musique, sons…), lecture seule, sans entrée ; mono
+    /// ou stéréo selon les fichiers.
+    Audio,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Track {
     pub id: u64,
+    #[serde(default)]
+    pub kind: TrackKind,
     #[serde(default)]
     pub name: String,
     /// Canal d'entrée de la carte son (0-based). `None` = pas d'entrée.
@@ -124,6 +137,10 @@ pub struct Track {
 }
 
 impl Track {
+    pub fn is_audio(&self) -> bool {
+        self.kind == TrackKind::Audio
+    }
+
     /// Nombre de canaux de la piste (1 = mono, 2 = stéréo).
     pub fn channels(&self) -> usize {
         if self.stereo { 2 } else { 1 }
@@ -231,6 +248,7 @@ impl Project {
         let name = name.unwrap_or_else(|| format!("Piste {}", self.tracks.len() + 1));
         self.tracks.push(Track {
             id,
+            kind: TrackKind::Record,
             name,
             input,
             stereo,
@@ -242,6 +260,16 @@ impl Project {
             clips: Vec::new(),
         });
         self.dirty = true;
+        id
+    }
+
+    /// Ajoute une piste audio (fichiers importés), sans entrée.
+    pub fn add_audio_track(&mut self, name: String, stereo: bool) -> u64 {
+        let id = self.add_track_ch(Some(name), None, stereo);
+        if let Some(t) = self.track_mut(id) {
+            t.kind = TrackKind::Audio;
+            t.armed = false;
+        }
         id
     }
 
@@ -640,6 +668,21 @@ pub fn default_sessions_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sorte de piste : une ancienne session (sans le champ) n'a que des pistes
+    /// d'enregistrement ; une piste audio est conservée telle quelle.
+    #[test]
+    fn track_kind_is_saved() {
+        let json = r#"{"id":1,"name":"Voix","input":0,"stereo":false,"clips":[]}"#;
+        let t: Track = serde_json::from_str(json).unwrap();
+        assert_eq!(t.kind, TrackKind::Record);
+        let mut p = Project::new("K".into(), std::env::temp_dir().join("tp-kind"), 48000);
+        let id = p.add_audio_track("Musique".into(), true);
+        let t = p.tracks.iter().find(|t| t.id == id).unwrap();
+        assert!(t.is_audio() && t.stereo && !t.armed && t.input.is_none());
+        let back: Track = serde_json::from_str(&serde_json::to_string(t).unwrap()).unwrap();
+        assert!(back.is_audio());
+    }
 
     /// Charge : session de 64 pistes × 500 prises (32 000 prises) : temps d'enregistrement
     /// et de réouverture du fichier de session.

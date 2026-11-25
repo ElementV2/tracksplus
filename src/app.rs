@@ -262,6 +262,16 @@ pub struct App {
     pub live: Vec<LiveTake>,
     pub peaks: HashMap<u64, Peaks>,
     pub in_meters: Vec<MeterState>,
+    /// Niveaux de lecture des pistes audio (par identifiant de piste).
+    pub track_meters: HashMap<u64, [MeterState; 2]>,
+    /// Position de lecture à la dernière mise à jour des vumètres de pistes.
+    meters_pos: u64,
+    /// Import de fichiers audio sur la timeline en cours (glisser-déposer).
+    pub audio_import: Option<crate::import::ImportJob>,
+    /// Fichiers déposés qui ne sont pas de l'audio (signalés à la fin de l'import).
+    import_skipped: Vec<PathBuf>,
+    /// Piste audio visée par le dépôt (un seul fichier déposé dessus).
+    import_target: Option<u64>,
     /// Instant de la dernière mise à jour des vumètres.
     pub meters_at: f64,
     /// Périphériques de sortie du pilote en cours (choix des destinations d'écoute).
@@ -405,6 +415,11 @@ impl App {
             transport: Transport::Stopped,
             playhead: 0,
             player: None,
+            track_meters: HashMap::new(),
+            meters_pos: 0,
+            audio_import: None,
+            import_skipped: Vec::new(),
+            import_target: None,
             recorder: None,
             live: Vec::new(),
             peaks: HashMap::new(),
@@ -529,11 +544,13 @@ impl App {
         app
     }
 
+    /// Message en bas de la fenêtre. Une information disparaît seule ; une erreur ou un
+    /// avertissement reste affiché jusqu'au clic : on ne peut pas le manquer.
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some(Toast {
             text: text.into(),
             error,
-            until: self.now + if error { 8.0 } else { 3.5 },
+            until: if error { f64::INFINITY } else { self.now + 3.5 },
         });
     }
 
@@ -577,7 +594,10 @@ impl App {
     /// la session : une modification et son annulation les perdraient), ou « Enregistrer
     /// sous » en cours.
     pub fn editing_locked(&self) -> bool {
-        self.is_recording() || self.finishing.is_some() || self.save_as_job.is_some()
+        self.is_recording()
+            || self.finishing.is_some()
+            || self.save_as_job.is_some()
+            || self.audio_import.is_some()
     }
 
     pub fn play(&mut self) {
@@ -1716,7 +1736,9 @@ impl App {
         let mut p = Project::new(name, dir, self.engine.status.sample_rate);
         p.rec_format = self.project.rec_format;
         if d.keep_tracks {
-            for tr in &self.project.tracks {
+            // Pistes d'enregistrement seulement : les pistes audio n'ont de sens qu'avec
+            // leurs fichiers.
+            for tr in self.project.tracks.iter().filter(|t| !t.is_audio()) {
                 let id = p.add_track_ch(Some(tr.name.clone()), tr.input, tr.stereo);
                 if let Some(nt) = p.track_mut(id) {
                     nt.armed = tr.armed;
@@ -1883,6 +1905,22 @@ impl App {
             .intersection(&with_audio)
             .copied()
             .collect();
+        let audible = self.project.audible();
+        let heard: HashSet<u64> = self
+            .project
+            .tracks
+            .iter()
+            .zip(&audible)
+            .filter(|(t, a)| **a && !t.clips.is_empty())
+            .map(|(t, _)| t.id)
+            .collect();
+        let default_tracks = if !sel.is_empty() {
+            sel
+        } else if !heard.is_empty() {
+            heard
+        } else {
+            with_audio
+        };
         self.export_dlg = Some(ExportDialog {
             s,
             range: if self.selection.is_some() {
@@ -1890,7 +1928,7 @@ impl App {
             } else {
                 RangeChoice::All
             },
-            tracks: if sel.is_empty() { with_audio } else { sel },
+            tracks: default_tracks,
         });
     }
 
@@ -1934,6 +1972,7 @@ impl App {
             || self.browser.is_some()
             || self.save_as_job.is_some()
             || self.import_job.is_some()
+            || self.audio_import.is_some()
     }
 
     pub fn zoom_to_fit(&mut self) {
@@ -2033,6 +2072,7 @@ impl App {
             .iter()
             .chain(self.master_play.iter())
             .chain(self.master_pad.iter())
+            .chain(self.track_meters.values().flatten())
             .any(|m| m.level > QUIET || m.hold > QUIET);
         let pads = self
             .engine
@@ -2043,11 +2083,12 @@ impl App {
         !self.is_stopped()
             || meters
             || pads
-            || self.toast.is_some()
+            || self.toast.as_ref().is_some_and(|t| t.until.is_finite())
             || self.updater.busy()
             || self.export_job.is_some()
             || self.save_as_job.is_some()
             || self.import_job.is_some()
+            || self.audio_import.is_some()
             || self.sb.drag_pad.is_some()
     }
 
@@ -2067,6 +2108,31 @@ impl App {
         for k in 0..2 {
             self.master_play[k].update(Shared::take_peak(&sh.master_play[k]), now, dt);
             self.master_pad[k].update(Shared::take_peak(&sh.master_pad[k]), now, dt);
+        }
+        // Pistes audio : niveau du passage entendu depuis l'image précédente.
+        let pos = self.playhead;
+        let from = if pos >= self.meters_pos {
+            self.meters_pos
+        } else {
+            pos
+        };
+        self.meters_pos = pos;
+        let playing = !self.is_stopped();
+        self.track_meters
+            .retain(|id, _| self.project.tracks.iter().any(|t| t.id == *id));
+        for (i, t) in self.project.tracks.iter().enumerate() {
+            if !t.is_audio() {
+                continue;
+            }
+            let v = self
+                .player
+                .as_ref()
+                .filter(|_| playing)
+                .and_then(|p| p.meters.peak(i, from, pos))
+                .unwrap_or([0.0; 2]);
+            let m = self.track_meters.entry(t.id).or_default();
+            m[0].update(v[0], now, dt);
+            m[1].update(v[1], now, dt);
         }
         if now - self.disk_checked > 2.0 {
             self.disk_checked = now;
@@ -2894,6 +2960,197 @@ impl App {
         }
     }
 
+    /// Fichiers audio déposés sur le multipiste : conversion en arrière-plan, puis une
+    /// piste audio par fichier (ou ajout à la piste audio `target`), prises posées à `at`.
+    pub fn import_audio_files(&mut self, paths: Vec<PathBuf>, at: u64, target: Option<u64>) {
+        if self.dialog_open() {
+            self.notify(
+                "Fermez la fenêtre ouverte avant de déposer des fichiers sur la timeline.",
+                true,
+            );
+            return;
+        }
+        if self.editing_locked() {
+            self.notify(
+                "Import impossible pendant un enregistrement ou une copie : réessayez après.",
+                true,
+            );
+            return;
+        }
+        let (audio, other): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| crate::soundboard::is_audio_file(p));
+        if audio.is_empty() {
+            self.notify(
+                format!(
+                    "Aucun fichier audio reconnu ({}). Formats acceptés : WAV, AIFF, MP3, FLAC, Ogg, M4A.",
+                    other
+                        .iter()
+                        .filter_map(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                true,
+            );
+            return;
+        }
+        self.stop();
+        if let Err(e) = self.project.ensure_dirs() {
+            self.notify(format!("Import impossible : {e:#}"), true);
+            return;
+        }
+        let mut taken = HashSet::new();
+        let targets: Vec<(PathBuf, String)> = audio
+            .into_iter()
+            .map(|p| {
+                let stem = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Import".into());
+                let file = self.project.new_take_file_avoiding(&stem, &taken);
+                taken.insert(file.clone());
+                (p, file)
+            })
+            .collect();
+        self.import_skipped = other;
+        self.import_target = target;
+        match crate::import::ImportJob::start(
+            targets,
+            self.project.audio_dir(),
+            self.project.sample_rate,
+            at,
+        ) {
+            Ok(job) => self.audio_import = Some(job),
+            Err(e) => self.notify(format!("{e:#}"), true),
+        }
+    }
+
+    /// Fenêtre de progression de l'import, puis création des pistes audio.
+    fn audio_import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.audio_import else {
+            return;
+        };
+        let p = job.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("audio_import"))
+            .frame(t::window_frame())
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(egui::RichText::new("Import en cours").font(t::semibold(16.0)));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Conversion dans le dossier « Audio » de la session")
+                        .font(t::regular(12.0))
+                        .color(t::TEXT_3),
+                );
+                ui.add_space(12.0);
+                ui.add(
+                    egui::ProgressBar::new(p)
+                        .desired_width(360.0)
+                        .desired_height(8.0)
+                        .fill(t::ACCENT),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{:.0} %", p * 100.0)).color(t::TEXT_2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if w::secondary_button(ui, "Annuler").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        if cancel {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        if !job.is_finished() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let job = self.audio_import.take().unwrap();
+        let at = job.at;
+        let mut done = Vec::new();
+        let mut errors: Vec<String> = self
+            .import_skipped
+            .drain(..)
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .map(|n| format!("{n} : pas un fichier audio"))
+            .collect();
+        let mut cancelled = false;
+        for (src, r) in job.join() {
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match r {
+                Ok(i) => done.push(i),
+                Err(e) if e.is::<crate::import::Cancelled>() => cancelled = true,
+                Err(e) => errors.push(format!("{name} : {e:#}")),
+            }
+        }
+        let n = done.len();
+        if n > 0 {
+            self.checkpoint();
+            let target = self.import_target.take().filter(|id| {
+                self.project
+                    .tracks
+                    .iter()
+                    .any(|t| t.id == *id && t.is_audio())
+            });
+            for i in done {
+                // Un seul fichier déposé sur une piste audio : il va sur cette piste.
+                let tid = match target {
+                    Some(id) if n == 1 => {
+                        if let Some(t) = self.project.track_mut(id) {
+                            t.stereo |= i.stereo;
+                        }
+                        id
+                    }
+                    _ => self.project.add_audio_track(i.name.clone(), i.stereo),
+                };
+                let cid = self.project.alloc_id();
+                if let Some(t) = self.project.track_mut(tid) {
+                    t.clips.push(Clip {
+                        id: cid,
+                        file: i.file,
+                        start: at,
+                        offset: 0,
+                        len: i.frames,
+                        src_len: i.frames,
+                        fade_in: 0,
+                        fade_out: 0,
+                    });
+                }
+            }
+            self.project.dirty = true;
+            self.load_peaks();
+            if let Err(e) = self.project.save() {
+                self.save_failed(e);
+            }
+        }
+        self.import_target = None;
+        if !errors.is_empty() {
+            self.notify(
+                format!(
+                    "{}Impossible d'importer {} fichier(s) : {}",
+                    if n > 0 {
+                        format!("{n} piste(s) audio ajoutée(s). ")
+                    } else {
+                        String::new()
+                    },
+                    errors.len(),
+                    errors.join(" · ")
+                ),
+                true,
+            );
+        } else if cancelled {
+            self.notify("Import annulé : rien n'a été ajouté", false);
+        } else if n > 0 {
+            self.notify(format!("{n} fichier(s) importé(s) sur la timeline"), false);
+        }
+    }
+
     fn new_tracks_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.tracks_dlg.take() else {
             return;
@@ -3066,18 +3323,34 @@ impl App {
             if job.is_finished() {
                 let job = self.export_job.take().unwrap();
                 match job.join() {
-                    Ok(files) => {
-                        let dir = files
+                    Ok(out) => {
+                        let dir = out
+                            .files
                             .first()
                             .and_then(|f| f.parent())
                             .map(Path::to_path_buf);
-                        self.notify(
-                            format!("Export terminé · {} fichier(s)", files.len()),
-                            false,
-                        );
+                        if out.warnings.is_empty() {
+                            self.notify(
+                                format!("Export terminé · {} fichier(s)", out.files.len()),
+                                false,
+                            );
+                        } else {
+                            // Export réussi mais à vérifier (saturation…) : message qui reste.
+                            self.notify(
+                                format!(
+                                    "Export terminé · {} fichier(s), à vérifier : {}",
+                                    out.files.len(),
+                                    out.warnings.join(" · ")
+                                ),
+                                true,
+                            );
+                        }
                         if let Some(d) = dir {
                             open_in_file_manager(&d);
                         }
+                    }
+                    Err(e) if e.is::<crate::export::Cancelled>() => {
+                        self.notify("Export annulé : aucun fichier n'a été modifié", false)
                     }
                     Err(e) => self.notify(format!("{e:#}"), true),
                 }
@@ -3109,6 +3382,13 @@ impl App {
             .copied()
             .filter(|id| self.selected_tracks.contains(id))
             .collect();
+        let audible = self.project.audible();
+        let muted_tracks = self
+            .project
+            .tracks
+            .iter()
+            .zip(&audible)
+            .any(|(t, a)| !a && !t.clips.is_empty());
         let session_len = self.project.end();
         let all_label = format!(
             "Toute la session · {}",
@@ -3234,6 +3514,12 @@ impl App {
                                 });
                         });
                         ui.add_space(4.0);
+                        if muted_tracks {
+                            exp_hint(
+                                ui,
+                                "Les pistes coupées (M) ou hors solo ne sont pas cochées : le mix correspond à ce que vous entendez.",
+                            );
+                        }
                         exp_row(ui, "Fichiers", |ui| {
                             ui.checkbox(&mut d.s.stems, "Pistes séparées").on_hover_text(
                                 "Un fichier par piste, mono ou stéréo comme la piste : pour remixer ailleurs ou envoyer les pistes à un ingé son.",
@@ -3338,6 +3624,14 @@ impl App {
                                 .collect();
                             w::segmented_tips(ui, "exp_rate", &mut d.s.sample_rate, &opts);
                         });
+                        if d.s.format == ExportFormat::Bwf
+                            && d.s.output_depth() == Some(BitDepth::F32)
+                        {
+                            exp_hint(
+                                ui,
+                                "BWF en 32 bits flottant : certains outils de diffusion n'acceptent que le BWF en 16 ou 24 bits.",
+                            );
+                        }
                         if d.s.output_rate() != sr {
                             exp_hint(
                                 ui,
@@ -3467,7 +3761,10 @@ impl App {
                 range: None,
                 ..s.clone()
             });
-            self.export_job = Some(ExportJob::start(&self.project, s));
+            match ExportJob::start(&self.project, s) {
+                Ok(job) => self.export_job = Some(job),
+                Err(e) => self.notify(format!("{e:#}"), true),
+            }
             return;
         }
         if !close {
@@ -3540,10 +3837,11 @@ impl App {
             return;
         }
         let fade = ((tt.until - self.now) / 0.3).min(1.0) as f32;
+        let mut dismiss = false;
         egui::Area::new(egui::Id::unique("toast"))
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -48.0))
             .order(egui::Order::Tooltip)
-            .interactable(false)
+            .interactable(tt.error)
             .show(ctx, |ui| {
                 let col = if tt.error { t::REC } else { t::ACCENT };
                 let resp = egui::Frame::new()
@@ -3581,7 +3879,22 @@ impl App {
                     },
                     col.gamma_multiply(fade),
                 );
+                if tt.error
+                    && ui
+                        .interact(
+                            r,
+                            ui.make_persistent_id("toast_close"),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_text("Clic pour fermer")
+                        .clicked()
+                {
+                    dismiss = true;
+                }
             });
+        if dismiss {
+            self.toast = None;
+        }
     }
 }
 
@@ -3639,6 +3952,12 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.midi.leds_off(self.board.led_mode);
         self.stop();
+        self.finish_export_for_exit();
+        // Import en cours : annulé (les fichiers à moitié convertis sont supprimés).
+        if let Some(job) = self.audio_import.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            let _ = job.join();
+        }
         self.poll_finishing(true);
         // Copie en cours (« Enregistrer sous », import) : on la laisse se terminer.
         for rx in [
@@ -3675,8 +3994,10 @@ impl App {
             self.save_board_now();
         }
 
-        // Fermeture de la fenêtre pendant une prise : on demande confirmation.
-        if ctx.input(|i| i.viewport().close_requested()) && self.is_recording() {
+        // Fermeture de la fenêtre pendant une prise ou un export : on demande confirmation.
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.is_recording() || self.export_job.is_some())
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = true;
         }
@@ -3759,44 +4080,77 @@ impl App {
         self.export_dialog(&ctx);
         self.new_session_dialog(&ctx);
         self.new_tracks_dialog(&ctx);
+        self.audio_import_dialog(&ctx);
         self.update_dialog(&ctx);
         self.browser_dialog(&ctx);
         self.save_as_dialog(&ctx);
+    }
+
+    /// Fermeture de l'application pendant un export : il est annulé et on attend qu'il ait
+    /// supprimé ses fichiers incomplets (quelques millisecondes).
+    fn finish_export_for_exit(&mut self) {
+        if let Some(job) = self.export_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            let _ = job.join();
+        }
     }
 
     fn confirm_close_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_close {
             return;
         }
-        if !self.is_recording() {
+        let recording = self.is_recording();
+        if !recording && self.export_job.is_none() {
             self.confirm_close = false;
             return;
         }
+        let (title, text, keep_label, quit_label) = if recording {
+            (
+                "ENREGISTREMENT EN COURS",
+                "Fermer TracksPlus arrêterait la prise. Les fichiers déjà enregistrés seraient conservés.",
+                "Continuer l'enregistrement",
+                "Arrêter, sauvegarder et quitter",
+            )
+        } else {
+            (
+                "EXPORT EN COURS",
+                "Fermer TracksPlus annulerait l'export. Aucun fichier incomplet ne serait laissé et les exports précédents resteraient intacts.",
+                "Continuer l'export",
+                "Annuler l'export et quitter",
+            )
+        };
         let mut keep = false;
         let mut quit = false;
-        egui::Modal::new(egui::Id::unique("confirm_close")).frame(t::window_frame()).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.label(egui::RichText::new("ENREGISTREMENT EN COURS").font(t::semibold(12.0)).color(t::REC));
-            ui.add_space(8.0);
-            ui.label("Fermer TracksPlus arrêterait la prise. Les fichiers déjà enregistrés seraient conservés.");
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                if w::primary_button(ui, None, "Continuer l'enregistrement", true).clicked() {
-                    keep = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if w::danger_button(ui, "Arrêter, sauvegarder et quitter").clicked() {
-                        quit = true;
+        egui::Modal::new(egui::Id::unique("confirm_close"))
+            .frame(t::window_frame())
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(t::semibold(12.0))
+                        .color(t::REC),
+                );
+                ui.add_space(8.0);
+                ui.label(text);
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if w::primary_button(ui, None, keep_label, true).clicked() {
+                        keep = true;
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if w::danger_button(ui, quit_label).clicked() {
+                            quit = true;
+                        }
+                    });
                 });
             });
-        });
         if keep {
             self.confirm_close = false;
         }
         if quit {
             self.confirm_close = false;
             self.stop();
+            self.finish_export_for_exit();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

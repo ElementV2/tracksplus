@@ -15,6 +15,8 @@ use std::collections::HashSet;
 const HEADER_W: f32 = 284.0;
 /// Hauteur du panneau de réglages d'une piste dépliée.
 const INSPECTOR_H: f32 = 132.0;
+/// Panneau d'une piste audio : seulement la couleur.
+const AUDIO_INSPECTOR_H: f32 = 40.0;
 
 /// Colonnes de forme d'onde déjà calculées, par paquets de `WAVE_CHUNK` pixels : (fichier,
 /// zoom, décalage, niveau, paquet) → (min, max) par colonne. Le dessin d'une image ne
@@ -1326,6 +1328,31 @@ impl App {
                 i.modifiers.command,
             )
         });
+        // Fichiers audio glissés depuis l'explorateur : position du curseur demandée au
+        // système (egui ne reçoit aucun mouvement de souris pendant le survol).
+        let files_hover = ui.input(|i| !i.raw.hovered_files.is_empty());
+        let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        let drop_ptr = if files_hover || !dropped.is_empty() {
+            if files_hover {
+                ui.ctx().request_repaint();
+            }
+            w::os_pointer_pos(ui.ctx()).or(pointer)
+        } else {
+            None
+        };
+        // Lâché sur la timeline : à cet endroit ; ailleurs : à la tête de lecture.
+        let drop_at = match drop_ptr {
+            Some(p) if p.x >= tl_left && full.contains(p) => self.sample_at(tl_left, p.x),
+            _ => self.playhead,
+        };
+        let mut drop_target: Option<u64> = None;
 
         // Grille verticale (repères de la règle).
         let step = self.ruler_step();
@@ -1368,7 +1395,13 @@ impl App {
             for idx in 0..ntracks {
                 let tid = self.project.tracks[idx].id;
                 let expanded = self.expanded_tracks.contains(&tid);
-                let row_h = track_h + if expanded { INSPECTOR_H } else { 0.0 };
+                let is_audio = self.project.tracks[idx].is_audio();
+                let row_h = track_h
+                    + match (expanded, is_audio) {
+                        (false, _) => 0.0,
+                        (true, false) => INSPECTOR_H,
+                        (true, true) => AUDIO_INSPECTOR_H,
+                    };
                 let (row, _) =
                     ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::hover());
                 spans.push((row.top() - lanes_top, row.bottom() - lanes_top));
@@ -1390,6 +1423,10 @@ impl App {
                 for &(gx, major) in &grid_x {
                     let col = if major { t::GRID } else { t::GRID.gamma_multiply(0.45) };
                     w::vline(&lp, gx, lane.top(), lane.bottom(), col);
+                }
+                if is_audio && drop_ptr.is_some_and(|dp| lane.contains(dp)) {
+                    drop_target = Some(tid);
+                    p.rect_filled(lane, 0.0, t::ACCENT.gamma_multiply(0.12));
                 }
                 p.rect_filled(
                     header,
@@ -1440,10 +1477,10 @@ impl App {
                 let mut toggle_panel = false;
                 hresp.context_menu(|ui| {
                     if ui
-                        .button(if expanded {
-                            "Masquer les réglages de la piste"
-                        } else {
-                            "Entrée et réglages de la piste…"
+                        .button(match (expanded, is_audio) {
+                            (true, _) => "Masquer les réglages de la piste",
+                            (false, false) => "Entrée et réglages de la piste…",
+                            (false, true) => "Couleur de la piste…",
                         })
                         .clicked()
                     {
@@ -1501,12 +1538,24 @@ impl App {
                     };
                     ui.painter().add(egui::Shape::convex_polygon(tri, acol, Stroke::NONE));
                     if aresp
-                        .on_hover_text("Réglages de la piste : entrée, mono / stéréo, monitoring")
+                        .on_hover_text(if is_audio {
+                            "Réglages de la piste : couleur"
+                        } else {
+                            "Réglages de la piste : entrée, mono / stéréo, monitoring"
+                        })
                         .clicked()
                     {
                         toggle_panel = true;
                     }
-                    if w::arm_button(
+                    if is_audio {
+                        // Piste audio : fichiers importés, lecture seule (pas d'enregistrement).
+                        let (r, resp) = ui.allocate_exact_size(vec2(20.0, 18.0), Sense::hover());
+                        ui.painter().rect_filled(r, t::R, t::SURFACE_3);
+                        w::paint_icon(ui.painter(), Icon::Speaker, r.center(), 4.5, t::TEXT_2);
+                        resp.on_hover_text(
+                            "Piste audio : fichiers importés, en lecture seule (pas d'entrée, pas d'enregistrement)",
+                        );
+                    } else if w::arm_button(
                         ui,
                         track.armed,
                         stopped && track.input.is_some(),
@@ -1561,7 +1610,9 @@ impl App {
                         name_rect = nr;
                     }
                     // Monitoring direct : écouter en temps réel ce qui entre dans la piste.
-                    if w::icon_tag_button(
+                    if is_audio {
+                        ui.allocate_exact_size(vec2(20.0, 18.0), Sense::hover());
+                    } else if w::icon_tag_button(
                         ui,
                         Icon::Headphones,
                         track.monitor,
@@ -1601,21 +1652,39 @@ impl App {
                 let stereo = track.stereo;
                 let label = track.input_label();
                 let chans: Vec<u16> = track.inputs().collect();
-                let ms: Vec<MeterState> = chans
-                    .iter()
-                    .map(|&i| {
-                        if (i as usize) < audio::MAX_INPUTS && i < in_ch {
-                            self.in_meters[i as usize]
-                        } else {
-                            MeterState::default()
-                        }
-                    })
-                    .collect();
+                let ms: Vec<MeterState> = if is_audio {
+                    // Piste audio : niveau de lecture, une barre par canal du fichier.
+                    let m = self.track_meters.get(&tid).copied().unwrap_or_default();
+                    m[..track.channels()].to_vec()
+                } else {
+                    chans
+                        .iter()
+                        .map(|&i| {
+                            if (i as usize) < audio::MAX_INPUTS && i < in_ch {
+                                self.in_meters[i as usize]
+                            } else {
+                                MeterState::default()
+                            }
+                        })
+                        .collect()
+                };
                 let mut new_input: Option<Option<u16>> = None;
                 let mut new_stereo: Option<bool> = None;
                 let (mut arm_toggle, mut monitor_toggle) = (false, false);
                 let mut new_color: Option<u8> = None;
                 hdr.horizontal(|ui| {
+                    if is_audio {
+                        let (r, resp) = ui.allocate_exact_size(vec2(58.0, 18.0), Sense::hover());
+                        ui.painter().rect_filled(r, t::R, t::INSET);
+                        ui.painter().text(
+                            pos2(r.left() + 6.0, r.center().y),
+                            Align2::LEFT_CENTER,
+                            if stereo { "STÉRÉO" } else { "MONO" },
+                            t::medium(10.0),
+                            t::TEXT_3,
+                        );
+                        resp.on_hover_text("Mono ou stéréo selon les fichiers importés");
+                    } else {
                     // Étiquette d'entrée présentée en liste déroulante (« IN 1 ▾ »).
                     let (r, resp) = ui.allocate_exact_size(
                         vec2(58.0, 18.0),
@@ -1666,6 +1735,7 @@ impl App {
                                 ui.close();
                             }
                         });
+                    }
                     let (mr, _) = ui.allocate_exact_size(vec2(152.0, 18.0), Sense::hover());
                     if ms.len() == 2 {
                         // Stéréo : deux barres bien distinctes, entrée gauche en haut, droite en
@@ -1696,6 +1766,10 @@ impl App {
                         .on_hover_text("Crête max — clic : remise à zéro")
                         .clicked()
                     {
+                        if let Some(m) = self.track_meters.get_mut(&tid) {
+                            m[0].reset();
+                            m[1].reset();
+                        }
                         for &i in &chans {
                             if let Some(mm) = self.in_meters.get_mut(i as usize) {
                                 mm.reset();
@@ -1715,6 +1789,7 @@ impl App {
                         .num_columns(2)
                         .spacing([10.0, 6.0])
                         .show(&mut pui, |ui| {
+                            if !is_audio {
                             ui.label(egui::RichText::new("Type").font(t::regular(11.5)).color(t::TEXT_2));
                             let mut s = stereo;
                             ui.add_enabled_ui(stopped, |ui| {
@@ -1731,6 +1806,7 @@ impl App {
                                 }
                             });
                             ui.end_row();
+                            }
                             ui.label(egui::RichText::new("Couleur").font(t::regular(11.5)).color(t::TEXT_2));
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -1748,6 +1824,9 @@ impl App {
                                 }
                             });
                             ui.end_row();
+                            if is_audio {
+                                return;
+                            }
                             ui.label("");
                             ui.horizontal(|ui| {
                                 if w::tool_button(ui, Some(Icon::Record), "Armée", armed, stopped && input.is_some())
@@ -2231,6 +2310,38 @@ impl App {
             t::SURFACE,
         );
 
+        if files_hover && let Some(dp) = drop_ptr {
+            let fp = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::unique("drop_overlay"),
+            ));
+            fp.rect_stroke(
+                full.shrink(1.0),
+                0.0,
+                Stroke::new(2.0, t::ACCENT),
+                StrokeKind::Inside,
+            );
+            if dp.x >= tl_left && full.contains(dp) {
+                let x = self.x_of(tl_left, drop_at);
+                w::vline(&fp, x, full.top(), full.bottom(), t::ACCENT);
+            }
+            let msg = if drop_target.is_some() {
+                "Déposer : ajouter le fichier à cette piste audio"
+            } else {
+                "Déposer : une nouvelle piste audio par fichier"
+            };
+            let g = fp.layout_no_wrap(msg.into(), t::semibold(12.0), t::TEXT);
+            let r = Rect::from_center_size(
+                pos2(full.center().x, full.top() + RULER_H + 30.0),
+                g.size() + vec2(28.0, 14.0),
+            );
+            fp.rect_filled(r, t::R, t::SURFACE_3);
+            fp.rect_stroke(r, t::R, Stroke::new(1.0, t::ACCENT), StrokeKind::Inside);
+            fp.galley(r.center() - g.size() / 2.0, g, t::TEXT);
+        }
+        if !dropped.is_empty() {
+            self.import_audio_files(dropped, drop_at, drop_target);
+        }
         if audible_changed {
             self.project.dirty = true;
             self.update_audible();

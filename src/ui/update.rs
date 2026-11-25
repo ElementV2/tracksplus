@@ -20,8 +20,13 @@ impl App {
         if self.update_install
             && let State::Ready { file, .. } = self.updater.state()
         {
-            if !self.is_stopped() || self.save_as_job.is_some() || self.import_job.is_some() {
-                // Prise, finalisation ou copie en cours : on réessaie dès que c'est fini.
+            if !self.is_stopped()
+                || self.save_as_job.is_some()
+                || self.import_job.is_some()
+                || self.export_job.is_some()
+                || self.audio_import.is_some()
+            {
+                // Prise, finalisation, copie ou export en cours : on réessaie dès que c'est fini.
                 return;
             }
             self.update_install = false;

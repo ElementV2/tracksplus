@@ -4,6 +4,7 @@ mod app;
 mod audio;
 mod encode;
 mod export;
+mod import;
 mod midi;
 mod player;
 mod project;

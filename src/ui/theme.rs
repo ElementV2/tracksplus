@@ -141,6 +141,11 @@ fn install_fonts(ctx: &egui::Context) {
 
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
+    // Molette : Ctrl = zoom, Alt = défilement horizontal (dans le temps), Maj = vertical.
+    ctx.options_mut(|o| {
+        o.input_options.horizontal_scroll_modifier = egui::Modifiers::ALT;
+        o.input_options.vertical_scroll_modifier = egui::Modifiers::SHIFT;
+    });
     let mut style = (*ctx.global_style()).clone();
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;

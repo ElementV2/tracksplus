@@ -5,7 +5,7 @@
 
 use crate::encode::{self, FileMeta, MAX_AIFF_DATA, SinkSpec};
 use crate::project::{Project, sanitize};
-use crate::render::TrackRenderer;
+use crate::render::{TrackRenderer, WavSource};
 use anyhow::{Context, Result, anyhow, bail};
 use rubato::{FftFixedIn, Resampler};
 use serde::{Deserialize, Serialize};
@@ -324,57 +324,231 @@ impl ExportSettings {
     }
 }
 
+/// Export annulé par l'utilisateur (à distinguer d'une erreur).
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Export annulé")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Export réussi : fichiers écrits et avertissements à montrer à l'utilisateur.
+pub struct Outcome {
+    pub files: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
 pub struct ExportJob {
     /// Avancement en millièmes (les deux passes de la normalisation comprises).
     pub progress: Arc<AtomicU32>,
     pub cancel: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Result<Vec<PathBuf>>>>,
+    handle: Option<JoinHandle<Result<Outcome>>>,
 }
 
 impl ExportJob {
-    pub fn start(project: &Project, settings: ExportSettings) -> Self {
+    pub fn start(project: &Project, settings: ExportSettings) -> Result<Self> {
         let progress = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (p2, c2) = (progress.clone(), cancel.clone());
         let project = project.clone();
         let handle = std::thread::Builder::new()
             .name("tracksplus-export".into())
-            .spawn(move || run(&project, &settings, &p2, &c2))
-            .expect("thread d'export");
-        Self {
+            .spawn(move || {
+                lower_thread_priority();
+                run_export(&project, &settings, &p2, &c2)
+            })
+            .context("Impossible de démarrer l'export")?;
+        Ok(Self {
             progress,
             cancel,
             handle: Some(handle),
-        }
+        })
     }
 
     pub fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 
-    pub fn join(mut self) -> Result<Vec<PathBuf>> {
-        match self.handle.take().map(|h| h.join()) {
-            Some(Ok(r)) => r,
-            _ => bail!("L'export a échoué"),
+    /// Attend la fin de l'export. Une erreur interne (panique) devient un message : les
+    /// fichiers incomplets ont déjà été supprimés et les exports précédents sont intacts.
+    pub fn join(mut self) -> Result<Outcome> {
+        let Some(h) = self.handle.take() else {
+            bail!("L'export a échoué");
+        };
+        match h.join() {
+            Ok(r) => r,
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "erreur inconnue".into());
+                bail!(
+                    "L'export s'est arrêté sur une erreur interne ({msg}). Aucun fichier \
+                     incomplet n'a été laissé et les exports précédents sont intacts."
+                )
+            }
         }
+    }
+}
+
+/// L'export tourne sous la priorité normale : la lecture, l'enregistrement et les pads
+/// restent prioritaires.
+fn lower_thread_priority() {
+    #[cfg(windows)]
+    // SAFETY : appel sans pointeur sur le thread courant.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
 
 /// Un fichier à produire.
 struct Unit {
+    /// Nom affiché dans les messages (« Mix », nom de la piste).
+    name: String,
     path: PathBuf,
-    /// Indices des pistes mixées dans ce fichier.
+    /// Fichier en cours d'écriture, renommé en `path` une fois complet et sur le disque.
+    part: PathBuf,
+    /// Pistes mixées dans ce fichier (indices dans la liste des pistes exportées).
     tracks: Vec<usize>,
     channels: usize,
     meta: FileMeta,
 }
 
-fn run(
+/// Fichiers « .part » en cours d'écriture : supprimés s'ils n'ont pas été validés (erreur,
+/// annulation, panique). Un export ne laisse ainsi jamais de fichier incomplet, et un
+/// export précédent du même nom n'est remplacé qu'une fois le nouveau complet.
+struct PartFiles(Vec<PathBuf>);
+
+impl Drop for PartFiles {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Nom de fichier lisible et de longueur raisonnable (limite de 255 caractères).
+fn file_stem(name: &str) -> String {
+    sanitize(name)
+        .chars()
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Dossier d'export : relatif à la session, jamais vide, jamais le dossier des prises.
+fn export_dir(project: &Project, dir: &Path) -> Result<PathBuf> {
+    if dir.as_os_str().is_empty() {
+        bail!("Choisissez le dossier où écrire les fichiers exportés");
+    }
+    let dir = if dir.is_relative() {
+        project.dir.join(dir)
+    } else {
+        dir.to_path_buf()
+    };
+    let canon = |p: &Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .to_lowercase()
+    };
+    if canon(&dir) == canon(&project.audio_dir()) {
+        bail!(
+            "Export impossible dans le dossier « Audio » de la session : il contient les prises \
+             enregistrées. Choisissez un autre dossier, par exemple « Export »."
+        );
+    }
+    Ok(dir)
+}
+
+/// Vérifie avant de commencer que chaque prise de la plage est présente et lisible en
+/// entier : sinon l'export contiendrait des trous de silence.
+fn check_takes(project: &Project, tracks: &[usize], start: u64, end: u64) -> Result<()> {
+    let mut bad = Vec::new();
+    for &i in tracks {
+        for c in &project.tracks[i].clips {
+            if c.end() <= start || c.start >= end {
+                continue;
+            }
+            let path = project.clip_path(c);
+            let why = if !path.exists() {
+                Some("fichier introuvable".to_string())
+            } else {
+                match WavSource::open(&path) {
+                    Err(e) => Some(format!("illisible ({e})")),
+                    Ok(src) if src.frames() < c.offset + c.len => {
+                        Some("fichier plus court que la prise (tronqué)".to_string())
+                    }
+                    Ok(_) => None,
+                }
+            };
+            if let Some(why) = why {
+                bad.push(format!("{} : {why}", c.file));
+            }
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Export impossible : {} prise(s) manquante(s) ou illisible(s) dans le dossier « Audio » \
+         de la session — {}",
+        bad.len(),
+        list(&bad)
+    )
+}
+
+/// Liste courte pour un message : les 5 premiers éléments, puis le nombre restant.
+fn list(items: &[String]) -> String {
+    let mut s = items
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if items.len() > 5 {
+        s += &format!(" · et {} autre(s)", items.len() - 5);
+    }
+    s
+}
+
+/// Message clair pour une erreur d'écriture (disque plein en particulier).
+fn write_error(e: anyhow::Error, name: &str) -> anyhow::Error {
+    let full = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+    });
+    if full {
+        anyhow!(
+            "Disque plein pendant l'écriture de « {name} ». Libérez de la place puis relancez \
+             l'export : les exports précédents sont intacts."
+        )
+    } else {
+        e.context(format!("Écriture de « {name} »"))
+    }
+}
+
+fn fmt_gb(bytes: f64) -> String {
+    format!("{:.1} Go", bytes / 1e9).replace('.', ",")
+}
+
+/// Exporte la session selon `s`. Les fichiers sont écrits à côté de leur nom final
+/// (« .part ») et ne prennent leur nom qu'une fois tous complets et sur le disque.
+pub fn run_export(
     project: &Project,
     s: &ExportSettings,
     progress: &AtomicU32,
     cancel: &AtomicBool,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Outcome> {
     let (start, end) = s.range.unwrap_or((0, project.end()));
     let end = end.min(project.end().max(start));
     if end <= start {
@@ -386,7 +560,7 @@ fn run(
     if !(8000..=384_000).contains(&sr_out) {
         bail!("Fréquence d'export invalide : {sr_out} Hz");
     }
-    std::fs::create_dir_all(&s.dir).with_context(|| format!("Création de {}", s.dir.display()))?;
+    let dir = export_dir(project, &s.dir)?;
 
     let with_audio: Vec<usize> = (0..project.tracks.len())
         .filter(|&i| !project.tracks[i].clips.is_empty())
@@ -407,30 +581,54 @@ fn run(
         title,
         time_reference,
     };
+    let unit = |name: String, file: String, tracks: Vec<usize>, channels: usize| {
+        let path = dir.join(format!("{file}.{ext}"));
+        let part = dir.join(format!("{file}.{ext}.part"));
+        Unit {
+            meta: meta(name.clone()),
+            name,
+            path,
+            part,
+            tracks,
+            channels,
+        }
+    };
     let mut units = Vec::new();
     if s.stems {
-        for &i in &with_audio {
+        for (k, &i) in with_audio.iter().enumerate() {
             let t = &project.tracks[i];
-            units.push(Unit {
-                path: s
-                    .dir
-                    .join(format!("{:02} - {}.{ext}", i + 1, sanitize(&t.name))),
-                tracks: vec![i],
-                // Piste stéréo : fichier stéréo ; piste mono : fichier mono.
-                channels: t.channels(),
-                meta: meta(t.name.clone()),
-            });
+            // Piste stéréo : fichier stéréo ; piste mono : fichier mono.
+            units.push(unit(
+                t.name.clone(),
+                format!("{:02} - {}", i + 1, file_stem(&t.name)),
+                vec![k],
+                t.channels(),
+            ));
         }
     }
     if s.mix {
-        units.push(Unit {
-            path: s
-                .dir
-                .join(format!("{} - Mix.{ext}", sanitize(&project.name))),
-            tracks: with_audio.clone(),
-            channels: if s.mix_mono { 1 } else { 2 },
-            meta: meta("Mix".into()),
-        });
+        units.push(unit(
+            "Mix".into(),
+            format!("{} - Mix", file_stem(&project.name)),
+            (0..with_audio.len()).collect(),
+            if s.mix_mono { 1 } else { 2 },
+        ));
+    }
+    // Jamais un fichier de prise comme destination (dossier choisi à la main).
+    for u in &units {
+        let target = u.path.to_string_lossy().to_lowercase();
+        let clash = project
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .any(|c| project.clip_path(c).to_string_lossy().to_lowercase() == target);
+        if clash {
+            bail!(
+                "Export impossible : « {} » remplacerait une prise de la session. Choisissez \
+                 un autre dossier.",
+                u.path.display()
+            );
+        }
     }
 
     // L'AIFF stocke ses tailles sur 32 bits : on refuse avant d'écrire plutôt que de
@@ -440,45 +638,60 @@ fn run(
         let depth = s.output_depth().unwrap_or(BitDepth::I32);
         check_aiff_size(len, sr_in, sr_out, widest, depth)?;
     }
+    check_takes(project, &with_audio, start, end)?;
+
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Création du dossier {}", dir.display()))?;
+    // Place disponible : on refuse d'emblée plutôt que d'échouer au bout d'une heure.
+    let secs = len as f64 / sr_in.max(1) as f64;
+    let need: f64 = units
+        .iter()
+        .map(|u| s.estimated_bytes(secs, u.channels))
+        .sum::<f64>()
+        * 1.05
+        + 20e6;
+    if let Ok(free) = fs4::available_space(&dir)
+        && need > free as f64
+    {
+        bail!(
+            "Espace disque insuffisant : cet export demande environ {}, il reste {} dans {}. \
+             Libérez de la place ou choisissez un autre dossier.",
+            fmt_gb(need),
+            fmt_gb(free as f64),
+            dir.display()
+        );
+    }
 
     let passes = if s.normalize.is_off() { 1 } else { 2 };
-    let total = (units.len() * passes) as f64;
-    let mut done = 0usize;
-    let mut out = Vec::new();
-    for u in &units {
-        let mut tick = |f: f64| {
-            let p = (done as f64 + f.clamp(0.0, 1.0)) / total;
-            progress.store((p * 1000.0) as u32, Ordering::Relaxed);
-            !cancel.load(Ordering::Relaxed)
-        };
-        let make = || {
-            u.tracks
-                .iter()
-                .map(|&i| TrackRenderer::new(project, i))
-                .collect::<Vec<_>>()
-        };
-        let gain = match s.normalize {
-            Normalize::Off => 1.0,
-            n => {
-                let m = measure(
-                    project,
-                    make(),
-                    u.channels,
-                    start,
-                    len,
-                    sr_out,
-                    n,
-                    &mut tick,
-                )?;
-                done += 1;
-                m
-            }
-        };
-        let mut tick = |f: f64| {
-            let p = (done as f64 + f.clamp(0.0, 1.0)) / total;
-            progress.store((p * 1000.0) as u32, Ordering::Relaxed);
-            !cancel.load(Ordering::Relaxed)
-        };
+    let mut pass = 0;
+    let gains = match s.normalize {
+        Normalize::Off => vec![1.0; units.len()],
+        n => {
+            let g = measure_all(
+                project,
+                &with_audio,
+                &units,
+                start,
+                len,
+                sr_out,
+                n,
+                &mut |f| {
+                    let p = (pass as f64 + f.clamp(0.0, 1.0)) / passes as f64;
+                    progress.store((p * 1000.0) as u32, Ordering::Relaxed);
+                    !cancel.load(Ordering::Relaxed)
+                },
+            )?;
+            pass += 1;
+            g
+        }
+    };
+
+    // Écriture : chaque fichier dans son « .part », supprimé en cas d'échec.
+    let mut parts = PartFiles(Vec::new());
+    let mut sinks = Vec::new();
+    for (k, u) in units.iter().enumerate() {
+        let _ = std::fs::remove_file(&u.part);
+        parts.0.push(u.part.clone());
         let spec = SinkSpec {
             format: s.format,
             depth: s.output_depth().unwrap_or(BitDepth::F32),
@@ -488,13 +701,89 @@ fn run(
             mp3_bitrate: s.mp3_bitrate,
             ogg_quality: s.ogg_quality,
             meta: &u.meta,
+            seed: k as u64 + 1,
         };
-        write_file(project, make(), &spec, &u.path, start, len, gain, &mut tick)?;
-        done += 1;
-        out.push(u.path.clone());
+        sinks.push(encode::create(&u.part, &spec).map_err(|e| write_error(e, &u.name))?);
     }
+    // En 32 bits flottant (WAV/BWF), rien n'est écrêté : au-delà de 0 dBFS, on prévient.
+    let float_out = s.output_depth() == Some(BitDepth::F32)
+        && matches!(s.format, ExportFormat::Wav | ExportFormat::Bwf);
+    let mut over = vec![0u64; units.len()];
+    let mut scaled = Vec::new();
+    render_all(
+        project,
+        &with_audio,
+        &units,
+        start,
+        len,
+        sr_out,
+        |k, b| {
+            let g = gains[k];
+            scaled.clear();
+            scaled.extend(b.iter().map(|x| x * g));
+            over[k] += scaled.iter().filter(|x| x.abs() > 1.0).count() as u64;
+            sinks[k]
+                .write(&scaled)
+                .map_err(|e| write_error(e, &units[k].name))
+        },
+        &mut |f| {
+            let p = (pass as f64 + f.clamp(0.0, 1.0)) / passes as f64;
+            progress.store((p * 1000.0) as u32, Ordering::Relaxed);
+            !cancel.load(Ordering::Relaxed)
+        },
+    )?;
+    // Fin des fichiers : en-têtes, puis écriture forcée sur le disque.
+    for (sink, u) in sinks.into_iter().zip(&units) {
+        sink.finish().map_err(|e| write_error(e, &u.name))?;
+    }
+    // Tous complets : ils prennent leur nom (remplace un export précédent du même nom).
+    let mut files = Vec::new();
+    for u in &units {
+        std::fs::rename(&u.part, &u.path).with_context(|| {
+            format!(
+                "Impossible de remplacer « {} » : le fichier est peut-être ouvert dans un autre \
+                 programme. Fermez-le puis relancez l'export.",
+                u.path.display()
+            )
+        })?;
+        files.push(u.path.clone());
+    }
+    parts.0.clear();
     progress.store(1000, Ordering::Relaxed);
-    Ok(out)
+
+    let warnings = units
+        .iter()
+        .zip(&over)
+        .filter(|(_, n)| **n > 0)
+        .map(|(u, n)| {
+            if float_out {
+                format!(
+                    "« {} » dépasse 0 dBFS ({n} échantillons) : rien n'est écrêté en 32 bits \
+                     flottant, mais le son saturera à la lecture. Activez la normalisation \
+                     (crête −1 dB) ou baissez le niveau.",
+                    u.name
+                )
+            } else {
+                format!(
+                    "« {} » : {n} échantillons au-delà de 0 dBFS ont été écrêtés (saturation). \
+                     Activez la normalisation (crête −1 dB) pour l'éviter.",
+                    u.name
+                )
+            }
+        })
+        .collect();
+    Ok(Outcome { files, warnings })
+}
+
+/// Pour les tests : l'export et la liste des fichiers.
+#[cfg(test)]
+fn run(
+    project: &Project,
+    s: &ExportSettings,
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> Result<Vec<PathBuf>> {
+    run_export(project, s, progress, cancel).map(|o| o.files)
 }
 
 /// Trames produites pour `len` trames à `sr_in` converties en `sr_out`.
@@ -519,73 +808,14 @@ fn check_aiff_size(
     let bytes = pcm_data_bytes(len, sr_in, sr_out, channels, depth);
     if bytes > MAX_AIFF_DATA {
         bail!(
-            "Export impossible : un fichier ferait {:.1} Go, au-delà de la limite de 4 Go du \
+            "Export impossible : un fichier ferait {} Go, au-delà de la limite de 4 Go du \
              format AIFF. Choisissez le WAV ou le BWF (sans limite de taille), moins de bits, \
              une fréquence plus basse, des pistes séparées plutôt que le mix, ou une plage \
              plus courte.",
-            bytes as f64 / 1e9
+            format!("{:.1}", bytes as f64 / 1e9).replace('.', ",")
         );
     }
     Ok(())
-}
-
-/// Première passe de la normalisation : mesure le signal exporté et renvoie le gain
-/// linéaire à appliquer.
-#[allow(clippy::too_many_arguments)]
-fn measure(
-    project: &Project,
-    renderers: Vec<TrackRenderer>,
-    channels: usize,
-    offset: u64,
-    len: u64,
-    sr_out: u32,
-    mode: Normalize,
-    on_progress: &mut impl FnMut(f64) -> bool,
-) -> Result<f32> {
-    match mode {
-        Normalize::Off => Ok(1.0),
-        Normalize::Peak(target) => {
-            let mut peak = 0f32;
-            render(
-                project,
-                renderers,
-                channels,
-                offset,
-                len,
-                sr_out,
-                |b| {
-                    peak = b.iter().fold(peak, |m, x| m.max(x.abs()));
-                    Ok(())
-                },
-                on_progress,
-            )?;
-            Ok(peak_gain(peak, target))
-        }
-        Normalize::Lufs(target) => {
-            use ebur128::{EbuR128, Mode};
-            let mut meter = EbuR128::new(channels as u32, sr_out, Mode::I | Mode::TRUE_PEAK)
-                .map_err(|e| anyhow!("Mesure de sonie : {e:?}"))?;
-            render(
-                project,
-                renderers,
-                channels,
-                offset,
-                len,
-                sr_out,
-                |b| {
-                    meter
-                        .add_frames_f32(b)
-                        .map_err(|e| anyhow!("Mesure de sonie : {e:?}"))
-                },
-                on_progress,
-            )?;
-            let loudness = meter.loudness_global().unwrap_or(f64::NEG_INFINITY);
-            let true_peak = (0..channels as u32)
-                .filter_map(|c| meter.true_peak(c).ok())
-                .fold(0f64, f64::max);
-            Ok(lufs_gain(loudness, true_peak, target))
-        }
-    }
 }
 
 fn db_to_gain(db: f64) -> f32 {
@@ -616,147 +846,283 @@ fn lufs_gain(loudness: f64, true_peak: f64, target: f32) -> f32 {
     db_to_gain(db)
 }
 
-/// Deuxième (ou unique) passe : écrit le fichier avec le gain donné. Le fichier
-/// incomplet est supprimé en cas d'erreur ou d'annulation.
+/// Première passe de la normalisation : mesure chaque fichier et renvoie le gain linéaire
+/// à appliquer à chacun.
 #[allow(clippy::too_many_arguments)]
-fn write_file(
+fn measure_all(
     project: &Project,
-    renderers: Vec<TrackRenderer>,
-    spec: &SinkSpec,
-    path: &Path,
-    offset: u64,
-    len: u64,
-    gain: f32,
-    on_progress: &mut impl FnMut(f64) -> bool,
-) -> Result<()> {
-    let mut sink = encode::create(path, spec)?;
-    let mut scaled = Vec::new();
-    let r = render(
-        project,
-        renderers,
-        spec.channels,
-        offset,
-        len,
-        spec.sample_rate,
-        |b| {
-            if gain == 1.0 {
-                sink.write(b)
-            } else {
-                scaled.clear();
-                scaled.extend(b.iter().map(|x| x * gain));
-                sink.write(&scaled)
-            }
-        },
-        on_progress,
-    )
-    .and_then(|()| sink.finish());
-    if r.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    r
-}
-
-/// Rend `len` trames depuis `offset` (mixées sur `channels` canaux), les rééchantillonne
-/// à `sr_out` et passe des blocs entrelacés à `sink`. `on_progress(f)` renvoie `false`
-/// pour annuler.
-#[allow(clippy::too_many_arguments)]
-fn render(
-    project: &Project,
-    mut renderers: Vec<TrackRenderer>,
-    channels: usize,
-    offset: u64,
+    tracks: &[usize],
+    units: &[Unit],
+    start: u64,
     len: u64,
     sr_out: u32,
-    mut sink: impl FnMut(&[f32]) -> Result<()>,
+    mode: Normalize,
+    on_progress: &mut impl FnMut(f64) -> bool,
+) -> Result<Vec<f32>> {
+    use ebur128::{EbuR128, Mode};
+    let sonie = |e: ebur128::Error| anyhow!("Mesure de sonie : {e:?}");
+    let mut peaks = vec![0f32; units.len()];
+    let mut meters = Vec::new();
+    if let Normalize::Lufs(_) = mode {
+        for u in units {
+            meters.push(
+                EbuR128::new(u.channels as u32, sr_out, Mode::I | Mode::TRUE_PEAK)
+                    .map_err(sonie)?,
+            );
+        }
+    }
+    render_all(
+        project,
+        tracks,
+        units,
+        start,
+        len,
+        sr_out,
+        |k, b| {
+            match mode {
+                Normalize::Lufs(_) => meters[k].add_frames_f32(b).map_err(sonie)?,
+                _ => peaks[k] = b.iter().fold(peaks[k], |m, x| m.max(x.abs())),
+            }
+            Ok(())
+        },
+        on_progress,
+    )?;
+    Ok(match mode {
+        Normalize::Off => vec![1.0; units.len()],
+        Normalize::Peak(target) => peaks.iter().map(|&p| peak_gain(p, target)).collect(),
+        Normalize::Lufs(target) => meters
+            .iter()
+            .zip(units)
+            .map(|(m, u)| {
+                let loudness = m.loudness_global().unwrap_or(f64::NEG_INFINITY);
+                let true_peak = (0..u.channels as u32)
+                    .filter_map(|c| m.true_peak(c).ok())
+                    .fold(0f64, f64::max);
+                lufs_gain(loudness, true_peak, target)
+            })
+            .collect(),
+    })
+}
+
+/// Rend la plage `[start, start + len)` une seule fois pour tous les fichiers : chaque
+/// piste est lue une fois par bloc, puis mixée dans les fichiers qui la contiennent (piste
+/// séparée, mix). `sink(k, bloc)` reçoit les échantillons entrelacés du fichier `k`, déjà
+/// à `sr_out` ; `on_progress(f)` renvoie `false` pour annuler. Une prise illisible en cours
+/// de route arrête l'export avec son nom (jamais de trou de silence passé sous silence).
+#[allow(clippy::too_many_arguments)]
+fn render_all(
+    project: &Project,
+    tracks: &[usize],
+    units: &[Unit],
+    start: u64,
+    len: u64,
+    sr_out: u32,
+    mut sink: impl FnMut(usize, &[f32]) -> Result<()>,
     on_progress: &mut impl FnMut(f64) -> bool,
 ) -> Result<()> {
     let sr_in = project.sample_rate;
-    let mut resampler = if sr_in != sr_out {
-        Some(FftFixedIn::<f32>::new(
-            sr_in as usize,
-            sr_out as usize,
-            CHUNK,
-            2,
-            channels,
-        )?)
-    } else {
-        None
-    };
-    let expected = expected_frames(len, sr_in, sr_out);
-    let mut skip = resampler.as_ref().map_or(0, |r| r.output_delay());
-    let mut written = 0u64;
-
-    let mut tbuf = vec![0f32; CHUNK * 2];
-    let mut input: Vec<Vec<f32>> = vec![vec![0f32; CHUNK]; channels];
-    let mut inter: Vec<f32> = Vec::new();
+    let mut renderers: Vec<TrackRenderer> = tracks
+        .iter()
+        .map(|&i| TrackRenderer::new(project, i))
+        .collect();
+    let mut bufs: Vec<Vec<f32>> = renderers
+        .iter()
+        .map(|r| vec![0f32; CHUNK * r.channels()])
+        .collect();
+    let mut chains = units
+        .iter()
+        .map(|u| Chain::new(u.channels, sr_in, sr_out, len))
+        .collect::<Result<Vec<_>>>()?;
     let mut pos = 0u64;
-
-    let mut emit = |block: &[Vec<f32>], skip: &mut usize, written: &mut u64| -> Result<()> {
-        let frames = block[0].len();
-        let start = (*skip).min(frames);
-        *skip -= start;
-        let take = ((frames - start) as u64).min(expected - *written) as usize;
-        if take == 0 {
-            return Ok(());
-        }
-        inter.clear();
-        for f in start..start + take {
-            for ch in block {
-                inter.push(ch[f]);
-            }
-        }
-        *written += take as u64;
-        sink(&inter)
-    };
-
     while pos < len {
         let n = ((len - pos) as usize).min(CHUNK);
-        for ch in &mut input {
-            ch.clear();
-            ch.resize(n, 0.0);
-        }
-        for r in &mut renderers {
-            let rc = r.channels();
-            let buf = &mut tbuf[..n * rc];
-            r.render(offset + pos, buf);
-            for (j, ch) in input.iter_mut().enumerate() {
-                for (f, d) in ch.iter_mut().enumerate() {
-                    *d += match (rc, channels) {
-                        // Mono : même signal sur chaque canal de sortie (au centre).
-                        (1, _) => buf[f],
-                        // Stéréo vers mono : moyenne des deux canaux.
-                        (_, 1) => 0.5 * (buf[f * 2] + buf[f * 2 + 1]),
-                        _ => buf[f * 2 + j.min(1)],
-                    };
+        for (r, b) in renderers.iter_mut().zip(&mut bufs) {
+            let b = &mut b[..n * r.channels()];
+            r.render(start + pos, b);
+            // Prise flottante abîmée : jamais de NaN ni d'infini dans un export.
+            for x in b.iter_mut() {
+                if !x.is_finite() {
+                    *x = 0.0;
                 }
             }
         }
-        pos += n as u64;
-        match &mut resampler {
-            None => emit(&input, &mut skip, &mut written)?,
-            Some(rs) => {
-                let block = if n == CHUNK {
-                    rs.process(&input, None)?
-                } else {
-                    rs.process_partial(Some(&input), None)?
-                };
-                emit(&block, &mut skip, &mut written)?;
+        for (k, (u, c)) in units.iter().zip(&mut chains).enumerate() {
+            c.begin(n);
+            for &t in &u.tracks {
+                let rc = renderers[t].channels();
+                c.add(&bufs[t][..n * rc], rc);
             }
+            c.process(&mut |b| sink(k, b))?;
+        }
+        pos += n as u64;
+        let errors: Vec<String> = renderers.iter_mut().flat_map(|r| r.take_errors()).collect();
+        if !errors.is_empty() {
+            bail!(
+                "Export interrompu : lecture impossible d'une prise — {}. Les exports \
+                 précédents sont intacts.",
+                list(&errors)
+            );
         }
         if !on_progress(pos as f64 / len as f64) {
-            bail!("Export annulé");
+            return Err(Cancelled.into());
         }
     }
-    // Vide le résampleur (latence du filtre).
-    if let Some(rs) = &mut resampler {
-        let mut guard = 0;
-        while written < expected && guard < 64 {
-            let block = rs.process_partial::<Vec<f32>>(None, None)?;
-            emit(&block, &mut skip, &mut written)?;
-            guard += 1;
-        }
+    for (k, c) in chains.iter_mut().enumerate() {
+        c.flush(&mut |b| sink(k, b))?;
     }
     Ok(())
+}
+
+/// Chaîne de sortie d'un fichier : mixage de ses pistes, rééchantillonnage, puis découpe
+/// exacte (latence du filtre, longueur attendue) en blocs entrelacés.
+struct Chain {
+    channels: usize,
+    rs: Option<FftFixedIn<f32>>,
+    /// Trames de latence du filtre encore à sauter.
+    skip: usize,
+    written: u64,
+    expected: u64,
+    input: Vec<Vec<f32>>,
+    out: Vec<Vec<f32>>,
+    inter: Vec<f32>,
+}
+
+impl Chain {
+    fn new(channels: usize, sr_in: u32, sr_out: u32, len: u64) -> Result<Self> {
+        let rs = if sr_in != sr_out {
+            Some(FftFixedIn::<f32>::new(
+                sr_in as usize,
+                sr_out as usize,
+                CHUNK,
+                2,
+                channels,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            channels,
+            skip: rs.as_ref().map_or(0, |r| r.output_delay()),
+            out: rs
+                .as_ref()
+                .map_or_else(Vec::new, |r| r.output_buffer_allocate(true)),
+            rs,
+            written: 0,
+            expected: expected_frames(len, sr_in, sr_out),
+            input: vec![Vec::with_capacity(CHUNK); channels],
+            inter: Vec::new(),
+        })
+    }
+
+    /// Prépare un bloc de `n` trames silencieuses.
+    fn begin(&mut self, n: usize) {
+        for ch in &mut self.input {
+            ch.clear();
+            ch.resize(n, 0.0);
+        }
+    }
+
+    /// Ajoute une piste rendue (entrelacée sur `rc` canaux) au bloc.
+    fn add(&mut self, buf: &[f32], rc: usize) {
+        match (rc, self.channels) {
+            // Mono : même signal sur chaque canal de sortie (au centre).
+            (1, _) => {
+                for ch in &mut self.input {
+                    for (d, s) in ch.iter_mut().zip(buf) {
+                        *d += *s;
+                    }
+                }
+            }
+            // Stéréo vers mono : moyenne des deux canaux.
+            (_, 1) => {
+                for (d, s) in self.input[0].iter_mut().zip(buf.as_chunks::<2>().0) {
+                    *d += 0.5 * (s[0] + s[1]);
+                }
+            }
+            _ => {
+                for (j, ch) in self.input.iter_mut().enumerate() {
+                    for (d, s) in ch.iter_mut().zip(buf.as_chunks::<2>().0) {
+                        *d += s[j.min(1)];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rééchantillonne le bloc préparé et l'envoie.
+    fn process(&mut self, sink: &mut impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
+        let n = self.input[0].len();
+        let Self {
+            rs,
+            input,
+            out,
+            inter,
+            skip,
+            written,
+            expected,
+            ..
+        } = self;
+        match rs {
+            None => emit(input, n, skip, written, *expected, inter, sink),
+            Some(rs) => {
+                let (_, got) = if n == CHUNK {
+                    rs.process_into_buffer(input, out, None)?
+                } else {
+                    rs.process_partial_into_buffer(Some(input), out, None)?
+                };
+                emit(out, got, skip, written, *expected, inter, sink)
+            }
+        }
+    }
+
+    /// Vide le résampleur (latence du filtre) jusqu'à la longueur attendue.
+    fn flush(&mut self, sink: &mut impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
+        let Self {
+            rs,
+            out,
+            inter,
+            skip,
+            written,
+            expected,
+            ..
+        } = self;
+        if let Some(rs) = rs {
+            let mut guard = 0;
+            while *written < *expected && guard < 64 {
+                let (_, got) = rs.process_partial_into_buffer::<Vec<f32>, _>(None, out, None)?;
+                emit(out, got, skip, written, *expected, inter, sink)?;
+                guard += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Entrelace les `frames` premières trames de `block`, sans la latence restante ni
+/// au-delà de la longueur attendue, et les envoie à `sink`.
+fn emit(
+    block: &[Vec<f32>],
+    frames: usize,
+    skip: &mut usize,
+    written: &mut u64,
+    expected: u64,
+    inter: &mut Vec<f32>,
+    sink: &mut impl FnMut(&[f32]) -> Result<()>,
+) -> Result<()> {
+    let start = (*skip).min(frames);
+    *skip -= start;
+    let take = ((frames - start) as u64).min(expected - *written) as usize;
+    if take == 0 {
+        return Ok(());
+    }
+    inter.clear();
+    for f in start..start + take {
+        for ch in block {
+            inter.push(ch[f]);
+        }
+    }
+    *written += take as u64;
+    sink(inter)
 }
 
 #[cfg(test)]
@@ -814,7 +1180,7 @@ mod tests {
     }
 
     /// Décode un fichier avec symphonia : (fréquence, canaux, échantillons entrelacés).
-    fn decode(path: &Path) -> (u32, usize, Vec<f32>) {
+    pub(super) fn decode(path: &Path) -> (u32, usize, Vec<f32>) {
         use symphonia::core::audio::SampleBuffer;
         use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
         use symphonia::core::errors::Error as SymError;
@@ -1333,5 +1699,442 @@ mod range_tests {
             &v[..2]
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// Exports réels de plusieurs gigaoctets (lents : `cargo test --release -- --ignored
+/// big_exports --nocapture`).
+#[cfg(test)]
+mod big_tests {
+    use super::*;
+    use crate::project::Clip;
+    use hound::{WavSpec, WavWriter};
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SR: u32 = 48000;
+    /// 48 min 20 s : en 192 kHz flottant stéréo, le mix dépasse 4 Gio.
+    const SECS: u64 = 2900;
+    const FREQ: f32 = 441.0;
+
+    fn long_project() -> Project {
+        let dir = std::env::temp_dir().join(format!("tp-big-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("Long".into(), dir, SR);
+        p.ensure_dirs().unwrap();
+        let id = p.add_track(Some("Voix".into()), Some(0));
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: SR,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let frames = SECS * SR as u64;
+        let mut w = WavWriter::create(p.audio_dir().join("long.wav"), spec).unwrap();
+        let mut ph = 0f64;
+        let step = 2.0 * std::f64::consts::PI * FREQ as f64 / SR as f64;
+        for _ in 0..frames {
+            w.write_sample(0.5 * ph.sin() as f32).unwrap();
+            ph += step;
+            if ph > 2.0 * std::f64::consts::PI {
+                ph -= 2.0 * std::f64::consts::PI;
+            }
+        }
+        w.finalize().unwrap();
+        p.track_mut(id).unwrap().clips.push(Clip {
+            id: 1,
+            file: "long.wav".into(),
+            start: 0,
+            offset: 0,
+            len: frames,
+            src_len: frames,
+            fade_in: 0,
+            fade_out: 0,
+        });
+        p
+    }
+
+    fn u32le(b: &[u8], at: usize) -> u64 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as u64
+    }
+
+    fn u64le(b: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+
+    /// Vérifie un WAV/BWF exporté : en-tête RF64 cohérent avec la taille réelle, et un vrai
+    /// signal (sinus à 0,5) dans les dernières secondes, au-delà de 4 Gio.
+    fn check_rf64(path: &Path, bwf: bool, channels: u64, frames: u64) {
+        let len = std::fs::metadata(path).unwrap().len();
+        assert!(len > u32::MAX as u64, "{} : {len} octets", path.display());
+        let mut f = std::fs::File::open(path).unwrap();
+        let mut head = vec![0u8; 4096];
+        f.read_exact(&mut head).unwrap();
+        assert_eq!(&head[0..4], b"RF64");
+        assert_eq!(u32le(&head, 4), u32::MAX as u64);
+        assert_eq!(&head[8..12], b"WAVE");
+        assert_eq!(&head[12..16], b"ds64");
+        let ds = 20;
+        let riff_size = u64le(&head, ds);
+        let data_size = u64le(&head, ds + 8);
+        let sample_count = u64le(&head, ds + 16);
+        assert_eq!(riff_size, len - 8, "riffSize du ds64");
+        // Parcours des chunks jusqu'à « data ».
+        let mut p = 12usize;
+        let mut data_at = None;
+        let mut seen_bext = false;
+        while p + 8 <= head.len() {
+            let id = &head[p..p + 4];
+            let size = u32le(&head, p + 4);
+            if id == b"data" {
+                assert_eq!(size, u32::MAX as u64, "taille 32 bits du data");
+                data_at = Some(p as u64 + 8);
+                break;
+            }
+            if id == b"bext" {
+                seen_bext = true;
+            }
+            p += 8 + size as usize + (size as usize & 1);
+        }
+        let data_at = data_at.expect("chunk data introuvable");
+        assert_eq!(seen_bext, bwf, "chunk bext");
+        assert_eq!(
+            data_at + data_size,
+            len,
+            "dataSize du ds64 = fin du fichier"
+        );
+        assert_eq!(data_size, frames * channels * 4);
+        assert_eq!(sample_count, frames);
+        // Dernières 2 s : signal attendu, aligné (flottants lisibles, amplitude 0,5).
+        let tail = 2 * 192_000 * channels * 4;
+        f.seek(SeekFrom::Start(len - tail)).unwrap();
+        let mut buf = vec![0u8; tail as usize];
+        f.read_exact(&mut buf).unwrap();
+        let peak = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            (0.45..=0.55).contains(&peak),
+            "fin du fichier : crête {peak} (attendu ≈ 0,5)"
+        );
+        assert!(
+            len - tail > u32::MAX as u64,
+            "la vérification porte bien au-delà de 4 Gio"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn big_exports() {
+        let t0 = std::time::Instant::now();
+        let p = long_project();
+        eprintln!("session de {SECS} s générée en {:.0?}", t0.elapsed());
+        let frames_192 = SECS * 192_000;
+        let base = ExportSettings {
+            sample_rate: 192_000,
+            depth: BitDepth::F32,
+            stems: false,
+            mix: true,
+            dither: false,
+            dir: p.dir.join("Export"),
+            ..Default::default()
+        };
+        let go = |s: &ExportSettings| run(&p, s, &AtomicU32::new(0), &AtomicBool::new(false));
+
+        // WAV et BWF : mix stéréo 192 kHz flottant ≈ 4,45 Go → RF64.
+        for (fmt, bwf) in [(ExportFormat::Wav, false), (ExportFormat::Bwf, true)] {
+            let t = std::time::Instant::now();
+            let files = go(&ExportSettings {
+                format: fmt,
+                ..base.clone()
+            })
+            .unwrap();
+            eprintln!("{fmt:?} : {:.1?}", t.elapsed());
+            assert_eq!(files.len(), 1);
+            check_rf64(&files[0], bwf, 2, frames_192);
+            std::fs::remove_file(&files[0]).unwrap();
+        }
+
+        // AIFF : refusé avant d'écrire quoi que ce soit (limite de 4 Go du format).
+        let err = go(&ExportSettings {
+            format: ExportFormat::Aiff,
+            depth: BitDepth::I32,
+            ..base.clone()
+        })
+        .unwrap_err();
+        eprintln!("AIFF : {err:#}");
+        let left: Vec<_> = std::fs::read_dir(p.dir.join("Export"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "aucun fichier laissé : {left:?}");
+
+        // Formats compressés sur toute la durée : longueur exacte à la relecture.
+        for (fmt, rate) in [
+            (ExportFormat::Flac, 48_000u32),
+            (ExportFormat::Mp3, 48_000),
+            (ExportFormat::Ogg, 48_000),
+        ] {
+            let t = std::time::Instant::now();
+            let files = go(&ExportSettings {
+                format: fmt,
+                sample_rate: rate,
+                depth: BitDepth::I24,
+                ..base.clone()
+            })
+            .unwrap();
+            eprintln!("{fmt:?} : {:.1?}", t.elapsed());
+            let (r, ch, samples) = super::tests::decode(&files[0]);
+            assert_eq!(r, rate);
+            assert_eq!(ch, 2);
+            let got = (samples.len() / ch) as i64;
+            let want = (SECS * rate as u64) as i64;
+            // MP3 : quelques trames de délai d'encodeur tolérées. Ogg : le décodeur de test
+            // ignore la coupure de fin ; la longueur exacte est vérifiée dans le fichier
+            // (position « granule » de la dernière page).
+            let tol = match fmt {
+                ExportFormat::Mp3 => 4096,
+                ExportFormat::Ogg => 2048,
+                _ => 0,
+            };
+            if fmt == ExportFormat::Ogg {
+                let bytes = std::fs::read(&files[0]).unwrap();
+                let last = bytes
+                    .windows(4)
+                    .rposition(|w| w == b"OggS")
+                    .expect("page Ogg");
+                let granule = u64le(&bytes, last + 6);
+                assert_eq!(granule, want as u64, "longueur Ogg dans le fichier");
+            }
+            assert!(
+                (got - want).abs() <= tol,
+                "{fmt:?} : {got} trames, attendu {want}"
+            );
+            let peak = samples[samples.len() - 2 * rate as usize * ch..]
+                .iter()
+                .fold(0f32, |m, x| m.max(x.abs()));
+            assert!((0.4..=0.6).contains(&peak), "{fmt:?} : crête finale {peak}");
+            std::fs::remove_file(&files[0]).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&p.dir);
+        eprintln!("total : {:.0?}", t0.elapsed());
+    }
+}
+
+/// Sûreté de l'export : rien n'est jamais perdu ni laissé à moitié écrit, et chaque
+/// problème est signalé avec son détail.
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::project::Clip;
+    use hound::{WavSpec, WavWriter};
+
+    fn project(tag: &str, level: f32, tracks: usize) -> Project {
+        let dir = std::env::temp_dir().join(format!("tp-export-safe-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("Safe".into(), dir, 48000);
+        p.ensure_dirs().unwrap();
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        for k in 0..tracks {
+            let file = format!("t{k}.wav");
+            let mut w = WavWriter::create(p.audio_dir().join(&file), spec).unwrap();
+            for _ in 0..48000 {
+                w.write_sample(level).unwrap();
+            }
+            w.finalize().unwrap();
+            let id = p.add_track(Some(format!("T{k}")), Some(k as u16));
+            p.track_mut(id).unwrap().clips.push(Clip {
+                id: 100 + k as u64,
+                file,
+                start: 0,
+                offset: 0,
+                len: 48000,
+                src_len: 48000,
+                fade_in: 0,
+                fade_out: 0,
+            });
+        }
+        p
+    }
+
+    fn settings(p: &Project) -> ExportSettings {
+        ExportSettings {
+            sample_rate: 48000,
+            depth: BitDepth::I24,
+            stems: false,
+            mix: true,
+            dir: p.dir.join("Export"),
+            ..Default::default()
+        }
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|r| {
+                r.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".part"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Annuler (dans les deux passes) laisse l'export précédent intact, sans « .part ».
+    #[test]
+    fn cancel_keeps_previous_export() {
+        let p = project("cancel", 0.25, 1);
+        let s = settings(&p);
+        let dir = p.dir.join("Export");
+        let first = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        let before = std::fs::read(&first[0]).unwrap();
+        for normalize in [Normalize::Off, Normalize::Peak(-1.0)] {
+            let s = ExportSettings {
+                normalize,
+                ..s.clone()
+            };
+            let e = run_export(&p, &s, &AtomicU32::new(0), &AtomicBool::new(true))
+                .err()
+                .unwrap();
+            assert!(e.is::<Cancelled>(), "{e:#}");
+            assert_eq!(std::fs::read(&first[0]).unwrap(), before);
+            assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        }
+        // Un nouvel export complet remplace bien l'ancien.
+        let s = ExportSettings {
+            depth: BitDepth::I16,
+            ..s
+        };
+        let again = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert_eq!(again, first);
+        assert_ne!(std::fs::read(&first[0]).unwrap(), before);
+        assert!(leftovers(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// Une prise manquante ou tronquée : export refusé avant d'écrire, avec son nom.
+    #[test]
+    fn missing_or_truncated_take_is_reported() {
+        let mut p = project("missing", 0.25, 2);
+        std::fs::remove_file(p.audio_dir().join("t1.wav")).unwrap();
+        let e = run(
+            &p,
+            &settings(&p),
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("t1.wav") && e.contains("introuvable"), "{e}");
+        assert!(!p.dir.join("Export").join("Safe - Mix.wav").exists());
+        // Prise plus longue que son fichier (fichier tronqué).
+        p.tracks[1].clips.clear();
+        p.tracks[0].clips[0].len = 96000;
+        let e = run(
+            &p,
+            &settings(&p),
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("t0.wav") && e.contains("tronqué"), "{e}");
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// Jamais d'export dans le dossier des prises, ni dans un dossier vide.
+    #[test]
+    fn audio_folder_and_empty_dir_are_refused() {
+        let p = project("audio", 0.25, 1);
+        for dir in [p.audio_dir(), PathBuf::from("Audio"), PathBuf::new()] {
+            let s = ExportSettings {
+                dir: dir.clone(),
+                ..settings(&p)
+            };
+            let e = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false));
+            assert!(e.is_err(), "{}", dir.display());
+        }
+        // Dossier relatif : dans la session.
+        let s = ExportSettings {
+            dir: PathBuf::from("Rendus"),
+            ..settings(&p)
+        };
+        let files = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert!(files[0].starts_with(p.dir.join("Rendus")));
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// Un mix qui sature est signalé ; en 32 bits flottant, il n'est pas écrêté.
+    #[test]
+    fn clipping_is_reported() {
+        let p = project("clip", 0.75, 2);
+        let s = settings(&p);
+        let out = run_export(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(out.warnings[0].contains("écrêtés"));
+        let s = ExportSettings {
+            depth: BitDepth::F32,
+            ..s
+        };
+        let out = run_export(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert!(out.warnings[0].contains("rien n'est écrêté"));
+        let mut r = hound::WavReader::open(&out.files[0]).unwrap();
+        let max = r
+            .samples::<f32>()
+            .map(|x| x.unwrap().abs())
+            .fold(0f32, f32::max);
+        assert!((max - 1.5).abs() < 1e-3, "{max}");
+        // Avec la normalisation : plus de saturation, plus d'avertissement.
+        let s = ExportSettings {
+            normalize: Normalize::Peak(-1.0),
+            ..settings(&p)
+        };
+        let out = run_export(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// Disque plein : message clair, qui nomme le fichier.
+    #[test]
+    fn disk_full_message() {
+        let io = std::io::Error::new(std::io::ErrorKind::StorageFull, "plein");
+        let e = write_error(anyhow::Error::new(io), "Mix").to_string();
+        assert!(e.contains("Disque plein") && e.contains("Mix"), "{e}");
+        let other = std::io::Error::other("autre");
+        let e = format!("{:#}", write_error(anyhow::Error::new(other), "T1"));
+        assert!(e.contains("T1") && e.contains("autre"), "{e}");
+    }
+
+    /// Pistes séparées et mix rendus en un seul passage : chaque fichier reste exact.
+    #[test]
+    fn single_pass_matches_each_file() {
+        let p = project("pass", 0.25, 2);
+        let s = ExportSettings {
+            stems: true,
+            mix: true,
+            depth: BitDepth::F32,
+            ..settings(&p)
+        };
+        let files = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        assert_eq!(files.len(), 3);
+        let first = |f: &Path| {
+            let mut r = hound::WavReader::open(f).unwrap();
+            let ch = r.spec().channels;
+            (
+                ch,
+                r.samples::<f32>().next().unwrap().unwrap(),
+                r.duration(),
+            )
+        };
+        assert_eq!(first(&files[0]), (1, 0.25, 48000));
+        assert_eq!(first(&files[1]), (1, 0.25, 48000));
+        assert_eq!(first(&files[2]), (2, 0.5, 48000));
+        let _ = std::fs::remove_dir_all(&p.dir);
     }
 }

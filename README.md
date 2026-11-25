@@ -68,6 +68,19 @@ ou archiver d'un bloc :
   en dB, voyant de saturation (clic pour remettre à zéro). Un par piste, un master stéréo, et
   un bandeau de toutes les entrées.
 
+### Pistes audio (musique, sons)
+
+- Glisser des fichiers audio (WAV, AIFF, MP3, FLAC, Ogg, M4A) depuis l'explorateur sur le
+  multipiste : **une piste audio par fichier**, la prise posée à l'endroit du dépôt (à la
+  tête de lecture si on lâche sur la colonne des pistes). Un fichier lâché sur une piste
+  audio existante s'y ajoute.
+- Les fichiers sont convertis à la fréquence de la session et copiés dans `Audio\` ; les
+  originaux ne sont jamais modifiés. Progression et « Annuler » pendant la conversion ;
+  chaque fichier refusé est signalé avec la raison. Ctrl+Z retire les pistes ajoutées.
+- Une piste audio est en lecture seule : pas d'entrée, pas d'enregistrement ni de monitoring,
+  mono ou stéréo selon ses fichiers. Son vumètre montre le **niveau de lecture** (une barre
+  par canal). Montage, fondus, M / S et export comme les autres pistes.
+
 ### Navigation
 
 - La timeline suit la tête de lecture ; après un défilement manuel, le suivi reprend au bout
@@ -213,7 +226,7 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
 | Glisser sur la règle | Faire défiler la timeline (sur la tête de lecture : la déplacer) | |
 | Double-clic | Renommer une piste / un repère | Renommer le pad |
 | Ctrl + molette | Zoom | Zoom de l'éditeur |
-| Maj + molette | Défiler dans le temps | |
+| Alt + molette | Défiler dans le temps | |
 | Ctrl + 1 / Ctrl + 2 | Changer d'onglet | Changer d'onglet |
 | Ctrl + S / Ctrl + E | Enregistrer / Exporter | |
 

@@ -39,6 +39,9 @@ pub struct SinkSpec<'a> {
     pub mp3_bitrate: Mp3Bitrate,
     pub ogg_quality: OggQuality,
     pub meta: &'a FileMeta,
+    /// Graine du dither : différente pour chaque fichier d'un même export (sinon le bruit
+    /// des pistes séparées s'additionnerait de façon cohérente au remixage).
+    pub seed: u64,
 }
 
 /// Destination des échantillons d'un fichier exporté.
@@ -78,11 +81,12 @@ struct Quantizer {
 }
 
 impl Quantizer {
-    fn new(bits: u16, dither: bool) -> Self {
+    fn new(bits: u16, dither: bool, seed: u64) -> Self {
         Self {
             bits,
             dither: dither && bits == 16,
-            rng: 0x9E37_79B9_7F4A_7C15,
+            // Jamais nulle (xorshift).
+            rng: 0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1,
         }
     }
 
@@ -336,7 +340,7 @@ impl WavSink {
             sample_rate: spec.sample_rate,
             pcm,
             bext,
-            q: Quantizer::new(pcm.bits(), spec.dither),
+            q: Quantizer::new(pcm.bits(), spec.dither, spec.seed),
             data_bytes: 0,
             buf: Vec::new(),
         })
@@ -366,8 +370,7 @@ impl Sink for WavSink {
             }
             Pcm::Float => {
                 for &x in samples {
-                    self.buf
-                        .extend_from_slice(&x.clamp(-1.0, 1.0).to_le_bytes());
+                    self.buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
         }
@@ -390,6 +393,7 @@ impl Sink for WavSink {
         self.w.seek(SeekFrom::Start(0))?;
         self.w.write_all(&h)?;
         self.w.flush()?;
+        self.w.get_ref().sync_all()?;
         Ok(())
     }
 }
@@ -461,7 +465,7 @@ impl AiffSink {
             channels,
             sample_rate: spec.sample_rate,
             bits,
-            q: Quantizer::new(bits, spec.dither),
+            q: Quantizer::new(bits, spec.dither, spec.seed),
             data_bytes: 0,
             buf: Vec::new(),
         })
@@ -497,6 +501,7 @@ impl Sink for AiffSink {
         self.w.seek(SeekFrom::Start(0))?;
         self.w.write_all(&h)?;
         self.w.flush()?;
+        self.w.get_ref().sync_all()?;
         Ok(())
     }
 }
@@ -583,7 +588,7 @@ impl FlacSink {
                 .map_err(|e| anyhow!("FLAC : {e}"))?,
             ctx: flacenc::source::Context::new(bits, spec.channels),
             pending: Vec::with_capacity(FLAC_BLOCK * 2 * spec.channels),
-            q: Quantizer::new(bits as u16, spec.dither),
+            q: Quantizer::new(bits as u16, spec.dither, spec.seed),
             channels: spec.channels,
             frame_no: 0,
         })
@@ -641,6 +646,7 @@ impl Sink for FlacSink {
         self.w.seek(SeekFrom::Start(0))?;
         self.w.write_all(&h)?;
         self.w.flush()?;
+        self.w.get_ref().sync_all()?;
         Ok(())
     }
 }
@@ -755,6 +761,7 @@ impl Sink for Mp3Sink {
             self.w.write_all(&tag)?;
         }
         self.w.flush()?;
+        self.w.get_ref().sync_all()?;
         Ok(())
     }
 }
@@ -827,6 +834,7 @@ impl Sink for OggSink {
             .finish()
             .map_err(|e| anyhow!("Encodage Vorbis : {e}"))?;
         w.flush()?;
+        w.get_ref().sync_all()?;
         Ok(())
     }
 }

@@ -323,6 +323,10 @@ pub struct WavSource {
     /// Position courante (en trames).
     pos: u64,
     frames: u64,
+    /// Échantillons illisibles remplacés par du silence (fichier abîmé).
+    read_errors: u64,
+    /// Repositionnement impossible : la suite est lue comme du silence.
+    seek_failed: bool,
 }
 
 impl WavSource {
@@ -338,7 +342,14 @@ impl WavSource {
             reader,
             pos: 0,
             frames,
+            read_errors: 0,
+            seek_failed: false,
         })
+    }
+
+    /// Longueur du fichier (trames).
+    pub fn frames(&self) -> u64 {
+        self.frames
     }
 
     pub fn seek(&mut self, frame: u64) {
@@ -349,6 +360,7 @@ impl WavSource {
             } else {
                 // Échec de lecture : silence plutôt qu'un mauvais passage audio.
                 self.pos = self.frames;
+                self.seek_failed = true;
             }
         }
     }
@@ -366,46 +378,65 @@ impl WavSource {
         let fc = self.channels;
         let want = (out.len() / out_ch).min((self.frames - self.pos) as usize);
         let total = want * fc;
-        let float = self.float;
         let scale = self.scale;
-        // Échantillons du fichier, convertis en f32 (une erreur de lecture = silence).
-        let samples: Box<dyn Iterator<Item = f32> + '_> = if float {
-            Box::new(
-                self.reader
-                    .samples::<f32>()
-                    .take(total)
-                    .map(|s| s.unwrap_or(0.0)),
+        // Échantillons du fichier, convertis en f32 (une erreur de lecture = silence,
+        // comptée pour être signalée).
+        let errs = std::cell::Cell::new(0u64);
+        let n = if self.float {
+            fill(
+                self.reader.samples::<f32>().take(total).map(|s| {
+                    s.unwrap_or_else(|_| {
+                        errs.set(errs.get() + 1);
+                        0.0
+                    })
+                }),
+                fc,
+                out_ch,
+                out,
             )
         } else {
-            Box::new(
-                self.reader
-                    .samples::<i32>()
-                    .take(total)
-                    .map(move |s| s.unwrap_or(0) as f32 * scale),
+            fill(
+                self.reader.samples::<i32>().take(total).map(|s| {
+                    s.map(|v| v as f32 * scale).unwrap_or_else(|_| {
+                        errs.set(errs.get() + 1);
+                        0.0
+                    })
+                }),
+                fc,
+                out_ch,
+                out,
             )
         };
-        let mut n = 0;
-        let mut l = 0f32;
-        for (i, s) in samples.enumerate() {
-            let k = i % fc;
-            match (fc, out_ch) {
-                (1, 1) => out[n] = s,
-                (1, _) => {
-                    out[n * 2] = s;
-                    out[n * 2 + 1] = s;
-                }
-                (_, 1) if k == 0 => l = s,
-                (_, 1) if k == 1 => out[n] = 0.5 * (l + s),
-                (_, _) if k < 2 => out[n * 2 + k] = s,
-                _ => {}
-            }
-            if k == fc - 1 {
-                n += 1;
-            }
-        }
+        self.read_errors += errs.get();
         self.pos += n as u64;
         n
     }
+}
+
+/// Répartit les échantillons d'un fichier de `fc` canaux sur `out_ch` canaux (1 ou 2) :
+/// mono → stéréo par duplication, stéréo → mono par moyenne des deux premiers canaux.
+/// Retourne le nombre de trames écrites.
+fn fill(samples: impl Iterator<Item = f32>, fc: usize, out_ch: usize, out: &mut [f32]) -> usize {
+    let mut n = 0;
+    let mut l = 0f32;
+    for (i, s) in samples.enumerate() {
+        let k = i % fc;
+        match (fc, out_ch) {
+            (1, 1) => out[n] = s,
+            (1, _) => {
+                out[n * 2] = s;
+                out[n * 2 + 1] = s;
+            }
+            (_, 1) if k == 0 => l = s,
+            (_, 1) if k == 1 => out[n] = 0.5 * (l + s),
+            (_, _) if k < 2 => out[n * 2 + k] = s,
+            _ => {}
+        }
+        if k == fc - 1 {
+            n += 1;
+        }
+    }
+    n
 }
 
 struct ClipSource {
@@ -413,6 +444,8 @@ struct ClipSource {
     path: PathBuf,
     src: Option<WavSource>,
     failed: bool,
+    /// Problème déjà signalé (une seule fois par prise).
+    reported: bool,
 }
 
 /// Rend le signal d'une piste (mono, ou stéréo entrelacé) à n'importe quelle position
@@ -421,6 +454,7 @@ pub struct TrackRenderer {
     clips: Vec<ClipSource>,
     tmp: Vec<f32>,
     channels: usize,
+    errors: Vec<String>,
 }
 
 impl TrackRenderer {
@@ -434,13 +468,22 @@ impl TrackRenderer {
                 path: project.clip_path(c),
                 src: None,
                 failed: false,
+                reported: false,
             })
             .collect();
         Self {
             clips,
             tmp: Vec::new(),
             channels: track.channels(),
+            errors: Vec::new(),
         }
+    }
+
+    /// Prises qui n'ont pas pu être lues correctement depuis le dernier appel (fichier
+    /// absent, illisible ou abîmé) : remplacées par du silence à l'écoute, signalées à
+    /// l'export.
+    pub fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.errors)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -469,7 +512,11 @@ impl TrackRenderer {
             } else if cs.src.is_none() && !cs.failed && c.start >= end {
                 match WavSource::open(&cs.path) {
                     Ok(s) => cs.src = Some(s),
-                    Err(_) => cs.failed = true,
+                    Err(e) => {
+                        cs.failed = true;
+                        cs.reported = true;
+                        self.errors.push(format!("{} : {e}", c.file));
+                    }
                 }
             }
         }
@@ -481,8 +528,12 @@ impl TrackRenderer {
             if cs.src.is_none() {
                 match WavSource::open(&cs.path) {
                     Ok(s) => cs.src = Some(s),
-                    Err(_) => {
+                    Err(e) => {
                         cs.failed = true;
+                        if !cs.reported {
+                            cs.reported = true;
+                            self.errors.push(format!("{} : {e}", c.file));
+                        }
                         continue;
                     }
                 }
@@ -496,6 +547,11 @@ impl TrackRenderer {
             self.tmp.resize(n * ch, 0.0);
             let got = src.read_frames(&mut self.tmp[..n * ch], ch);
             self.tmp[got * ch..n * ch].fill(0.0);
+            if !cs.reported && (src.seek_failed || src.read_errors > 0 || got < n) {
+                cs.reported = true;
+                self.errors
+                    .push(format!("{} : fichier abîmé ou tronqué", c.file));
+            }
             let dst = &mut out[dst_off * ch..(dst_off + n) * ch];
             if c.fade_in == 0 && c.fade_out == 0 {
                 dst.copy_from_slice(&self.tmp[..n * ch]);
