@@ -31,13 +31,69 @@ pub struct Journal {
     pub latency: u64,
     pub sample_rate: u32,
     pub takes: Vec<JournalTake>,
+    /// Prises précédentes pas encore terminées (leur disque ne répondait plus quand
+    /// celle-ci a commencé) : récupérées elles aussi, chacune avec sa position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<Journal>,
+}
+
+impl Journal {
+    /// Ce journal et ceux qu'il contient (`extra`), à plat (profondeur et nombre bornés).
+    fn groups(&self) -> Vec<&Journal> {
+        let mut out = vec![self];
+        let mut i = 0;
+        while i < out.len() && out.len() < 64 {
+            let g = out[i];
+            out.extend(g.extra.iter().take(64 - out.len()));
+            i += 1;
+        }
+        out
+    }
+
+    /// Mêmes fichiers de prise.
+    fn same_takes(&self, other: &Journal) -> bool {
+        self.takes.len() == other.takes.len()
+            && self
+                .takes
+                .iter()
+                .zip(&other.takes)
+                .all(|(a, b)| a.file == b.file)
+    }
 }
 
 pub fn journal_path(dir: &Path) -> PathBuf {
     dir.join(JOURNAL)
 }
 
+/// Garde `j` dans le journal de `dir` sans rien perdre de ce qui y est déjà : ajouté aux
+/// prises en attente du journal existant (sauf s'il y figure déjà), ou écrit tel quel.
+pub fn keep_journal(dir: &Path, j: &Journal) -> Result<()> {
+    let existing = std::fs::read_to_string(journal_path(dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Journal>(&t).ok());
+    match existing {
+        Some(mut cur) => {
+            if cur.groups().iter().any(|g| g.same_takes(j)) {
+                return Ok(());
+            }
+            cur.extra.push(j.clone());
+            write_journal(dir, &cur)
+        }
+        None => write_journal(dir, j),
+    }
+}
+
+/// Écrit le journal de la prise en cours (forcé sur le disque) et note la session parmi
+/// celles dont un enregistrement n'est pas terminé (voir `interrupted_session`).
 pub fn write_journal(dir: &Path, j: &Journal) -> Result<()> {
+    write_journal_untracked(dir, j)?;
+    track_pending(dir, true);
+    Ok(())
+}
+
+/// Journal du double de la session (copie de sécurité) : jamais proposé à la
+/// récupération automatique au lancement (c'est la session principale qui l'est).
+pub fn write_journal_untracked(dir: &Path, j: &Journal) -> Result<()> {
     let p = journal_path(dir);
     let tmp = p.with_extension("tmp");
     crate::project::write_synced(&tmp, serde_json::to_string_pretty(j)?.as_bytes())?;
@@ -47,6 +103,7 @@ pub fn write_journal(dir: &Path, j: &Journal) -> Result<()> {
 
 pub fn remove_journal(dir: &Path) {
     let _ = std::fs::remove_file(journal_path(dir));
+    track_pending(dir, false);
 }
 
 /// Recale les tailles RIFF / data d'un WAV interrompu sur la taille réelle du fichier.
@@ -100,41 +157,96 @@ pub fn repair_wav(path: &Path) -> Result<u64> {
     }
 }
 
+/// Résultat d'une récupération : prises réintégrées, et sauvegarde de la session (en cas
+/// d'échec, les prises sont dans la session en mémoire et le journal est conservé).
+#[derive(Debug)]
+pub struct Recovered {
+    pub takes: usize,
+    pub saved: Result<()>,
+}
+
+/// Fichiers d'une prise présents dans `names` (noms du dossier Audio) : le fichier de base
+/// et ses suites `_pN`, dans l'ordre. Les numéros manquants (fichier vide supprimé) ne
+/// coupent pas la liste.
+fn take_segments(base: &str, names: &[String]) -> Vec<String> {
+    let stem = base.trim_end_matches(".wav").to_lowercase();
+    let base_low = base.to_lowercase();
+    let mut found: Vec<(usize, &String)> = names
+        .iter()
+        .filter_map(|n| {
+            let low = n.to_lowercase();
+            if low == base_low {
+                return Some((1, n));
+            }
+            let k = low
+                .strip_prefix(&stem)?
+                .strip_prefix("_p")?
+                .strip_suffix(".wav")?;
+            // Chiffres seulement (« _p2 », pas « _p2b » ni « _p+2 »).
+            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let k: usize = k.parse().ok()?;
+            (k >= 2).then_some((k, n))
+        })
+        .collect();
+    found.sort();
+    found.dedup_by_key(|(k, _)| *k);
+    found.into_iter().map(|(_, n)| n.clone()).collect()
+}
+
 /// Applique un journal à une session : répare les fichiers et ajoute les prises
-/// manquantes. Retourne le nombre de prises récupérées.
-pub fn recover(project: &mut Project) -> Result<usize> {
+/// manquantes. `Err` seulement si le journal est illisible (fichiers laissés dans Audio/).
+pub fn recover(project: &mut Project) -> Result<Recovered> {
     let jp = journal_path(&project.dir);
     let Ok(text) = std::fs::read_to_string(&jp) else {
-        return Ok(0);
+        return Ok(Recovered {
+            takes: 0,
+            saved: Ok(()),
+        });
     };
-    let j: Journal = serde_json::from_str(&text).context("Journal d'enregistrement illisible")?;
+    let journal: Journal =
+        serde_json::from_str(&text).context("Journal d'enregistrement illisible")?;
+    let names: Vec<String> = std::fs::read_dir(project.audio_dir())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut n = 0;
-    for take in &j.takes {
+    // Prise interrompue, et les précédentes restées en attente (chacune à sa position).
+    let all = journal
+        .groups()
+        .into_iter()
+        .flat_map(|g| g.takes.iter().map(move |t| (g, t)));
+    for (j, take) in all {
         // Journal falsifié ou abîmé : jamais de chemin hors du dossier Audio/.
         let base = crate::project::safe_file_name(&take.file);
         if base.is_empty() {
             continue;
         }
         // Une prise longue peut s'étendre sur plusieurs fichiers (nom, nom_p2, nom_p3…).
-        // Fichiers supposés bout à bout (le journal ne connaît pas les trous laissés par une
-        // éventuelle erreur d'écriture), décalés de la latence comme une fin de prise normale.
+        // Fichiers supposés bout à bout, sauf ceux repris après une erreur d'écriture (leur
+        // position est notée à côté), décalés de la latence comme une fin de prise normale.
         let origin = j
             .start
             .saturating_add(j.play_offset)
             .min(crate::project::MAX_POS);
         let mut seg_start = 0u64;
-        for k in 1.. {
-            let file = crate::recorder::segment_name(&base, k);
+        for file in take_segments(&base, &names) {
             let path = project.audio_dir().join(&file);
-            if !path.exists() {
-                break;
-            }
-            // Réparation de l'en-tête ; sur un support en lecture seule, on lit la durée telle quelle.
+            // Réparation de l'en-tête ; sur un support en lecture seule, on lit la durée
+            // telle quelle. Fichier illisible (vide, abîmé) : on passe au suivant, sans
+            // abandonner ceux d'après.
             let frames = match repair_wav(&path) {
                 Ok(f) => f,
                 Err(_) => match hound::WavReader::open(&path) {
                     Ok(r) => r.duration() as u64,
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("Récupération : {} ignoré ({e})", path.display());
+                        continue;
+                    }
                 },
             };
             // Fichier repris après une erreur d'écriture : sa vraie position est notée.
@@ -168,11 +280,17 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                 .iter()
                 .any(|t| t.clips.iter().any(|c| c.file == file));
             if already {
-                // Prise déjà dans la session : on recale seulement sa longueur sur le fichier réel.
+                // Prise déjà dans la session : on recale seulement sa longueur sur le fichier
+                // réel (prolongée si elle allait jusqu'au bout du fichier, réintégré plus tôt
+                // alors que son écriture n'était pas finie).
                 for t in &mut project.tracks {
                     for c in t.clips.iter_mut().filter(|c| c.file == file) {
+                        let to_end = c.offset + c.len >= c.src_len;
                         c.src_len = frames;
-                        if c.offset + c.len > frames {
+                        if to_end && frames > c.offset {
+                            c.len = frames - c.offset;
+                            c.clamp_fades();
+                        } else if c.offset + c.len > frames {
                             c.len = frames.saturating_sub(c.offset).max(1);
                             c.clamp_fades();
                         }
@@ -206,17 +324,27 @@ pub fn recover(project: &mut Project) -> Result<usize> {
         }
     }
     project.dirty = true;
-    project.save()?;
-    remove_journal(&project.dir);
-    Ok(n)
+    let saved = project.save();
+    if saved.is_ok() {
+        remove_journal(&project.dir);
+    }
+    Ok(Recovered { takes: n, saved })
 }
 
 /// Mémorise la dernière session utilisée (pour la rouvrir après un crash).
 pub fn remember_session(project: &Project) {
+    remember_session_path(&project.file_path());
+}
+
+/// Comme `remember_session`, depuis n'importe quel thread (début de prise : jamais
+/// d'écriture forcée sur le disque dans le thread de l'interface avant la capture).
+pub fn remember_session_path(path: &Path) {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _g = LOCK.lock();
     if let Some(p) = state_path() {
-        let _ = crate::project::write_atomic(&p, project.file_path().to_string_lossy().as_bytes());
+        let _ = crate::project::write_atomic(&p, path.to_string_lossy().as_bytes());
     }
-    crate::sessions::remember(&project.file_path());
+    crate::sessions::remember(path);
 }
 
 /// Dernière session utilisée, si elle existe encore.
@@ -226,16 +354,95 @@ pub fn last_session() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// Session à restaurer : la dernière utilisée, si un enregistrement y a été interrompu.
+/// Session à restaurer : la dernière utilisée si un enregistrement y a été interrompu,
+/// sinon toute autre session dont un enregistrement n'a pas été terminé (prise restée en
+/// suspens, puis une autre session ouverte avant de quitter).
 pub fn interrupted_session() -> Option<PathBuf> {
-    let p = std::fs::read_to_string(state_path()?).ok()?;
-    let path = PathBuf::from(p.trim());
-    let dir = path.parent()?;
-    (path.exists() && journal_path(dir).exists()).then_some(path)
+    let last = std::fs::read_to_string(state_path()?)
+        .ok()
+        .map(|p| PathBuf::from(p.trim()));
+    if let Some(path) = &last
+        && let Some(dir) = path.parent()
+        && path.exists()
+        && journal_path(dir).exists()
+    {
+        return Some(path.clone());
+    }
+    let list = std::fs::read_to_string(pending_path()?).unwrap_or_default();
+    pending_dirs(&list)
+        .into_iter()
+        .filter(|d| journal_path(d).exists())
+        .find_map(|d| session_file_in(&d))
+}
+
+/// Fichier de session d'un dossier de session.
+fn session_file_in(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case(crate::project::PROJECT_EXT))
+        })
 }
 
 fn state_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("TracksPlus").join("last_session"))
+}
+
+/// Liste des sessions dont un enregistrement n'est pas terminé (une par ligne). Jamais
+/// dans les tests (le dossier de réglages de l'utilisateur n'est pas touché).
+fn pending_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    dirs::config_dir().map(|d| d.join("TracksPlus").join("pending_recordings"))
+}
+
+/// Dossiers de la liste (lignes non vides), au plus 64.
+fn pending_dirs(list: &str) -> Vec<PathBuf> {
+    list.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(64)
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Nouvelle liste avec `dir` ajouté (`add`, en tête) ou retiré ; `None` si rien ne change.
+fn pending_with(list: &str, dir: &Path, add: bool) -> Option<String> {
+    let mut dirs = pending_dirs(list);
+    let had = dirs.iter().any(|d| d == dir);
+    if had == add {
+        return None;
+    }
+    dirs.retain(|d| d != dir);
+    if add {
+        dirs.insert(0, dir.to_path_buf());
+        dirs.truncate(64);
+    }
+    let mut out = String::new();
+    for d in dirs {
+        out.push_str(&d.to_string_lossy());
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Tient à jour la liste des sessions à récupérer (erreurs ignorées : ce n'est qu'une aide
+/// au lancement, le journal lui-même reste dans le dossier de la session).
+fn track_pending(dir: &Path, add: bool) {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let Some(p) = pending_path() else {
+        return;
+    };
+    let _g = LOCK.lock();
+    let list = std::fs::read_to_string(&p).unwrap_or_default();
+    if let Some(new) = pending_with(&list, dir, add) {
+        let _ = crate::project::write_atomic(&p, new.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +496,7 @@ mod tests {
                 play_offset: 240,
                 latency: 100,
                 sample_rate: 48000,
+                extra: Vec::new(),
                 takes: vec![
                     JournalTake {
                         track_id: t,
@@ -303,13 +511,13 @@ mod tests {
         )
         .unwrap();
         let mut q = Project::load(&p.file_path()).unwrap();
-        assert_eq!(recover(&mut q).unwrap(), 1);
+        assert_eq!(recover(&mut q).unwrap().takes, 1);
         let c = &q.tracks[0].clips[0];
         // Recalée comme une fin de prise normale : décalage de lecture et latence.
         assert_eq!((c.start, c.offset, c.len), (960 + 240, 100, 4700));
         assert!(!journal_path(&dir).exists());
         // Rejouer la récupération ne duplique rien.
-        assert_eq!(recover(&mut q).unwrap(), 0);
+        assert_eq!(recover(&mut q).unwrap().takes, 0);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -339,6 +547,7 @@ mod tests {
                 play_offset: 0,
                 latency: 100,
                 sample_rate: 48000,
+                extra: Vec::new(),
                 takes: vec![JournalTake {
                     track_id: t,
                     file: "Voix_001.wav".into(),
@@ -347,7 +556,7 @@ mod tests {
         )
         .unwrap();
         let mut q = Project::load(&p.file_path()).unwrap();
-        assert_eq!(recover(&mut q).unwrap(), 2);
+        assert_eq!(recover(&mut q).unwrap().takes, 2);
         let c: Vec<_> = q.tracks[0]
             .clips
             .iter()
@@ -360,5 +569,160 @@ mod tests {
                 .exists()
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Suites d'une prise retrouvées dans le dossier, dans l'ordre, trous de numérotation
+    /// compris, sans confondre une autre prise au nom voisin.
+    #[test]
+    fn take_segments_lists_all_parts_in_order() {
+        let names: Vec<String> = [
+            "Voix_001_p10.wav",
+            "Voix_001.wav",
+            "voix_001_p3.wav",
+            "Voix_001_p3.wav.start",
+            "Voix_0012.wav",
+            "Voix_001_p2b.wav",
+            "Voix_001_p1.wav",
+            "Basse_001_p2.wav",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            take_segments("Voix_001.wav", &names),
+            ["Voix_001.wav", "voix_001_p3.wav", "Voix_001_p10.wav"]
+        );
+        assert!(take_segments("Absent.wav", &names).is_empty());
+    }
+
+    /// Crash après un segment vide (disque plein) puis une reprise : la reprise est
+    /// réintégrée quand même, à sa place ; une sauvegarde impossible n'efface pas le compte.
+    #[test]
+    fn recover_skips_empty_segment_and_keeps_later_ones() {
+        let dir = std::env::temp_dir().join(format!("tp-recover-hole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("H".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let t = p.add_track(Some("Voix".into()), Some(0));
+        p.save().unwrap();
+        write_wav(&p.audio_dir().join("Voix_001.wav"), 4800);
+        // _p2 : créé, rien d'écrit (0 octet) ; _p3 manquant (supprimé) ; _p4 repris.
+        std::fs::write(p.audio_dir().join("Voix_001_p2.wav"), b"").unwrap();
+        write_wav(&p.audio_dir().join("Voix_001_p4.wav"), 1000);
+        std::fs::write(
+            p.audio_dir()
+                .join(crate::recorder::start_sidecar("Voix_001_p4.wav")),
+            "9000",
+        )
+        .unwrap();
+        let j = Journal {
+            start: 0,
+            play_offset: 0,
+            latency: 0,
+            sample_rate: 48000,
+            extra: Vec::new(),
+            takes: vec![JournalTake {
+                track_id: t,
+                file: "Voix_001.wav".into(),
+            }],
+        };
+        write_journal(&dir, &j).unwrap();
+        let mut q = Project::load(&p.file_path()).unwrap();
+        let r = recover(&mut q).unwrap();
+        assert_eq!(r.takes, 2);
+        assert!(r.saved.is_ok());
+        let c: Vec<_> = q.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.file.as_str(), c.start, c.len))
+            .collect();
+        assert_eq!(
+            c,
+            [("Voix_001.wav", 0, 4800), ("Voix_001_p4.wav", 9000, 1000)]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Prise précédente restée en attente (disque bloqué) quand une nouvelle a commencé :
+    /// un seul journal les porte toutes les deux, chacune récupérée à sa position ; une
+    /// prise réintégrée trop tôt (fichier pas fini) est prolongée à sa vraie longueur.
+    #[test]
+    fn recover_journal_with_pending_previous_take() {
+        let dir = std::env::temp_dir().join(format!("tp-recover-extra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("X".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let t = p.add_track(Some("Voix".into()), Some(0));
+        // Prise précédente réintégrée pendant le blocage avec 1000 trames seulement.
+        p.track_mut(t).unwrap().clips.push(Clip {
+            id: 50,
+            file: "Voix_001.wav".into(),
+            start: 100,
+            offset: 0,
+            len: 1000,
+            src_len: 1000,
+            fade_in: 0,
+            fade_out: 0,
+        });
+        p.next_id = 60;
+        p.save().unwrap();
+        write_wav(&p.audio_dir().join("Voix_001.wav"), 3000);
+        write_wav(&p.audio_dir().join("Voix_002.wav"), 500);
+        let take = |file: &str| JournalTake {
+            track_id: t,
+            file: file.into(),
+        };
+        let old = Journal {
+            start: 100,
+            play_offset: 0,
+            latency: 0,
+            sample_rate: 48000,
+            takes: vec![take("Voix_001.wav")],
+            extra: Vec::new(),
+        };
+        let new = Journal {
+            start: 8000,
+            play_offset: 0,
+            latency: 0,
+            sample_rate: 48000,
+            takes: vec![take("Voix_002.wav")],
+            extra: Vec::new(),
+        };
+        write_journal(&dir, &new).unwrap();
+        keep_journal(&dir, &old).unwrap();
+        // Déjà présent : rien n'est dupliqué.
+        keep_journal(&dir, &old).unwrap();
+        let text = std::fs::read_to_string(journal_path(&dir)).unwrap();
+        let j: Journal = serde_json::from_str(&text).unwrap();
+        assert_eq!(j.extra.len(), 1);
+        let mut q = Project::load(&p.file_path()).unwrap();
+        let r = recover(&mut q).unwrap();
+        assert_eq!(r.takes, 1, "seule la nouvelle prise est ajoutée");
+        let mut c: Vec<_> = q.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.file.as_str(), c.start, c.len))
+            .collect();
+        c.sort();
+        assert_eq!(
+            c,
+            [("Voix_001.wav", 100, 3000), ("Voix_002.wav", 8000, 500)]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Liste des sessions à récupérer : ajout en tête sans doublon, retrait.
+    #[test]
+    fn pending_list_add_and_remove() {
+        let a = Path::new("C:/Sessions/A");
+        let b = Path::new("D:/B");
+        let l1 = pending_with("", a, true).unwrap();
+        assert_eq!(pending_dirs(&l1), [a]);
+        assert!(pending_with(&l1, a, true).is_none(), "déjà présente");
+        let l2 = pending_with(&l1, b, true).unwrap();
+        assert_eq!(pending_dirs(&l2), [b, a]);
+        let l3 = pending_with(&l2, a, false).unwrap();
+        assert_eq!(pending_dirs(&l3), [b]);
+        assert!(pending_with(&l3, a, false).is_none());
     }
 }

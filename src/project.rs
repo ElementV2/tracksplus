@@ -632,14 +632,29 @@ impl Project {
     /// `_p2` d'une prise longue) ni avec `taken`, sans tenir compte de la casse
     /// (Windows et macOS ne distinguent pas « Voix » et « voix »).
     pub fn new_take_file_avoiding(&self, track_name: &str, taken: &HashSet<String>) -> String {
-        let base = sanitize(track_name);
-        let existing: HashSet<String> = std::fs::read_dir(self.audio_dir())
+        self.new_take_file_in(track_name, &self.audio_file_names(), taken)
+    }
+
+    /// Noms des fichiers du dossier Audio, en minuscules (une seule lecture du dossier,
+    /// partagée par toutes les pistes d'une prise : 64 pistes = 1 lecture, pas 64).
+    pub fn audio_file_names(&self) -> HashSet<String> {
+        std::fs::read_dir(self.audio_dir())
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_lowercase())
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Comme `new_take_file_avoiding`, avec les noms déjà lus (`audio_file_names`).
+    pub fn new_take_file_in(
+        &self,
+        track_name: &str,
+        existing: &HashSet<String>,
+        taken: &HashSet<String>,
+    ) -> String {
+        let base = sanitize(track_name);
         for n in 1.. {
             let f = format!("{base}_{n:03}.wav");
             let low = f.to_lowercase();

@@ -151,6 +151,11 @@ pub fn compute_peaks(path: &Path, dst: &Peaks) {
     let mut local = Vec::new();
     let mut all = Vec::new();
     loop {
+        // Enregistrement en cours : le calcul cède le disque aux prises (lecture au ralenti,
+        // ≈ 7 fois le temps réel à 48 kHz au lieu de la pleine vitesse du disque).
+        if RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         let n = src.read_frames(&mut buf, ch);
         if n == 0 {
             break;
@@ -179,32 +184,123 @@ pub fn compute_peaks(path: &Path, dst: &Peaks) {
     dst.write().shrink();
 }
 
-/// Demande le calcul de la forme d'onde de `path` dans `dst`, par un petit groupe de
-/// threads partagé (deux fichiers à la fois au plus : le disque n'est pas saturé).
-pub fn request_peaks(path: PathBuf, dst: Peaks) {
-    static POOL: OnceLock<crossbeam_channel::Sender<(PathBuf, Peaks)>> = OnceLock::new();
-    let tx = POOL.get_or_init(|| {
-        let (tx, rx) = crossbeam_channel::unbounded::<(PathBuf, Peaks)>();
+/// Enregistrement en cours (ou en finalisation) : les calculs de forme d'onde depuis le
+/// disque ralentissent pour ne pas disputer le disque aux prises.
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_recording(on: bool) {
+    RECORDING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Travaux de forme d'onde faits hors du thread de l'interface.
+enum PeakTask {
+    /// Calcul depuis le fichier (ou son cache).
+    Compute(PathBuf, Peaks),
+    /// Forme d'onde complète d'un fichier fermé : mémoire rendue, puis mise en cache.
+    Store(PathBuf, Peaks),
+    /// Fichier d'une prise longue : sa part de la forme d'onde en direct (points `a..b` du
+    /// niveau fin), sans relire le fichier, puis mise en cache.
+    Slice {
+        src: Peaks,
+        a: usize,
+        b: usize,
+        path: PathBuf,
+        dst: Peaks,
+    },
+}
+
+/// Petit groupe de threads partagé (deux fichiers à la fois au plus : le disque n'est pas
+/// saturé), en priorité basse, entrées-sorties comprises : jamais devant les prises.
+fn peak_pool() -> &'static crossbeam_channel::Sender<PeakTask> {
+    static POOL: OnceLock<crossbeam_channel::Sender<PeakTask>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<PeakTask>();
         for i in 0..2 {
             let rx = rx.clone();
             let _ = std::thread::Builder::new()
                 .name(format!("tracksplus-peaks-{i}"))
                 .spawn(move || {
-                    while let Ok((path, dst)) = rx.recv() {
-                        // Session refermée entre-temps : plus personne n'attend ce calcul.
-                        if Arc::strong_count(&dst) == 1 {
-                            continue;
-                        }
+                    lower_thread_priority();
+                    while let Ok(task) = rx.recv() {
                         // Un fichier piégé ne doit pas arrêter le calcul des suivants.
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            compute_peaks(&path, &dst)
+                            run_task(task)
                         }));
                     }
                 });
         }
         tx
+    })
+}
+
+fn run_task(task: PeakTask) {
+    match task {
+        PeakTask::Compute(path, dst) => {
+            // Session refermée entre-temps : plus personne n'attend ce calcul.
+            if Arc::strong_count(&dst) > 1 {
+                compute_peaks(&path, &dst);
+            }
+        }
+        PeakTask::Store(path, peaks) => {
+            peaks.write().shrink();
+            store_peaks(&path, &peaks.read());
+        }
+        PeakTask::Slice {
+            src,
+            a,
+            b,
+            path,
+            dst,
+        } => {
+            let part: Vec<Peak> = {
+                let s = src.read();
+                let b = b.min(s.l0.len());
+                s.l0[a.min(b)..b].to_vec()
+            };
+            drop(src);
+            {
+                let mut d = dst.write();
+                d.extend(&part);
+                d.shrink();
+            }
+            store_peaks(&path, &dst.read());
+        }
+    }
+}
+
+/// Threads de forme d'onde : priorité « arrière-plan » (Windows : processeur et disque).
+fn lower_thread_priority() {
+    #[cfg(windows)]
+    // SAFETY : appel sans pointeur sur le thread courant.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    }
+}
+
+/// Demande le calcul de la forme d'onde de `path` dans `dst` (thread de fond).
+pub fn request_peaks(path: PathBuf, dst: Peaks) {
+    let _ = peak_pool().send(PeakTask::Compute(path, dst));
+}
+
+/// Fichier de prise fermé dont la forme d'onde complète est déjà en mémoire : réduction
+/// de la mémoire réservée et mise en cache faites en arrière-plan (pas de gel au Stop).
+pub fn store_peaks_later(path: PathBuf, peaks: Peaks) {
+    let _ = peak_pool().send(PeakTask::Store(path, peaks));
+}
+
+/// Forme d'onde d'un fichier d'une prise longue, découpée dans celle calculée en direct
+/// pour toute la prise : points `a..b` du niveau fin (`dst` se remplit en arrière-plan).
+pub fn slice_peaks_later(src: Peaks, a: usize, b: usize, path: PathBuf, dst: Peaks) {
+    let _ = peak_pool().send(PeakTask::Slice {
+        src,
+        a,
+        b,
+        path,
+        dst,
     });
-    let _ = tx.send((path, dst));
 }
 
 /// Met en cache la forme d'onde d'un fichier terminé (par exemple calculée en direct
@@ -301,10 +397,7 @@ fn write_cache(path: &Path, st: Stamp, l0: &[Peak]) {
     b.extend_from_slice(&st.secs.to_le_bytes());
     b.extend_from_slice(&st.nanos.to_le_bytes());
     b.extend_from_slice(&(l0.len() as u64).to_le_bytes());
-    for p in l0 {
-        b.push(p[0] as u8);
-        b.push(p[1] as u8);
-    }
+    b.extend(l0.iter().flat_map(|p| [p[0] as u8, p[1] as u8]));
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = dst.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(format!(".{}-{seq}.tmp", std::process::id()));
@@ -598,6 +691,33 @@ impl TrackRenderer {
 mod tests {
     use super::*;
     use crate::project::{Clip, Project};
+
+    /// Fichier d'une prise longue : sa forme d'onde est découpée dans celle de la prise
+    /// entière (sans relecture), réduite, et mise en cache à côté du fichier.
+    #[test]
+    fn slice_task_cuts_live_peaks_and_caches_them() {
+        let dir = std::env::temp_dir().join(format!("tp-slice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t_p2.wav");
+        std::fs::write(&path, b"RIFF").unwrap();
+        let src: Peaks = Arc::new(RwLock::new(PeakData::default()));
+        let pts: Vec<Peak> = (0..100).map(|i| [-(i as i8), i as i8]).collect();
+        src.write().extend(&pts);
+        let dst: Peaks = Arc::new(RwLock::new(PeakData::default()));
+        run_task(PeakTask::Slice {
+            src: src.clone(),
+            a: 40,
+            b: 1000,
+            path: path.clone(),
+            dst: dst.clone(),
+        });
+        assert_eq!(dst.read().l0, pts[40..]);
+        assert_eq!(dst.read().l0.capacity(), 60);
+        let st = Stamp::of(&path).unwrap();
+        assert_eq!(load_cache(&path, st).unwrap(), pts[40..]);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn fades_and_crossfade() {

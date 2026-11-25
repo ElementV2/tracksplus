@@ -1160,6 +1160,9 @@ pub fn wave_mesh(
     let mid = rect.center().y;
     let half = rect.height() * 0.5;
     let n = rect.width().max(0.0) as usize;
+    // Un rectangle par colonne au plus : réservé d'un coup (pas de recopies à chaque image).
+    mesh.vertices.reserve(n * 4);
+    mesh.indices.reserve(n * 6);
     for i in 0..n {
         if let Some((mn, mx)) = col(i) {
             let x = rect.left() + i as f32;

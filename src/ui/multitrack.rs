@@ -38,6 +38,7 @@ const WAVE_CHUNK: i64 = 256;
 
 impl WaveCache {
     /// Min / max de la colonne `k` (en pixels depuis le début de la prise).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn column(
         &mut self,
@@ -49,7 +50,23 @@ impl WaveCache {
         spp: f64,
         k: i64,
     ) -> Option<(i8, i8)> {
-        let chunk = k.div_euclid(WAVE_CHUNK);
+        let cols = self.chunk(id, lvl, level, per, offset, spp, k.div_euclid(WAVE_CHUNK));
+        cols[k.rem_euclid(WAVE_CHUNK) as usize]
+    }
+
+    /// Min / max des colonnes du paquet `chunk` (paquets de `WAVE_CHUNK` pixels depuis le
+    /// début de la prise) : une seule recherche dans le cache pour tout le paquet.
+    #[allow(clippy::too_many_arguments)]
+    fn chunk(
+        &mut self,
+        id: usize,
+        lvl: &[crate::render::Peak],
+        level: u8,
+        per: f64,
+        offset: u64,
+        spp: f64,
+        chunk: i64,
+    ) -> &[Option<(i8, i8)>] {
         let key = (id, spp.to_bits(), offset, level, chunk);
         let fresh = self
             .map
@@ -113,7 +130,7 @@ impl WaveCache {
                 },
             );
         }
-        self.map[&key].cols[k.rem_euclid(WAVE_CHUNK) as usize]
+        &self.map[&key].cols
     }
 }
 
@@ -2780,9 +2797,21 @@ pub fn draw_clip(
             };
             let id = data.id as usize;
             let mesh = WAVES.with_borrow_mut(|cache| {
+                // Paquet courant recopié une fois (256 colonnes), au lieu de deux recherches
+                // dans le cache par colonne de pixel à chaque image.
+                let mut cur = i64::MIN;
+                let mut cols: Vec<Option<(i8, i8)>> = Vec::with_capacity(WAVE_CHUNK as usize);
                 w::wave_mesh(wave, wcol, |i| {
-                    cache
-                        .column(id, lvl, level, per, offset, spp, k0 + i as i64)
+                    let k = k0 + i as i64;
+                    let ch = k.div_euclid(WAVE_CHUNK);
+                    if ch != cur {
+                        cols.clear();
+                        cols.extend_from_slice(cache.chunk(id, lvl, level, per, offset, spp, ch));
+                        cur = ch;
+                    }
+                    cols.get(k.rem_euclid(WAVE_CHUNK) as usize)
+                        .copied()
+                        .flatten()
                         .map(|(mn, mx)| (wave_scale(mn), wave_scale(mx)))
                 })
             });
