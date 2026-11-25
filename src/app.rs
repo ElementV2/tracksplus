@@ -1658,6 +1658,28 @@ impl App {
         });
     }
 
+    /// Carte choisie mais qui ne joue pas encore (barre du haut) : « pas d'horloge » (Dante
+    /// sans horloge), « reconnexion… » (perdue ou absente), `None` si tout tourne.
+    fn card_waiting(&self) -> Option<&'static str> {
+        let st = &self.engine.status;
+        let dante = [&st.input, &st.output]
+            .into_iter()
+            .flatten()
+            .any(|n| n.to_lowercase().contains("dante"));
+        if self.clockless || self.not_started != 0 {
+            return Some(if dante { "pas d'horloge" } else { "en attente" });
+        }
+        let lost = self.engine.shared.device_lost.load(Ordering::Relaxed);
+        if lost != 0 || self.engine.missing() != 0 || self.reconnect_job.is_some() {
+            return Some("reconnexion…");
+        }
+        // Ouverte, mais pas encore de premier bloc du pilote.
+        if self.engine.open_mask() & !self.started != 0 {
+            return Some("démarrage…");
+        }
+        None
+    }
+
     /// Pilote ASIO ouvert par le moteur (`None` hors ASIO ou carte fermée).
     pub fn asio_in_use(&self) -> Option<String> {
         let st = &self.engine.status;
@@ -5450,6 +5472,9 @@ impl App {
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         rui.add_space(8.0);
+        // État de la carte : vert = le son tourne ; orange = carte choisie mais en attente
+        // (pas d'horloge Dante, reconnexion) ; rouge = aucune carte.
+        let waiting = self.card_waiting();
         let st = &self.engine.status;
         let ok = st.input.is_some() || st.output.is_some();
         let dev = st
@@ -5457,6 +5482,10 @@ impl App {
             .clone()
             .or(st.output.clone())
             .unwrap_or_else(|| "Aucune carte son".into());
+        let dev = match waiting {
+            Some(w) if ok => format!("{dev} · {w}"),
+            _ => dev,
+        };
         let full_label = if ok {
             format!(
                 "{} · {} · {} kHz · {}/{}",
@@ -5502,7 +5531,11 @@ impl App {
                 vec2(6.0, 6.0),
             ),
             1.0,
-            if ok { t::PLAY } else { t::REC },
+            match (ok, waiting) {
+                (false, _) => t::REC,
+                (true, Some(_)) => t::ORANGE,
+                (true, None) => t::PLAY,
+            },
         );
         pp.galley(
             egui::pos2(pr.left() + 19.0, pr.center().y - gal.size().y / 2.0),
