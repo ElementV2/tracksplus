@@ -50,6 +50,19 @@ impl Journal {
         out
     }
 
+    /// Prises de ce journal (le sien et ceux qu'il porte), hors celles de `live`, chacune
+    /// seule (sans les prises en attente qu'elle portait) : à reporter dans un autre journal.
+    pub fn pending_groups(&self, live: &[Journal]) -> Vec<Journal> {
+        self.groups()
+            .into_iter()
+            .filter(|g| !g.takes.is_empty() && !live.iter().any(|l| l.same_takes(g)))
+            .map(|g| Journal {
+                extra: Vec::new(),
+                ..g.clone()
+            })
+            .collect()
+    }
+
     /// Mêmes fichiers de prise.
     fn same_takes(&self, other: &Journal) -> bool {
         self.takes.len() == other.takes.len()
@@ -84,7 +97,7 @@ pub fn keep_journal(dir: &Path, j: &Journal) -> Result<()> {
 }
 
 /// Écrit le journal de la prise en cours (forcé sur le disque) et note la session parmi
-/// celles dont un enregistrement n'est pas terminé (voir `interrupted_session`).
+/// celles dont un enregistrement n'est pas terminé (voir `interrupted_sessions`).
 pub fn write_journal(dir: &Path, j: &Journal) -> Result<()> {
     write_journal_untracked(dir, j)?;
     track_pending(dir, true);
@@ -195,9 +208,18 @@ fn take_segments(base: &str, names: &[String]) -> Vec<String> {
     found.into_iter().map(|(_, n)| n.clone()).collect()
 }
 
-/// Applique un journal à une session : répare les fichiers et ajoute les prises
-/// manquantes. `Err` seulement si le journal est illisible (fichiers laissés dans Audio/).
+/// Applique le journal de la session : répare les fichiers et ajoute les prises
+/// manquantes, puis sauvegarde. `Err` seulement si le journal est illisible (fichiers
+/// laissés dans Audio/).
 pub fn recover(project: &mut Project) -> Result<Recovered> {
+    recover_with(project, &[])
+}
+
+/// Comme `recover`, sauf pour les prises de `live`, encore en cours d'écriture (prise
+/// restée bloquée sur un disque lent) : leurs fichiers ne sont pas touchés (jamais de
+/// réparation d'un fichier qu'un thread d'écriture complète encore), elles restent dans
+/// le journal et seront intégrées à la fin de leur écriture.
+pub fn recover_with(project: &mut Project, live: &[Journal]) -> Result<Recovered> {
     let jp = journal_path(&project.dir);
     let Ok(text) = std::fs::read_to_string(&jp) else {
         return Ok(Recovered {
@@ -207,6 +229,53 @@ pub fn recover(project: &mut Project) -> Result<Recovered> {
     };
     let journal: Journal =
         serde_json::from_str(&text).context("Journal d'enregistrement illisible")?;
+    let (n, sidecars) = apply_journal(project, &journal, live);
+    project.dirty = true;
+    let saved = project.save();
+    if saved.is_ok() {
+        // Positions notées supprimées seulement maintenant : si la sauvegarde échoue, le
+        // journal reste et une récupération ultérieure en a encore besoin.
+        for p in sidecars {
+            let _ = std::fs::remove_file(p);
+        }
+        if live.is_empty() {
+            remove_journal(&project.dir);
+        } else {
+            let rest = Journal {
+                start: 0,
+                play_offset: 0,
+                latency: 0,
+                sample_rate: journal.sample_rate,
+                takes: Vec::new(),
+                extra: live.to_vec(),
+            };
+            if let Err(e) = write_journal(&project.dir, &rest) {
+                eprintln!("Récupération : journal des prises en cours non écrit ({e:#})");
+            }
+        }
+    }
+    Ok(Recovered { takes: n, saved })
+}
+
+/// Réintègre les prises d'un journal dans `project`, en mémoire (sans sauvegarde) :
+/// fichiers réparés, prises manquantes ajoutées, prises déjà présentes recalées sur la
+/// longueur réelle de leur fichier. Les prises de `live` (encore en cours d'écriture) sont
+/// laissées de côté. Rend le nombre de prises ajoutées et les positions notées (`.start`)
+/// utilisées, à supprimer une fois la session sauvegardée.
+pub fn apply_journal(
+    project: &mut Project,
+    journal: &Journal,
+    live: &[Journal],
+) -> (usize, Vec<PathBuf>) {
+    let groups: Vec<&Journal> = journal
+        .groups()
+        .into_iter()
+        .filter(|g| !g.takes.is_empty() && !live.iter().any(|l| l.same_takes(g)))
+        .collect();
+    let mut sidecars = Vec::new();
+    if groups.is_empty() {
+        return (0, sidecars);
+    }
     let names: Vec<String> = std::fs::read_dir(project.audio_dir())
         .map(|rd| {
             rd.flatten()
@@ -216,8 +285,7 @@ pub fn recover(project: &mut Project) -> Result<Recovered> {
         .unwrap_or_default();
     let mut n = 0;
     // Prise interrompue, et les précédentes restées en attente (chacune à sa position).
-    let all = journal
-        .groups()
+    let all = groups
         .into_iter()
         .flat_map(|g| g.takes.iter().map(move |t| (g, t)));
     for (j, take) in all {
@@ -259,7 +327,7 @@ pub fn recover(project: &mut Project) -> Result<Recovered> {
             {
                 seg_start = s.min(crate::project::MAX_POS);
             }
-            let _ = std::fs::remove_file(&side);
+            sidecars.push(side);
             if frames == 0 {
                 continue;
             }
@@ -323,12 +391,7 @@ pub fn recover(project: &mut Project) -> Result<Recovered> {
             seg_start += frames;
         }
     }
-    project.dirty = true;
-    let saved = project.save();
-    if saved.is_ok() {
-        remove_journal(&project.dir);
-    }
-    Ok(Recovered { takes: n, saved })
+    (n, sidecars)
 }
 
 /// Mémorise la dernière session utilisée (pour la rouvrir après un crash).
@@ -354,25 +417,33 @@ pub fn last_session() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// Session à restaurer : la dernière utilisée si un enregistrement y a été interrompu,
-/// sinon toute autre session dont un enregistrement n'a pas été terminé (prise restée en
-/// suspens, puis une autre session ouverte avant de quitter).
-pub fn interrupted_session() -> Option<PathBuf> {
-    let last = std::fs::read_to_string(state_path()?)
-        .ok()
+/// Sessions dont un enregistrement n'a pas été terminé, celle à restaurer en premier : la
+/// dernière utilisée si un enregistrement y a été interrompu, puis toute autre session
+/// restée en suspens (prise bloquée, puis une autre session ouverte avant de quitter).
+pub fn interrupted_sessions() -> Vec<PathBuf> {
+    let last = state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|p| PathBuf::from(p.trim()));
+    let mut out = Vec::new();
     if let Some(path) = &last
         && let Some(dir) = path.parent()
         && path.exists()
         && journal_path(dir).exists()
     {
-        return Some(path.clone());
+        out.push(path.clone());
     }
-    let list = std::fs::read_to_string(pending_path()?).unwrap_or_default();
-    pending_dirs(&list)
-        .into_iter()
-        .filter(|d| journal_path(d).exists())
-        .find_map(|d| session_file_in(&d))
+    let list = pending_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    for d in pending_dirs(&list) {
+        if !journal_path(&d).exists() || out.iter().any(|p| p.parent() == Some(d.as_path())) {
+            continue;
+        }
+        if let Some(f) = session_file_in(&d) {
+            out.push(f);
+        }
+    }
+    out
 }
 
 /// Fichier de session d'un dossier de session.
@@ -708,6 +779,108 @@ mod tests {
             c,
             [("Voix_001.wav", 100, 3000), ("Voix_002.wav", 8000, 500)]
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Session rouverte pendant qu'une prise bloquée écrit encore : ses fichiers ne sont ni
+    /// réparés ni tronqués (le thread d'écriture garde sa position), elle reste dans le
+    /// journal ; les autres prises du journal sont récupérées.
+    #[test]
+    fn recover_never_touches_takes_still_writing() {
+        let dir = std::env::temp_dir().join(format!("tp-recover-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("L".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let t = p.add_track(Some("Voix".into()), Some(0));
+        p.save().unwrap();
+        write_wav(&p.audio_dir().join("Voix_001.wav"), 1000);
+        let live_path = p.audio_dir().join("Voix_002.wav");
+        write_wav(&live_path, 1000);
+        // En cours d'écriture : une trame incomplète en fin de fichier.
+        let mut f = OpenOptions::new().append(true).open(&live_path).unwrap();
+        f.write_all(&[1u8; 3 * 10 + 2]).unwrap();
+        drop(f);
+        let before = std::fs::read(&live_path).unwrap();
+        let take = |file: &str, start| Journal {
+            start,
+            play_offset: 0,
+            latency: 0,
+            sample_rate: 48000,
+            takes: vec![JournalTake {
+                track_id: t,
+                file: file.into(),
+            }],
+            extra: Vec::new(),
+        };
+        let live = take("Voix_002.wav", 5000);
+        let mut j = take("Voix_001.wav", 0);
+        j.extra.push(live.clone());
+        write_journal(&dir, &j).unwrap();
+        let mut q = Project::load(&p.file_path()).unwrap();
+        let r = recover_with(&mut q, std::slice::from_ref(&live)).unwrap();
+        assert_eq!(r.takes, 1);
+        assert!(r.saved.is_ok());
+        assert_eq!(std::fs::read(&live_path).unwrap(), before, "fichier intact");
+        let files: Vec<_> = q.tracks[0].clips.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(files, ["Voix_001.wav"]);
+        // Le journal ne garde que la prise encore en cours.
+        let text = std::fs::read_to_string(journal_path(&dir)).unwrap();
+        let kept: Journal = serde_json::from_str(&text).unwrap();
+        assert!(kept.takes.is_empty());
+        assert_eq!(kept.extra.len(), 1);
+        assert_eq!(kept.extra[0].takes[0].file, "Voix_002.wav");
+        // Reportée dans un nouveau journal : seulement les prises qui ne sont pas en cours.
+        assert!(kept.pending_groups(std::slice::from_ref(&live)).is_empty());
+        assert_eq!(kept.pending_groups(&[]).len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Sauvegarde de la session impossible après une récupération : positions notées et
+    /// journal gardés, une nouvelle récupération replace les fichiers au même endroit.
+    #[test]
+    fn recover_keeps_positions_until_saved() {
+        let dir = std::env::temp_dir().join(format!("tp-recover-unsaved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("U".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let t = p.add_track(Some("Voix".into()), Some(0));
+        p.save().unwrap();
+        write_wav(&p.audio_dir().join("Voix_001.wav"), 4800);
+        write_wav(&p.audio_dir().join("Voix_001_p2.wav"), 2000);
+        let side = p
+            .audio_dir()
+            .join(crate::recorder::start_sidecar("Voix_001_p2.wav"));
+        std::fs::write(&side, "5800").unwrap();
+        let j = Journal {
+            start: 0,
+            play_offset: 0,
+            latency: 0,
+            sample_rate: 48000,
+            extra: Vec::new(),
+            takes: vec![JournalTake {
+                track_id: t,
+                file: "Voix_001.wav".into(),
+            }],
+        };
+        write_journal(&dir, &j).unwrap();
+        // Sauvegarde impossible : un dossier occupe la place du fichier temporaire.
+        let blocker = p.file_path().with_extension("tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let mut q = Project::load(&p.file_path()).unwrap();
+        let r = recover(&mut q).unwrap();
+        assert_eq!(r.takes, 2);
+        assert!(r.saved.is_err());
+        assert!(side.exists(), "position gardée");
+        assert!(journal_path(&dir).exists(), "journal gardé");
+        // Plus tard (crash entre-temps : session d'origine), la récupération recommence.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let mut q = Project::load(&p.file_path()).unwrap();
+        let r = recover(&mut q).unwrap();
+        assert!(r.saved.is_ok());
+        let c: Vec<_> = q.tracks[0].clips.iter().map(|c| c.start).collect();
+        assert_eq!(c, [0, 5800]);
+        assert!(!side.exists());
+        assert!(!journal_path(&dir).exists());
         std::fs::remove_dir_all(dir).ok();
     }
 

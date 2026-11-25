@@ -200,8 +200,9 @@ struct TakeEnd {
     backup_warn: Vec<String>,
     overruns: u32,
     xruns: u32,
-    /// Une nouvelle prise a commencé pendant que le disque ne répondait plus : les fichiers
-    /// de celle-ci ont déjà été réintégrés depuis le disque, on complète (sans doublon).
+    /// Une nouvelle prise a commencé pendant que le disque ne répondait plus : celle-ci est
+    /// intégrée à son arrivée sans toucher à la prise en cours (forme d'onde en direct,
+    /// tête de lecture), et sa sauvegarde se fait en arrière-plan si une autre prise tourne.
     merge: bool,
     /// Session de la prise, et son journal de secours (dernière version).
     dir: PathBuf,
@@ -248,6 +249,127 @@ const FINISH_SLOW_SECS: f64 = 10.0;
 const FINISH_STALLED_SECS: f64 = 30.0;
 /// Prises bloquées gardées en attente au plus (chacune retient ses tampons).
 const MAX_STALLED_TAKES: usize = 3;
+/// Fichiers inutiles en attente de suppression gardés au plus (une longue journée de prises
+/// sur une session dont la sauvegarde échoue ne fait pas grossir la liste sans fin).
+const MAX_STALE_FILES: usize = 4096;
+
+/// Sauvegarde en arrière-plan suivie : (session, résultat, fichiers à supprimer si elle
+/// réussit).
+type RecSave = (
+    PathBuf,
+    std::sync::mpsc::Receiver<anyhow::Result<()>>,
+    Vec<PathBuf>,
+);
+
+/// Départ d'une prise pendant la fin d'écriture de la précédente.
+#[derive(Debug, PartialEq, Eq)]
+enum OverFinishing {
+    /// Rien en cours : départ normal.
+    Free,
+    /// La précédente écrit encore (disque lent qui avance) : on attend.
+    Wait,
+    /// Trop de prises déjà bloquées : refus.
+    TooMany,
+    /// Disque sans aucun progrès depuis longtemps : la prise part quand même, la
+    /// précédente sera intégrée dès que son écriture se termine.
+    Adopt,
+}
+
+fn over_finishing(finishing: bool, stalled: bool, n_stalled: usize) -> OverFinishing {
+    if !finishing {
+        OverFinishing::Free
+    } else if !stalled {
+        OverFinishing::Wait
+    } else if n_stalled >= MAX_STALLED_TAKES {
+        OverFinishing::TooMany
+    } else {
+        OverFinishing::Adopt
+    }
+}
+
+/// Dossier Audio d'une prise préparé dans un thread : créé, journal de secours lu (s'il
+/// existe), noms des fichiers déjà présents (minuscules). `None` si le disque n'a pas
+/// répondu dans `timeout` : l'interface ne se fige jamais sur un disque bloqué (le
+/// thread est abandonné à son sort).
+type AudioDirProbe = Result<(Option<String>, HashSet<String>), String>;
+
+fn probe_audio_dir(
+    audio: PathBuf,
+    journal: PathBuf,
+    timeout: std::time::Duration,
+) -> Option<AudioDirProbe> {
+    fn prepare(audio: &Path, journal: &Path) -> AudioDirProbe {
+        std::fs::create_dir_all(audio)
+            .map_err(|e| format!("Impossible de créer {} : {e}", audio.display()))?;
+        let journal = std::fs::read_to_string(journal).ok();
+        let names = std::fs::read_dir(audio)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((journal, names))
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (a, j) = (audio.clone(), journal.clone());
+    match std::thread::Builder::new()
+        .name("tracksplus-take-dir".into())
+        .spawn(move || {
+            let _ = tx.send(prepare(&a, &j));
+        }) {
+        Ok(_) => rx.recv_timeout(timeout).ok(),
+        // Pas de thread possible : fait ici.
+        Err(_) => Some(prepare(&audio, &journal)),
+    }
+}
+
+/// Journaux de prises (sans les prises en attente qu'ils portent) appartenant à `dir`.
+fn journals_of<'a>(takes: impl Iterator<Item = &'a TakeEnd>, dir: &Path) -> Vec<recovery::Journal> {
+    takes
+        .filter(|t| t.dir == dir)
+        .filter_map(|t| t.journal.clone())
+        .map(|mut j| {
+            j.extra.clear();
+            j
+        })
+        .collect()
+}
+
+/// Journal qui ne garde que les prises encore en cours d'écriture (`None` : plus rien).
+fn remaining_journal(
+    inflight: Vec<recovery::Journal>,
+    sample_rate: u32,
+) -> Option<recovery::Journal> {
+    (!inflight.is_empty()).then(|| recovery::Journal {
+        start: 0,
+        play_offset: 0,
+        latency: 0,
+        sample_rate,
+        takes: Vec::new(),
+        extra: inflight,
+    })
+}
+
+/// Prise déjà dans la session (réintégrée depuis le disque après un crash, ou à la
+/// réouverture de la session pendant son écriture) : recalée sur la longueur réelle de son
+/// fichier (`frames`), prolongée si elle allait jusqu'au bout. Rend les prises touchées
+/// (aucune : le fichier n'est pas dans la session, la prise est à ajouter).
+fn extend_existing(project: &mut Project, file: &str, frames: u64) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for tr in &mut project.tracks {
+        for c in tr.clips.iter_mut().filter(|c| c.file == file) {
+            let old = c.src_len;
+            c.src_len = frames;
+            if c.offset + c.len >= old || c.offset + c.len > frames {
+                c.len = frames.saturating_sub(c.offset).max(1);
+                c.clamp_fades();
+            }
+            ids.push(c.id);
+        }
+    }
+    ids
+}
 
 /// Résultat d'un import de soundboard : soundboard adopté, sons introuvables.
 pub type ImportDone = (Board, Vec<PathBuf>);
@@ -622,10 +744,15 @@ pub struct App {
     /// « Enregistrer sous » en cours dans un thread (copie des fichiers).
     pub save_as_job: Option<std::sync::mpsc::Receiver<Result<SaveAsDone, String>>>,
     /// Prises précédentes dont le disque ne répondait plus quand une nouvelle prise a
-    /// commencé : déjà réintégrées depuis le disque, complétées dès que leur écriture finit.
+    /// commencé : portées par le journal de la nouvelle, intégrées dès que leur écriture
+    /// finit.
     stalled_takes: Vec<Finishing>,
-    /// Sauvegarde de la session lancée au début d'une prise (thread) : (session, résultat).
-    rec_save: Option<(PathBuf, std::sync::mpsc::Receiver<anyhow::Result<()>>)>,
+    /// Sauvegarde de la session lancée en arrière-plan (début de prise, prise intégrée
+    /// pendant une autre) : (session, résultat, fichiers à supprimer si elle réussit).
+    rec_save: Option<RecSave>,
+    /// Fichiers devenus inutiles (positions notées, fichiers vides) d'une prise intégrée,
+    /// à supprimer après la prochaine sauvegarde réussie de leur session : (session, fichier).
+    stale_files: Vec<(PathBuf, PathBuf)>,
     /// Journal de la prise en cours (pour le double de la session sur le second disque).
     rec_journal: Option<recovery::Journal>,
     /// La prise en cours a une copie de sécurité.
@@ -842,6 +969,7 @@ impl App {
             save_as_job: None,
             stalled_takes: Vec::new(),
             rec_save: None,
+            stale_files: Vec::new(),
             rec_journal: None,
             rec_has_backup: false,
             backup_double_at: 0.0,
@@ -901,11 +1029,12 @@ impl App {
             app.cache.request(&p, Some(&cc.egui_ctx));
         }
         // Enregistrement interrompu lors de la dernière utilisation : on restaure.
-        if let Some(path) = recovery::interrupted_session() {
+        let interrupted = recovery::interrupted_sessions();
+        if let Some(path) = interrupted.first() {
             // Protégé : une session illisible ne doit pas empêcher l'application de démarrer
             // (sinon elle planterait à chaque lancement, le journal étant toujours là).
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                app.load_session(&path);
+                app.load_session(path);
             }))
             .is_ok();
             if !ok {
@@ -916,6 +1045,28 @@ impl App {
                     ),
                     true,
                 );
+            }
+            // D'autres sessions ont aussi une prise interrompue : on le dit (leurs prises
+            // sont récupérées à leur ouverture).
+            if interrupted.len() > 1 {
+                let names: Vec<String> = interrupted[1..]
+                    .iter()
+                    .map(|p| {
+                        p.file_stem()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let others = format!(
+                    "Prise interrompue aussi dans : {} — ouvrez ces sessions pour récupérer leurs prises",
+                    join_few(&names, 3)
+                );
+                // Ajouté au message de la récupération (qui reste lisible).
+                let text = match app.toast.take() {
+                    Some(t) => format!("{} · {others}", t.text),
+                    None => others,
+                };
+                app.notify(text, true);
             }
         } else {
             // Écran d'accueil : aucune session tant que l'utilisateur n'a pas choisi de
@@ -1068,32 +1219,29 @@ impl App {
 
     pub fn record(&mut self) {
         let t0 = std::time::Instant::now();
-        if self.finishing.is_some() {
-            if !self.finish_stalled() {
+        // Le disque de la prise précédente n'avance plus depuis longtemps : on ne bloque pas
+        // le spectacle. Elle n'est confiée aux prises en attente qu'une fois la nouvelle
+        // vraiment partie (plus bas), et intégrée dès que son écriture se termine.
+        let adopt = match over_finishing(
+            self.finishing.is_some(),
+            self.finish_stalled(),
+            self.stalled_takes.len(),
+        ) {
+            OverFinishing::Free => false,
+            OverFinishing::Adopt => true,
+            OverFinishing::Wait => {
                 self.notify("Finalisation de la prise précédente en cours…", false);
                 return;
             }
-            if self.stalled_takes.len() >= MAX_STALLED_TAKES {
+            OverFinishing::TooMany => {
                 self.notify(
                     "Le disque ne répond plus depuis plusieurs prises : vérifiez-le, ou relancez TracksPlus (les prises seront récupérées)",
                     true,
                 );
                 return;
             }
-            // Le disque n'avance plus depuis longtemps : on ne bloque pas le spectacle. La
-            // prise précédente est réintégrée depuis ses fichiers (journal) ci-dessous, et
-            // complétée dès que son écriture se termine.
-            if let Some(mut f) = self.finishing.take() {
-                f.take.merge = true;
-                self.stalled_takes.push(f);
-            }
-            self.live.clear();
-            self.notify(
-                "Prise précédente pas encore entièrement écrite (disque lent) : elle est reprise depuis le disque et sera complétée dès qu'il répondra",
-                true,
-            );
-        }
-        if !self.is_stopped() {
+        };
+        if self.transport != Transport::Stopped {
             if matches!(self.transport, Transport::Playing { .. }) {
                 self.stop();
             } else {
@@ -1214,16 +1362,54 @@ impl App {
             return;
         }
 
-        // 4) Disque : dossier, noms des fichiers (une seule lecture du dossier), puis le
+        // 4) Disque : dossier, journal existant et noms des fichiers (une seule lecture du
+        //    dossier), dans un thread au temps borné — un disque bloqué ne fige jamais
+        //    l'interface, et la prise ne part pas sur un disque qui ne répond pas. Puis le
         //    thread d'écriture, qui écrit le journal de secours avant le premier fichier.
-        if let Err(e) = self.project.ensure_dirs() {
-            self.abort_record_start(format!("{e:#}"));
-            return;
-        }
-        // Journal d'une prise précédente non intégrée (sauvegarde échouée, disque resté
-        // bloqué) : on la récupère avant que le nouveau journal ne le remplace.
-        if recovery::journal_path(&self.project.dir).exists() {
-            match recovery::recover(&mut self.project) {
+        //    Prises de cette session encore en cours d'écriture (disque déjà en difficulté) :
+        //    attente courte.
+        let inflight = self.inflight_journals();
+        let timeout = if inflight.is_empty() {
+            std::time::Duration::from_secs(ring_secs.saturating_sub(2).max(2) as u64)
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        let (old_journal, existing) = match probe_audio_dir(
+            self.project.audio_dir(),
+            recovery::journal_path(&self.project.dir),
+            timeout,
+        ) {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
+                self.abort_record_start(e);
+                return;
+            }
+            None => {
+                self.abort_record_start(
+                    "Le disque de la session ne répond pas : prise impossible pour l'instant. Vérifiez le disque puis relancez la prise."
+                        .into(),
+                );
+                return;
+            }
+        };
+        // Journal d'une prise précédente non intégrée (sauvegarde échouée) : récupérée avant
+        // que le nouveau journal ne le remplace — sauf si des prises de cette session
+        // écrivent encore (leur disque ne répond plus) : rien n'est alors lu ni réparé ici,
+        // ses prises sont reportées dans le nouveau journal.
+        let mut carried = Vec::new();
+        match old_journal {
+            Some(text) if !inflight.is_empty() => {
+                match serde_json::from_str::<recovery::Journal>(&text) {
+                    Ok(j) => carried = j.pending_groups(&inflight),
+                    Err(e) => self.notify(
+                        format!(
+                            "Journal de la prise précédente illisible ({e}) : ses fichiers restent dans Audio/"
+                        ),
+                        true,
+                    ),
+                }
+            }
+            Some(_) => match recovery::recover(&mut self.project) {
                 Ok(r) => {
                     if r.takes > 0 {
                         self.load_peaks();
@@ -1244,9 +1430,9 @@ impl App {
                     ),
                     true,
                 ),
-            }
+            },
+            None => {}
         }
-        let existing = self.project.audio_file_names();
         let mut used = HashSet::new();
         let mut specs = Vec::new();
         for ((track_id, name, _, stereo), (cons, peaks)) in armed.into_iter().zip(conss) {
@@ -1274,9 +1460,10 @@ impl App {
                     file: s.file.clone(),
                 })
                 .collect(),
-            // Prises précédentes encore en attente (disque bloqué) : toujours récupérables
-            // après un crash, même si ce journal remplace le leur.
-            extra: self.stalled_journals(),
+            // Prises précédentes encore en attente (disque bloqué), et celles d'un journal
+            // pas encore intégré : toujours récupérables après un crash, même si ce journal
+            // remplace le leur.
+            extra: inflight.into_iter().chain(carried).collect(),
         };
         let has_backup = backup.is_some();
         let recorder = match Recorder::start_with_backup(
@@ -1292,6 +1479,16 @@ impl App {
                 return;
             }
         };
+        // La prise est vraiment partie : la précédente, bloquée, rejoint les prises en
+        // attente (son journal est porté par celui de la nouvelle).
+        if adopt && let Some(mut f) = self.finishing.take() {
+            f.take.merge = true;
+            self.stalled_takes.push(f);
+            self.notify(
+                "Prise précédente pas encore entièrement écrite (disque lent) : elle sera ajoutée à la session dès que son écriture se termine, et reste récupérable en cas de coupure",
+                true,
+            );
+        }
         // 5) Session et « dernière session » (récupération au lancement) écrites en
         //    arrière-plan : jamais d'écriture forcée sur le disque avant la capture.
         self.save_session_background();
@@ -1363,27 +1560,73 @@ impl App {
         self.engine.stop_playback();
         self.engine.shared.counting.store(false, Ordering::Relaxed);
         self.player = None;
-        self.live.clear();
+        // Prise précédente toujours en fin d'écriture : sa forme d'onde reste affichée.
+        self.live = self
+            .finishing
+            .as_ref()
+            .map(|f| f.take.live.clone())
+            .unwrap_or_default();
         self.rec_overdub = false;
         self.rec_latency = 0;
         self.notify(msg, true);
     }
 
-    /// Sauvegarde de la session dans un thread, résultat suivi (voir `poll_rec_save`).
+    /// Sauvegarde de la session dans un thread, résultat suivi (voir `poll_rec_save`). Les
+    /// fichiers inutiles de cette session en attente sont supprimés si elle réussit (elle
+    /// part de l'état actuel : elle couvre tout ce qui a été intégré jusqu'ici).
     fn save_session_background(&mut self) {
+        let dir = self.project.dir.clone();
+        // Sauvegarde précédente encore en cours : la nouvelle, plus récente, la remplace.
+        if let Some((d, _, old)) = self.rec_save.take() {
+            self.stash_stale_files(&d, old);
+        }
+        let cleanup = self.take_stale_files(&dir);
         let rx = self.project.save_in_background();
-        self.rec_save = Some((self.project.dir.clone(), rx));
+        self.rec_save = Some((dir, rx, cleanup));
+    }
+
+    /// Fichiers inutiles de la session `dir` en attente de suppression (retirés de la liste).
+    fn take_stale_files(&mut self, dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.stale_files.retain(|(d, f)| {
+            if d == dir {
+                out.push(f.clone());
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
+    /// Fichiers à supprimer après la prochaine sauvegarde réussie de la session `dir`.
+    fn stash_stale_files(&mut self, dir: &Path, files: Vec<PathBuf>) {
+        self.stale_files
+            .extend(files.into_iter().map(|f| (dir.to_path_buf(), f)));
+        if self.stale_files.len() > MAX_STALE_FILES {
+            let extra = self.stale_files.len() - MAX_STALE_FILES;
+            self.stale_files.drain(..extra);
+        }
     }
 
     fn poll_rec_save(&mut self) {
-        let Some((dir, rx)) = &self.rec_save else {
+        let Some((dir, rx, _)) = &self.rec_save else {
             return;
         };
         let same = *dir == self.project.dir;
         match rx.try_recv() {
-            Ok(Ok(())) => self.rec_save = None,
+            Ok(Ok(())) => {
+                // Session sauvegardée avec les prises : leurs fichiers inutiles peuvent partir.
+                if let Some((_, _, cleanup)) = self.rec_save.take() {
+                    for f in cleanup {
+                        let _ = std::fs::remove_file(f);
+                    }
+                }
+            }
             Ok(Err(e)) => {
-                self.rec_save = None;
+                if let Some((d, _, cleanup)) = self.rec_save.take() {
+                    self.stash_stale_files(&d, cleanup);
+                }
                 if same {
                     // Nouvel essai par la sauvegarde automatique (active aussi pendant une prise).
                     self.project.dirty = true;
@@ -1396,7 +1639,9 @@ impl App {
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.rec_save = None;
+                if let Some((d, _, cleanup)) = self.rec_save.take() {
+                    self.stash_stale_files(&d, cleanup);
+                }
                 if same {
                     self.project.dirty = true;
                 }
@@ -1405,36 +1650,57 @@ impl App {
         }
     }
 
-    /// Journaux des prises restées bloquées de cette session.
-    fn stalled_journals(&self) -> Vec<recovery::Journal> {
-        self.stalled_takes
-            .iter()
-            .filter(|f| f.take.dir == self.project.dir)
-            .filter_map(|f| f.take.journal.clone())
-            .collect()
+    /// Journaux des prises de cette session encore en cours d'écriture (prises restées
+    /// bloquées, fin de prise en cours), sans les prises en attente qu'ils portent.
+    fn inflight_journals(&self) -> Vec<recovery::Journal> {
+        journals_of(
+            self.stalled_takes
+                .iter()
+                .chain(self.finishing.as_ref())
+                .map(|f| &f.take),
+            &self.project.dir,
+        )
     }
 
-    /// Prise intégrée et session sauvegardée : le journal ne garde que les prises encore
-    /// bloquées (disque qui ne répond plus), ou disparaît.
+    /// Prise intégrée et session sauvegardée (aucune prise en cours ni en fin d'écriture
+    /// normale) : le journal ne garde que les prises encore bloquées, ou disparaît.
     fn settle_journal(&mut self) {
-        let extra = self.stalled_journals();
-        if extra.is_empty() {
-            recovery::remove_journal(&self.project.dir);
-            return;
+        match remaining_journal(self.inflight_journals(), self.project.sample_rate) {
+            None => recovery::remove_journal(&self.project.dir),
+            Some(j) => {
+                if let Err(e) = recovery::write_journal(&self.project.dir, &j) {
+                    self.notify(
+                        format!("Attention : journal de secours non écrit ({e:#})"),
+                        true,
+                    );
+                }
+            }
         }
-        let j = recovery::Journal {
-            start: 0,
-            play_offset: 0,
-            latency: 0,
-            sample_rate: self.project.sample_rate,
-            takes: Vec::new(),
-            extra,
-        };
-        if let Err(e) = recovery::write_journal(&self.project.dir, &j) {
-            self.notify(
-                format!("Attention : journal de secours non écrit ({e:#})"),
-                true,
-            );
+    }
+
+    /// Session sauvegardée après l'intégration tardive d'une prise (prise restée bloquée,
+    /// ou récupérée depuis ses fichiers) ; `cleanup` (positions notées, fichiers vides)
+    /// supprimé seulement une fois la sauvegarde réussie. Pendant une autre prise ou une
+    /// autre fin de prise : en arrière-plan, journal laissé tel quel (c'est leur thread
+    /// d'écriture qui le tient) ; sinon tout de suite, et journal réduit aux prises encore
+    /// en cours. Rend l'erreur d'une sauvegarde immédiate.
+    fn save_after_late_take(&mut self, cleanup: Vec<PathBuf>) -> Option<anyhow::Error> {
+        self.project.dirty = true;
+        let dir = self.project.dir.clone();
+        self.stash_stale_files(&dir, cleanup);
+        if self.is_recording() || self.finishing.is_some() {
+            self.save_session_background();
+            return None;
+        }
+        match self.project.save() {
+            Ok(()) => {
+                for f in self.take_stale_files(&dir) {
+                    let _ = std::fs::remove_file(f);
+                }
+                self.settle_journal();
+                None
+            }
+            Err(e) => Some(e),
         }
     }
 
@@ -1564,6 +1830,19 @@ impl App {
     /// Attente de la fin d'écriture d'une prise à la fermeture de l'application : aussi
     /// longtemps qu'elle avance (au plus 5 min), abandon après 15 s sans aucun progrès.
     fn wait_finish(f: &Finishing) -> TakeOutcome {
+        Self::wait_finish_for(
+            f,
+            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(300),
+        )
+    }
+
+    /// `wait_finish` avec ses délais : abandon après `idle` sans progrès, ou `cap` en tout.
+    fn wait_finish_for(
+        f: &Finishing,
+        idle: std::time::Duration,
+        cap: std::time::Duration,
+    ) -> TakeOutcome {
         use std::sync::mpsc::RecvTimeoutError;
         let t0 = std::time::Instant::now();
         let mut seen = (
@@ -1571,7 +1850,10 @@ impl App {
             std::time::Instant::now(),
         );
         loop {
-            match f.rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match f
+                .rx
+                .recv_timeout(idle.min(std::time::Duration::from_millis(100)))
+            {
                 Ok(r) => return TakeOutcome::Done(r),
                 Err(RecvTimeoutError::Disconnected) => return TakeOutcome::Lost,
                 Err(RecvTimeoutError::Timeout) => {
@@ -1579,9 +1861,7 @@ impl App {
                     if p != seen.0 {
                         seen = (p, std::time::Instant::now());
                     }
-                    if seen.1.elapsed() > std::time::Duration::from_secs(15)
-                        || t0.elapsed() > std::time::Duration::from_secs(300)
-                    {
+                    if seen.1.elapsed() > idle || t0.elapsed() > cap {
                         return TakeOutcome::StillWriting;
                     }
                 }
@@ -1703,44 +1983,59 @@ impl App {
                 return;
             }
             TakeOutcome::Done(Finished { main: Err(_), .. }) | TakeOutcome::Lost => {
-                if merge {
-                    // Fichiers déjà réintégrés depuis le disque au début de la prise suivante ;
-                    // le journal garde la prise pour la récupération (longueurs réelles).
-                    if !self.is_recording()
-                        && let Some(j) = &journal
-                    {
-                        let _ = recovery::keep_journal(&dir, j);
-                    }
-                    self.notify(
-                        "Prise précédente : écriture interrompue, la session garde ce qui était sur le disque",
-                        true,
-                    );
-                    return;
+                // Thread disque en échec : on récupère la prise depuis ses fichiers grâce à
+                // son journal (jamais celles d'autres prises encore en cours d'écriture).
+                if !merge {
+                    self.engine.shared.overruns.store(0, Ordering::Relaxed);
                 }
-                // Thread disque en échec : on récupère depuis les fichiers grâce au journal.
-                self.engine.shared.overruns.store(0, Ordering::Relaxed);
-                match recovery::recover(&mut self.project) {
-                    Ok(r) => {
-                        self.load_peaks();
-                        let msg = match &r.saved {
-                            Ok(()) => format!(
-                                "Problème d'écriture disque : {} prise(s) récupérée(s) depuis le disque",
-                                r.takes
+                let Some(j) = &journal else {
+                    // Pas de journal en mémoire : celui de la session, sans les prises
+                    // encore en cours d'écriture.
+                    let live = self.inflight_journals();
+                    match recovery::recover_with(&mut self.project, &live) {
+                        Ok(r) => {
+                            self.load_peaks();
+                            let msg = match &r.saved {
+                                Ok(()) => format!(
+                                    "Problème d'écriture disque : {} prise(s) récupérée(s) depuis le disque",
+                                    r.takes
+                                ),
+                                Err(e) => format!(
+                                    "Problème d'écriture disque : {} prise(s) récupérée(s), session pas encore sauvegardée ({e:#}) — le journal de secours est conservé, nouvel essai automatique",
+                                    r.takes
+                                ),
+                            };
+                            self.notify(msg, true);
+                        }
+                        Err(e) => self.notify(
+                            format!(
+                                "Problème d'écriture disque, journal de secours illisible ({e:#}) : les fichiers sont conservés dans Audio/"
                             ),
-                            Err(e) => format!(
-                                "Problème d'écriture disque : {} prise(s) récupérée(s), session pas encore sauvegardée ({e:#}) — le journal de secours est conservé, nouvel essai automatique",
-                                r.takes
-                            ),
-                        };
-                        self.notify(msg, true);
-                    }
-                    Err(e) => self.notify(
-                        format!(
-                            "Problème d'écriture disque, journal de secours illisible ({e:#}) : les fichiers sont conservés dans Audio/"
+                            true,
                         ),
-                        true,
+                    }
+                    return;
+                };
+                let (n, cleanup) = recovery::apply_journal(&mut self.project, j, &[]);
+                // La session a changé : l'historique d'avant ne s'applique plus (Ctrl+Z ne
+                // doit pas retirer la prise récupérée).
+                self.undo.clear();
+                self.redo.clear();
+                self.load_peaks();
+                self.prune_peaks();
+                let msg = match self.save_after_late_take(cleanup) {
+                    None => format!(
+                        "Problème d'écriture disque : {n} prise(s) récupérée(s) depuis le disque"
                     ),
-                }
+                    Some(e) => {
+                        // Journal de la prise gardé : la récupération se refera.
+                        let _ = recovery::keep_journal(&dir, j);
+                        format!(
+                            "Problème d'écriture disque : {n} prise(s) récupérée(s), session pas encore sauvegardée ({e:#}) — le journal de secours est conservé, nouvel essai automatique"
+                        )
+                    }
+                };
+                self.notify(msg, true);
                 return;
             }
         };
@@ -1763,21 +2058,10 @@ impl App {
         let mut main_clips = Vec::new();
         for (track_id, clip, seg) in layout.clips {
             let path = audio.join(&seg.file);
-            if merge
-                && let Some(tr) = self.project.track_mut(track_id)
-                && tr.clips.iter().any(|c| c.file == clip.file)
-            {
-                // Déjà réintégré depuis le disque pendant le blocage : longueur réelle.
-                let mut ids = Vec::new();
-                for c in tr.clips.iter_mut().filter(|c| c.file == clip.file) {
-                    let old = c.src_len;
-                    c.src_len = seg.frames;
-                    if c.offset + c.len >= old || c.offset + c.len > seg.frames {
-                        c.len = seg.frames.saturating_sub(c.offset).max(1);
-                        c.clamp_fades();
-                    }
-                    ids.push(c.id);
-                }
+            // Déjà dans la session (réintégré depuis le disque à la réouverture de la session
+            // ou après un crash) : longueur réelle, jamais de doublon.
+            let ids = extend_existing(&mut self.project, &clip.file, seg.frames);
+            if !ids.is_empty() {
                 let pk: Peaks = Arc::new(RwLock::new(PeakData::default()));
                 render::request_peaks(path, pk.clone());
                 for id in ids {
@@ -1827,20 +2111,29 @@ impl App {
                 main_clips.push((track_id, clip));
             }
         }
+        // Positions notées et fichiers vides : inutiles une fois la session sauvegardée avec
+        // ces prises (gardés jusque-là : la récupération après un crash en a besoin).
+        let cleanup: Vec<PathBuf> = layout
+            .discard
+            .iter()
+            .map(|f| audio.join(f))
+            .chain(results.iter().flat_map(|r| {
+                r.segments
+                    .iter()
+                    .map(|seg| audio.join(crate::recorder::start_sidecar(&seg.file)))
+            }))
+            .collect();
+        // Une prise modifie la timeline : l'historique d'annulation d'avant ne s'applique
+        // plus (sinon Ctrl+Z pourrait retirer la prise de la session).
+        self.undo.clear();
+        self.redo.clear();
+        self.prune_peaks();
         if merge {
-            // Une autre prise peut être en cours : sauvegarde en arrière-plan, journal et
-            // positions notées laissés en place (la récupération s'en sert encore). Sinon
-            // (arrêt, fermeture), sauvegarde tout de suite et journal à jour.
-            self.project.dirty = true;
-            if self.is_recording() || self.finishing.is_some() {
-                if self.rec_save.is_none() {
-                    self.save_session_background();
-                }
-            } else {
-                match self.project.save() {
-                    Ok(()) => self.settle_journal(),
-                    Err(e) => self.save_failed(e),
-                }
+            // Une autre prise peut être en cours : sauvegarde en arrière-plan, journal laissé
+            // en place (tenu par son thread d'écriture). Sinon (arrêt, fermeture), sauvegarde
+            // tout de suite et journal à jour.
+            if let Some(e) = self.save_after_late_take(cleanup) {
+                self.save_failed(e);
             }
             if let Some(b) = backup {
                 self.backup_pending.push(PendingBackup {
@@ -1860,26 +2153,19 @@ impl App {
             );
             return;
         }
-        self.undo.clear();
-        self.redo.clear();
-        self.prune_peaks();
         self.playhead = start + max_len;
         self.project.dirty = true;
         let save = self.project.save();
+        let dir = self.project.dir.clone();
         if save.is_ok() {
             // Les prises sont référencées dans la session : le journal, les positions
-            // notées et les fichiers vides ne servent plus (gardés tant que la session
-            // n'est pas sauvegardée : la récupération après un crash en a besoin).
-            for f in layout.discard {
-                let _ = std::fs::remove_file(audio.join(f));
-            }
-            for r in &results {
-                for seg in &r.segments {
-                    let _ =
-                        std::fs::remove_file(audio.join(crate::recorder::start_sidecar(&seg.file)));
-                }
+            // notées et les fichiers vides ne servent plus.
+            for f in cleanup.into_iter().chain(self.take_stale_files(&dir)) {
+                let _ = std::fs::remove_file(f);
             }
             self.settle_journal();
+        } else {
+            self.stash_stale_files(&dir, cleanup);
         }
         // Copie de sécurité : son résultat arrive à son rythme ; le double de la session
         // ne référence ses fichiers qu'une fois connus (voir `poll_backups`).
@@ -2975,7 +3261,17 @@ impl App {
     pub fn load_session(&mut self, path: &Path) {
         match Project::load(path) {
             Ok(mut p) => {
-                let recovered = recovery::recover(&mut p);
+                // Prises de cette session encore en cours d'écriture (session quittée puis
+                // rouverte pendant qu'un disque lent finissait) : jamais touchées ici, elles
+                // seront intégrées à la fin de leur écriture.
+                let live = journals_of(
+                    self.stalled_takes
+                        .iter()
+                        .chain(self.finishing.as_ref())
+                        .map(|f| &f.take),
+                    &p.dir,
+                );
+                let recovered = recovery::recover_with(&mut p, &live);
                 self.start_screen = false;
                 self.project = p;
                 self.load_session_board();
@@ -6130,6 +6426,195 @@ mod take_tests {
         let v: Vec<String> = (0..5).map(|i| format!("e{i}")).collect();
         assert_eq!(join_few(&v, 3), "e0 ; e1 ; e2 (+2 autre(s))");
         assert_eq!(join_few(&v[..2], 3), "e0 ; e1");
+    }
+
+    use std::sync::atomic::AtomicU64;
+
+    fn take_end(dir: &str, files: &[&str]) -> TakeEnd {
+        TakeEnd {
+            released: true,
+            live: Vec::new(),
+            lat: 0,
+            lost_card: false,
+            backup_warn: Vec::new(),
+            overruns: 0,
+            xruns: 0,
+            merge: false,
+            dir: PathBuf::from(dir),
+            journal: Some(recovery::Journal {
+                start: 10,
+                play_offset: 0,
+                latency: 0,
+                sample_rate: 48000,
+                takes: files
+                    .iter()
+                    .map(|f| recovery::JournalTake {
+                        track_id: 1,
+                        file: (*f).into(),
+                    })
+                    .collect(),
+                // Une prise bloquée plus ancienne portée par celle-ci : jamais dupliquée.
+                extra: vec![recovery::Journal {
+                    start: 0,
+                    play_offset: 0,
+                    latency: 0,
+                    sample_rate: 48000,
+                    takes: Vec::new(),
+                    extra: Vec::new(),
+                }],
+            }),
+        }
+    }
+
+    /// Nouvelle prise pendant la fin d'écriture de la précédente : attente tant que le
+    /// disque avance, départ quand il est bloqué, refus au-delà de quelques prises bloquées.
+    #[test]
+    fn record_over_finishing_take() {
+        assert_eq!(over_finishing(false, false, 0), OverFinishing::Free);
+        assert_eq!(over_finishing(false, false, 5), OverFinishing::Free);
+        assert_eq!(over_finishing(true, false, 0), OverFinishing::Wait);
+        assert_eq!(over_finishing(true, true, 0), OverFinishing::Adopt);
+        assert_eq!(
+            over_finishing(true, true, MAX_STALLED_TAKES - 1),
+            OverFinishing::Adopt
+        );
+        assert_eq!(
+            over_finishing(true, true, MAX_STALLED_TAKES),
+            OverFinishing::TooMany
+        );
+    }
+
+    /// Journal réécrit après l'intégration d'une prise : seulement les prises de la session
+    /// encore en cours d'écriture, sans les prises qu'elles portaient ; rien → supprimé.
+    #[test]
+    fn journal_keeps_only_inflight_takes_of_session() {
+        let takes = [
+            take_end("S", &["A_001.wav"]),
+            take_end("Autre", &["B_001.wav"]),
+            take_end("S", &["A_002.wav", "C_001.wav"]),
+        ];
+        let j = journals_of(takes.iter(), Path::new("S"));
+        assert_eq!(j.len(), 2);
+        assert!(j.iter().all(|j| j.extra.is_empty()));
+        assert_eq!(j[1].takes.len(), 2);
+        let r = remaining_journal(j, 48000).unwrap();
+        assert!(r.takes.is_empty());
+        assert_eq!(r.extra.len(), 2);
+        assert_eq!(r.extra[0].takes[0].file, "A_001.wav");
+        assert!(remaining_journal(Vec::new(), 48000).is_none());
+        assert!(journals_of(takes.iter(), Path::new("Rien")).is_empty());
+    }
+
+    /// Prise terminée dont le fichier est déjà dans la session : prolongée jusqu'au bout
+    /// du fichier (sans doublon) ; une prise raccourcie à la main garde sa longueur ; un
+    /// fichier absent de la session est à ajouter.
+    #[test]
+    fn finished_take_extends_existing_clip() {
+        let mut p = Project::new("E".into(), PathBuf::from("e"), 48000);
+        let t = p.add_track(Some("Voix".into()), Some(0));
+        let clip = |id, file: &str, len, src_len| Clip {
+            id,
+            file: file.into(),
+            start: 100,
+            offset: 0,
+            len,
+            src_len,
+            fade_in: 0,
+            fade_out: 0,
+        };
+        let tr = p.track_mut(t).unwrap();
+        tr.clips.push(clip(1, "Voix_001.wav", 1000, 1000));
+        tr.clips.push(clip(2, "Voix_002.wav", 300, 1000));
+        assert_eq!(extend_existing(&mut p, "Voix_001.wav", 5000), [1]);
+        assert_eq!(extend_existing(&mut p, "Voix_002.wav", 5000), [2]);
+        assert!(extend_existing(&mut p, "Voix_003.wav", 5000).is_empty());
+        let c: Vec<_> = p.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.id, c.len, c.src_len))
+            .collect();
+        assert_eq!(c, [(1, 5000, 5000), (2, 300, 5000)]);
+        // Fichier finalement plus court que la prise réintégrée : recalée.
+        assert_eq!(extend_existing(&mut p, "Voix_001.wav", 800), [1]);
+        assert_eq!(p.tracks[0].clips[0].len, 800);
+    }
+
+    fn finishing(rx: std::sync::mpsc::Receiver<Finished>, progress: Arc<AtomicU64>) -> Finishing {
+        Finishing {
+            rx,
+            start: 0,
+            take: take_end("S", &["A_001.wav"]),
+            progress,
+            seen: (0, 0.0),
+            slow_told: false,
+        }
+    }
+
+    /// Fermeture de l'application pendant une fin de prise : attente tant que l'écriture
+    /// avance, abandon (journal gardé) seulement quand elle n'avance plus ; résultat
+    /// tardif jamais jeté ; thread disparu → récupération depuis le disque.
+    #[test]
+    fn wait_finish_follows_progress() {
+        use std::time::Duration;
+        let idle = Duration::from_millis(150);
+        let cap = Duration::from_secs(30);
+        // Disque bloqué : aucun progrès.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let f = finishing(rx, Arc::new(AtomicU64::new(0)));
+        assert!(matches!(
+            App::wait_finish_for(&f, idle, cap),
+            TakeOutcome::StillWriting
+        ));
+        // Disque lent qui avance : le résultat arrive bien après `idle`.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let progress = Arc::new(AtomicU64::new(0));
+        let f = finishing(rx, progress.clone());
+        let h = std::thread::spawn(move || {
+            for _ in 0..12 {
+                std::thread::sleep(Duration::from_millis(50));
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = tx.send(Finished {
+                main: Ok(Vec::new()),
+                backup: None,
+            });
+        });
+        assert!(matches!(
+            App::wait_finish_for(&f, idle, cap),
+            TakeOutcome::Done(Finished { main: Ok(_), .. })
+        ));
+        h.join().unwrap();
+        // Thread de fin disparu sans résultat.
+        let (tx, rx) = std::sync::mpsc::channel::<Finished>();
+        drop(tx);
+        let f = finishing(rx, Arc::new(AtomicU64::new(0)));
+        assert!(matches!(
+            App::wait_finish_for(&f, idle, cap),
+            TakeOutcome::Lost
+        ));
+    }
+
+    /// Préparation du dossier d'une prise hors du thread de l'interface : dossier créé,
+    /// journal existant lu, noms présents (minuscules).
+    #[test]
+    fn probe_audio_dir_prepares_take_folder() {
+        let dir = std::env::temp_dir().join(format!("tp-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let audio = dir.join(project::AUDIO_DIR);
+        let journal = recovery::journal_path(&dir);
+        let timeout = std::time::Duration::from_secs(10);
+        let (j, names) = probe_audio_dir(audio.clone(), journal.clone(), timeout)
+            .unwrap()
+            .unwrap();
+        assert!(audio.is_dir());
+        assert!(j.is_none());
+        assert!(names.is_empty());
+        std::fs::write(audio.join("Voix_001.WAV"), b"x").unwrap();
+        std::fs::write(&journal, "{}").unwrap();
+        let (j, names) = probe_audio_dir(audio, journal, timeout).unwrap().unwrap();
+        assert_eq!(j.as_deref(), Some("{}"));
+        assert!(names.contains("voix_001.wav"));
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 

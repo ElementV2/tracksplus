@@ -468,8 +468,10 @@ impl LaneState {
         self.retry_delay = next_retry_delay(self.retry_delay);
     }
 
-    /// Ferme le fichier en cours (en-tête final + fsync). Un fichier sans aucune trame
-    /// sur le disque (prise arrêtée tout de suite, disque plein) est supprimé.
+    /// Ferme le fichier en cours (en-tête final + fsync). Seul un fichier réellement vide
+    /// (aucune trame acceptée, ou rien après l'en-tête sur le disque) est supprimé : un
+    /// fichier dont on ne peut pas relire la longueur (support un instant indisponible,
+    /// verrouillé par l'antivirus) est toujours gardé, il peut contenir des heures d'audio.
     fn close_current(&mut self, errors: &Errors, sync: &Sender<Arc<File>>) {
         let Some(seg) = self.cur.take() else {
             return;
@@ -482,22 +484,36 @@ impl LaneState {
             start,
         } = seg;
         let path = self.dir.join(&name);
+        if frames == 0 {
+            // Aucune trame acceptée : rien à garder (prise arrêtée tout de suite).
+            drop(w);
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(self.dir.join(start_sidecar(&name)));
+            return;
+        }
+        let data_start = w.data_size_at + 4;
+        let block = (self.wav.bits_per_sample / 8) as u64 * self.wav.channels.max(1) as u64;
         let mut frames = frames;
         if let Err(e) = w.finalize() {
             self.fail(errors, format!("{name} : {e}"));
             // Disque plein ou retiré : on recale la longueur sur ce qui est réellement
             // sur le disque (les derniers échantillons en tampon n'y sont peut-être pas).
-            // Fichier illisible : rien d'utilisable dedans.
+            // Réparation impossible : taille du fichier si on peut la lire, sinon la
+            // longueur comptée — le fichier est gardé, la récupération recalera.
             frames = match crate::recovery::repair_wav(&path) {
                 Ok(real) => real.min(frames),
-                Err(_) => 0,
+                Err(_) => std::fs::metadata(&path).map_or(frames, |m| {
+                    (m.len().saturating_sub(data_start) / block.max(1)).min(frames)
+                }),
             };
-        }
-        if frames == 0 {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(self.dir.join(start_sidecar(&name)));
-            return;
+            if frames == 0 {
+                // Rien après l'en-tête sur le disque (relu avec succès) : fichier vide.
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(self.dir.join(start_sidecar(&name)));
+                return;
+            }
         }
         // Écriture forcée sur le disque dans un thread à part : jamais de blocage ici.
         let _ = sync.send(file);
@@ -561,18 +577,42 @@ impl LaneState {
     }
 }
 
-/// Copies de sécurité en train de se terminer (voir `wait_backups`), avec leur avancement.
-type BackupFinishing = (JoinHandle<()>, Arc<AtomicU64>);
+/// Copie de sécurité en train de se terminer (voir `wait_backups`), avec son avancement
+/// et le dernier changement observé (valeur, instant).
+struct BackupFinishing {
+    handle: JoinHandle<()>,
+    progress: Arc<AtomicU64>,
+    seen: (u64, Instant),
+}
+
 static BACKUP_FINISHING: parking_lot::Mutex<Vec<BackupFinishing>> =
     parking_lot::Mutex::new(Vec::new());
 
-/// Une copie de sécurité d'une prise précédente est encore en train d'écrire (second
-/// disque lent ou bloqué) : la prise suivante ne doit pas en lancer une autre (ses
-/// tampons s'ajouteraient à ceux, jamais libérés, de la copie bloquée).
+/// Une copie qui n'avance plus depuis ce délai est tenue pour bloquée (second disque qui ne
+/// répond plus). Une copie lente qui avance (vidage et fsync sur une clé USB) ne l'est pas.
+const BACKUP_STALLED: Duration = Duration::from_secs(20);
+
+/// Retire les copies terminées et dit si l'une des autres n'a fait aucun progrès depuis
+/// `idle` (à l'instant `now`).
+fn backups_stalled(v: &mut Vec<BackupFinishing>, now: Instant, idle: Duration) -> bool {
+    v.retain(|b| !b.handle.is_finished());
+    let mut stalled = false;
+    for b in v.iter_mut() {
+        let p = b.progress.load(Ordering::Relaxed);
+        if p != b.seen.0 {
+            b.seen = (p, now);
+        }
+        stalled |= now.saturating_duration_since(b.seen.1) > idle;
+    }
+    stalled
+}
+
+/// Une copie de sécurité d'une prise précédente est bloquée (aucun progrès depuis
+/// `BACKUP_STALLED`) : la prise suivante ne doit pas en lancer une autre (ses tampons
+/// s'ajouteraient à ceux, jamais libérés, de la copie bloquée). Une copie qui avance
+/// encore n'empêche rien : deux jeux de tampons coexistent au plus quelques secondes.
 pub fn backup_busy() -> bool {
-    let mut v = BACKUP_FINISHING.lock();
-    v.retain(|(h, _)| !h.is_finished());
-    !v.is_empty()
+    backups_stalled(&mut BACKUP_FINISHING.lock(), Instant::now(), BACKUP_STALLED)
 }
 
 /// À la fermeture de l'application : laisse les copies de sécurité finir d'écrire, aussi
@@ -583,13 +623,15 @@ pub fn wait_backups(idle: Duration, cap: Duration) {
     let mut seen = (u64::MAX, Instant::now());
     loop {
         let mut v = BACKUP_FINISHING.lock();
-        v.retain(|(h, _)| !h.is_finished());
+        v.retain(|b| !b.handle.is_finished());
         if v.is_empty() {
             return;
         }
         let p = v
             .iter()
-            .fold(0u64, |a, (_, p)| a.wrapping_add(p.load(Ordering::Relaxed)))
+            .fold(0u64, |a, b| {
+                a.wrapping_add(b.progress.load(Ordering::Relaxed))
+            })
             .wrapping_add(v.len() as u64);
         drop(v);
         if p != seen.0 {
@@ -848,8 +890,13 @@ impl Recorder {
                 })
                 .ok()?;
             let mut v = BACKUP_FINISHING.lock();
-            v.retain(|(h, _)| !h.is_finished());
-            v.push((h, progress));
+            v.retain(|b| !b.handle.is_finished());
+            let seen = (progress.load(Ordering::Relaxed), Instant::now());
+            v.push(BackupFinishing {
+                handle: h,
+                progress,
+                seen,
+            });
             Some(BackupFinish { rx })
         });
         let main = match self.handle.take() {
@@ -1778,6 +1825,170 @@ mod tests {
             "dernière version du journal"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Piste mono 24 bits dans `dir`, sans fichier ouvert.
+    fn test_lane(dir: &Path) -> LaneState {
+        LaneState {
+            track_id: 1,
+            file: "t.wav".into(),
+            peaks: None,
+            dir: dir.to_path_buf(),
+            wav: wav_spec(RecFormat::Int24, 48000, 1),
+            k: 0,
+            cur: None,
+            done: Vec::new(),
+            seg_no: 1,
+            acc: PeakAccum::default(),
+            error: None,
+            elapsed: 0,
+            retry_at: None,
+            retry_delay: RETRY_EVERY,
+            take_time: chrono::Local::now().naive_local(),
+            time_ref: 0,
+            move_aside: false,
+        }
+    }
+
+    /// Fichier sans aucune trame : supprimé (avec sa position notée) à la fermeture.
+    #[test]
+    fn close_current_removes_only_empty_file() {
+        let dir = std::env::temp_dir().join(format!("tp-close-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let errors: Errors = Default::default();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut st = test_lane(&dir);
+        let path = dir.join("t.wav");
+        st.cur =
+            Some(open_segment(&path, "t.wav".into(), st.wav, &|_| Vec::new(), 0, false).unwrap());
+        std::fs::write(dir.join(start_sidecar("t.wav")), "0").unwrap();
+        st.close_current(&errors, &tx);
+        assert!(!path.exists(), "fichier vide supprimé");
+        assert!(!dir.join(start_sidecar("t.wav")).exists());
+        assert!(st.done.is_empty());
+        // Fichier avec des trames : jamais supprimé.
+        let path2 = dir.join("u.wav");
+        let mut seg =
+            open_segment(&path2, "u.wav".into(), st.wav, &|_| Vec::new(), 0, false).unwrap();
+        for i in 0..100 {
+            seg.w.write_i24(i).unwrap();
+            seg.frames += 1;
+        }
+        st.cur = Some(seg);
+        st.close_current(&errors, &tx);
+        assert!(path2.exists());
+        assert_eq!(st.done.len(), 1);
+        assert_eq!(st.done[0].frames, 100);
+        assert!(rx.try_recv().is_ok(), "fsync demandé");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fin de fichier en échec ET réparation impossible (fichier verrouillé, support un
+    /// instant indisponible) : le fichier reste sur le disque, avec sa longueur connue.
+    #[test]
+    fn close_current_keeps_file_when_repair_fails() {
+        let dir = std::env::temp_dir().join(format!("tp-close-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let errors: Errors = Default::default();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut st = test_lane(&dir);
+        let path = dir.join("t.wav");
+        // Un vrai fichier de 1000 trames sur le disque.
+        let mut seg =
+            open_segment(&path, "t.wav".into(), st.wav, &|_| Vec::new(), 0, false).unwrap();
+        let data_size_at = seg.w.data_size_at;
+        for i in 0..1000 {
+            seg.w.write_i24(i).unwrap();
+        }
+        seg.w.flush().unwrap();
+        drop(seg);
+        std::fs::write(dir.join(start_sidecar("t.wav")), "42").unwrap();
+        // Accès en lecture seule : la fin du fichier (en-tête) échoue, et la réparation,
+        // qui doit écrire, aussi.
+        let orig = std::fs::metadata(&path).unwrap().permissions();
+        let mut ro_perm = orig.clone();
+        ro_perm.set_readonly(true);
+        std::fs::set_permissions(&path, ro_perm).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            // Droits ignorés (administrateur sous Unix) : cas impossible à simuler ici.
+            std::fs::set_permissions(&path, orig).unwrap();
+            std::fs::remove_dir_all(dir).ok();
+            return;
+        }
+        let ro = File::open(&path).unwrap();
+        st.cur = Some(SegWriter {
+            w: TakeWav {
+                w: BufWriter::new(ro.try_clone().unwrap()),
+                data_size_at,
+                bytes: 3000,
+                padded: false,
+            },
+            name: "t.wav".into(),
+            file: Arc::new(ro),
+            frames: 1000,
+            start: 0,
+        });
+        st.close_current(&errors, &tx);
+        assert!(path.exists(), "fichier jamais supprimé");
+        assert!(dir.join(start_sidecar("t.wav")).exists(), "position gardée");
+        assert_eq!(st.done.len(), 1);
+        assert_eq!(st.done[0].frames, 1000, "longueur relue sur le disque");
+        assert!(st.error.is_some(), "erreur signalée");
+        std::fs::set_permissions(&path, orig).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Une copie de sécurité lente qui avance n'est jamais tenue pour bloquée ; une copie
+    /// figée l'est après le délai ; une copie terminée disparaît de la liste.
+    #[test]
+    fn backup_stalled_only_without_progress() {
+        let t0 = Instant::now();
+        let idle = Duration::from_secs(20);
+        let (stop_tx, stop_rx) = crossbeam_channel::unbounded::<()>();
+        let spawn = || {
+            let rx = stop_rx.clone();
+            std::thread::spawn(move || {
+                let _ = rx.recv();
+            })
+        };
+        let moving = Arc::new(AtomicU64::new(0));
+        let frozen = Arc::new(AtomicU64::new(0));
+        let mut v = vec![BackupFinishing {
+            handle: spawn(),
+            progress: moving.clone(),
+            seen: (0, t0),
+        }];
+        for s in 1..=5u64 {
+            moving.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                !backups_stalled(&mut v, t0 + Duration::from_secs(15 * s), idle),
+                "copie lente qui avance"
+            );
+        }
+        v.push(BackupFinishing {
+            handle: spawn(),
+            progress: frozen.clone(),
+            seen: (0, t0 + Duration::from_secs(75)),
+        });
+        moving.fetch_add(1, Ordering::Relaxed);
+        assert!(!backups_stalled(&mut v, t0 + Duration::from_secs(90), idle));
+        moving.fetch_add(1, Ordering::Relaxed);
+        assert!(backups_stalled(&mut v, t0 + Duration::from_secs(100), idle));
+        // Copies terminées : plus rien en attente.
+        drop(stop_tx);
+        for b in &v {
+            while !b.handle.is_finished() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(!backups_stalled(
+            &mut v,
+            t0 + Duration::from_secs(200),
+            idle
+        ));
+        assert!(v.is_empty());
     }
 
     fn rec_errors_count(res: &[RecResult]) -> usize {

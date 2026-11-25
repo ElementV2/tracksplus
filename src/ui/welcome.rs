@@ -334,7 +334,7 @@ impl App {
                     if resp.hovered() {
                         p.rect_filled(r, CornerRadius::same(t::R), t::SURFACE_3);
                     }
-                    let empty = s.takes == 0;
+                    let empty = s.takes == 0 && !s.interrupted;
                     let name_col = if empty { t::TEXT_2 } else { t::TEXT };
                     let date = &s.date;
                     let date_w = p
@@ -362,7 +362,8 @@ impl App {
                         Align2::LEFT_CENTER,
                         &s.summary,
                         t::regular(11.5),
-                        t::TEXT_3,
+                        // Prise interrompue : à remarquer (ses prises attendent l'ouverture).
+                        if s.interrupted { t::ORANGE } else { t::TEXT_3 },
                     );
                     // Bulle construite seulement au survol.
                     if resp
