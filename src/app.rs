@@ -380,6 +380,10 @@ pub struct App {
     pub backup_thread: Option<std::thread::JoinHandle<()>>,
     /// Carte son perdue : prochain essai de réouverture (secondes) et délai courant.
     pub reconnect: Option<(f64, f64)>,
+    /// La prise en cours a été arrêtée parce que la carte son a disparu.
+    pub lost_during_take: bool,
+    /// Réouverture de la carte en cours dans un thread.
+    pub reconnect_job: Option<std::sync::mpsc::Receiver<anyhow::Result<Engine>>>,
     /// Mesure de l'espace disque libre en cours (thread).
     pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<DiskSpace>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
@@ -571,6 +575,8 @@ impl App {
             backup_jobs: None,
             backup_thread: None,
             reconnect: None,
+            lost_during_take: false,
+            reconnect_job: None,
             disk_job: None,
             rec_latency: 0,
             rec_overdub: false,
@@ -1270,6 +1276,16 @@ impl App {
                 false,
             );
         }
+        // Prise arrêtée parce que la carte son a disparu : c'est ce qu'il faut retenir.
+        if std::mem::take(&mut self.lost_during_take) {
+            self.notify(
+                format!(
+                    "Carte son perdue pendant la prise : enregistrement arrêté, prise sauvegardée ({}). Reconnexion automatique de la carte…",
+                    fmt_time(max_len, self.sr())
+                ),
+                true,
+            );
+        }
     }
 
     /// Arrêt de l'enregistrement demandé au clavier : il faut appuyer deux fois.
@@ -1294,7 +1310,24 @@ impl App {
     /// logiciels pro, on la rouvre tout seul. Jamais pendant une prise (elle se termine
     /// proprement par Stop, la suite est récupérable) ; la lecture, elle, est arrêtée.
     fn watch_device(&mut self) {
-        use crate::audio::{LOST_OUTPUT, LOST_PADS};
+        use crate::audio::{LOST_INPUT, LOST_OUTPUT, LOST_PADS};
+        // Comme Pro Tools, Cubase / Nuendo ou REAPER : carte disparue pendant une prise
+        // (DVS arrêté, câble, horloge Dante perdue : plus aucun échantillon depuis 3 s),
+        // la prise est arrêtée et enregistrée telle quelle — rien n'est perdu de ce qui a
+        // été capté, et on ne continue pas à « enregistrer » du vide.
+        if self.is_recording() {
+            let sh = &self.engine.shared;
+            let input_lost = sh.device_lost.load(Ordering::Acquire) & LOST_INPUT != 0;
+            let frames = sh.rec_frames.load(Ordering::Relaxed);
+            let stalled = frames == self.rec_watch.0 && self.now - self.rec_watch.1 > 3.0;
+            if input_lost || stalled {
+                // Flux muet sans erreur du pilote (horloge Dante) : on le traite comme perdu
+                // pour le rouvrir ensuite.
+                sh.device_lost.fetch_or(LOST_INPUT, Ordering::Release);
+                self.lost_during_take = true;
+                self.stop();
+            }
+        }
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
         if lost != 0 && self.reconnect.is_none() {
             self.reconnect = Some((self.now + 1.0, 1.0));
@@ -1319,10 +1352,47 @@ impl App {
         if self.pads_status().0 > 0 && !pads_dead {
             return;
         }
+        // Ouverture en cours dans un thread (Windows WASAPI, Linux) : on attend son résultat.
+        if let Some(rx) = &self.reconnect_job {
+            match rx.try_recv() {
+                Ok(opened) => {
+                    self.reconnect_job = None;
+                    self.finish_reconnect(opened, delay);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.reconnect_job = None;
+                    self.finish_reconnect(Err(anyhow::anyhow!("ouverture interrompue")), delay);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            return;
+        }
         self.engine.pad(PadCmd::StopAll);
         // L'ancien pilote est libéré avant (ASIO n'en accepte qu'un à la fois).
         self.engine = Engine::offline();
+        // Ouverture hors du thread de l'interface quand c'est sûr : pas de gel de l'écran
+        // à chaque essai. Les pilotes ASIO (objets COM du système) et CoreAudio restent
+        // ouverts ici, sur le thread principal, comme à l'ouverture normale.
+        #[cfg(not(target_os = "macos"))]
+        if self.prefs.host.as_deref() != Some("ASIO") {
+            let (prefs, pad) = (self.prefs.clone(), self.prefs.pad_out());
+            let (tx, rx) = std::sync::mpsc::channel();
+            if std::thread::Builder::new()
+                .name("tracksplus-reconnect".into())
+                .spawn(move || {
+                    let _ = tx.send(Engine::open(&prefs, &pad));
+                })
+                .is_ok()
+            {
+                self.reconnect_job = Some(rx);
+                return;
+            }
+        }
         let opened = Engine::open(&self.prefs, &self.prefs.pad_out());
+        self.finish_reconnect(opened, delay);
+    }
+
+    fn finish_reconnect(&mut self, opened: anyhow::Result<Engine>, delay: f64) {
         let complete = match &opened {
             // Tous les périphériques choisis sont-ils revenus ? (Sinon le moteur tourne avec
             // ce qui est là, et on réessaie : DVS met parfois plusieurs secondes.)
@@ -2363,6 +2433,9 @@ impl App {
             return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
         }
         self.stop();
+        // Choix explicite de l'utilisateur : une reconnexion automatique en cours s'efface.
+        self.reconnect = None;
+        self.reconnect_job = None;
         self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();

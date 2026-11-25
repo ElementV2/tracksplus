@@ -253,8 +253,11 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
   débranché ne gêne jamais l'enregistrement principal.
 - **Fichiers BWF** : chaque prise porte son heure d'enregistrement (TimeReference) et le nom
   de sa piste ; Pro Tools, Nuendo ou Reaper peuvent la poser à son heure réelle.
-- **Carte son perdue** (DVS relancé, câble USB) : reconnexion automatique dès que la prise
-  est arrêtée.
+- **Carte son perdue pendant une prise** (DVS arrêté, câble USB, horloge Dante perdue : plus
+  aucun échantillon depuis 3 s) : comme Pro Tools, Cubase / Nuendo ou REAPER, la prise est
+  arrêtée et enregistrée telle quelle, avec un message clair. Puis la carte est **reconnectée
+  automatiquement** dès qu'elle revient (les pads en cours sur une autre sortie ne sont pas
+  coupés).
 - **Disque qui revient** (clé rebranchée, place libérée) : la piste reprend toute seule,
   calée sur les autres.
 - **Aucune prise perdue** : fichiers lisibles même après un crash ou une coupure de courant.
