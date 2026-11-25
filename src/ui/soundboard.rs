@@ -782,6 +782,25 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show(ui, |ui| self.sb_header(ui));
+        // Fichier du soundboard protégé (illisible, ou d'une version plus récente) : rappel
+        // permanent, on ne peut pas le manquer.
+        if let Some(g) = &self.board.guard {
+            let text = format!(
+                "Soundboard protégé — {} : le fichier de la session est gardé tel quel. Si vous \
+                 modifiez le soundboard, il sera d'abord mis de côté sous un autre nom (importable).",
+                g.reason
+            );
+            egui::Panel::top("sb_guard")
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(t::mix(t::REC, t::SURFACE, 0.55))
+                        .inner_margin(egui::Margin::symmetric(10, 6)),
+                )
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(text).color(t::TEXT));
+                });
+        }
         egui::Panel::right("sb_master")
             .resizable(false)
             .exact_size(crate::ui::multitrack::MASTER_W)

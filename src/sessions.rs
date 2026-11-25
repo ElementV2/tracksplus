@@ -34,10 +34,35 @@ pub struct StartupPrefs {
     /// Dernier dossier où des sons ont été choisis (explorateur de sons).
     #[serde(default)]
     pub sound_dir: Option<PathBuf>,
-    /// Copie de sécurité des prises sur un second disque (dossier racine) : chaque
-    /// session y a son double, ouvrable tel quel.
+    /// Ancien emplacement du dossier de la copie de sécurité (désormais `backup.json`, voir
+    /// `load_backup_root`) : lu s'il n'y a pas encore de `backup.json`, et gardé pour les
+    /// versions précédentes de l'application.
     #[serde(default)]
     pub backup_dir: Option<PathBuf>,
+    /// Champs inconnus (version plus récente) : réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: crate::project::Extra,
+}
+
+/// Lit un fichier de réglages JSON : `Ok(None)` s'il n'existe pas encore, `Err` s'il ne se
+/// lit pas (verrouillé, abîmé) — jamais des réglages par défaut qui l'écraseraient ensuite.
+/// Trois essais espacés de 50 ms.
+fn read_prefs<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+    let mut last = String::new();
+    for i in 0..3 {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match std::fs::read_to_string(path) {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => return Ok(Some(v)),
+                Err(e) => last = format!("{} illisible ({e})", path.display()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => last = format!("lecture de {} impossible ({e})", path.display()),
+        }
+    }
+    Err(last)
 }
 
 impl StartupPrefs {
@@ -45,27 +70,94 @@ impl StartupPrefs {
         dirs::config_dir().map(|d| d.join("TracksPlus").join("startup.json"))
     }
 
+    /// Lecture pour affichage : réglages par défaut si le fichier ne se lit pas. Pour les
+    /// modifier, passer par `update` (qui n'écrase jamais un fichier illisible).
     pub fn load() -> Self {
         Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|p| read_prefs(&p).ok().flatten())
             .unwrap_or_default()
     }
 
-    pub fn save(&self) {
-        if let (Some(p), Ok(s)) = (Self::path(), serde_json::to_string_pretty(self)) {
-            let _ = crate::project::write_atomic(&p, s.as_bytes());
+    fn save(&self) -> bool {
+        match (Self::path(), serde_json::to_string_pretty(self)) {
+            (Some(p), Ok(s)) => crate::project::write_atomic(&p, s.as_bytes()).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Modifie les réglages enregistrés. Fichier présent mais illisible : rien n'est écrit
+    /// (il n'est jamais remplacé par des réglages par défaut). Renvoie `true` si c'est écrit.
+    pub fn update(f: impl FnOnce(&mut Self)) -> bool {
+        let Some(path) = Self::path() else {
+            return false;
+        };
+        match read_prefs::<Self>(&path) {
+            Ok(prefs) => {
+                let mut prefs = prefs.unwrap_or_default();
+                f(&mut prefs);
+                prefs.save()
+            }
+            Err(e) => {
+                eprintln!("Réglages de l'accueil non modifiés : {e}");
+                false
+            }
         }
     }
 }
 
+/// Dossier de la copie de sécurité sur un second disque (`%APPDATA%\TracksPlus\backup.json`),
+/// séparé des réglages de l'accueil réécrits à chaque prise : il n'est écrit que quand
+/// l'utilisateur le change.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct BackupPrefs {
+    #[serde(default)]
+    backup_dir: Option<PathBuf>,
+    #[serde(flatten)]
+    extra: crate::project::Extra,
+}
+
+fn backup_prefs_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("TracksPlus").join("backup.json"))
+}
+
+/// Dossier de la copie de sécurité. `Err` : le réglage existe mais ne se lit pas (la copie
+/// est peut-être désactivée à tort, à signaler).
+pub fn load_backup_root() -> Result<Option<PathBuf>, String> {
+    let Some(path) = backup_prefs_path() else {
+        return Ok(None);
+    };
+    match read_prefs::<BackupPrefs>(&path)? {
+        Some(b) => Ok(b.backup_dir),
+        // Pas encore de `backup.json` : ancien emplacement.
+        None => match StartupPrefs::path() {
+            Some(p) => Ok(read_prefs::<StartupPrefs>(&p)?.and_then(|s| s.backup_dir)),
+            None => Ok(None),
+        },
+    }
+}
+
+/// Enregistre le dossier de la copie de sécurité (et à l'ancien emplacement, pour les
+/// versions précédentes de l'application).
+pub fn save_backup_root(dir: Option<&Path>) -> anyhow::Result<()> {
+    let path =
+        backup_prefs_path().ok_or_else(|| anyhow::anyhow!("dossier des réglages introuvable"))?;
+    let mut b = read_prefs::<BackupPrefs>(&path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    b.backup_dir = dir.map(Path::to_path_buf);
+    crate::project::write_atomic(&path, serde_json::to_string_pretty(&b)?.as_bytes())?;
+    StartupPrefs::update(|p| p.backup_dir = dir.map(Path::to_path_buf));
+    Ok(())
+}
+
 /// Mémorise une session ouverte ou enregistrée (en tête des récentes).
 pub fn remember(path: &Path) {
-    let mut prefs = StartupPrefs::load();
-    prefs.recent.retain(|p| p != path);
-    prefs.recent.insert(0, path.to_path_buf());
-    prefs.recent.truncate(RECENT_MAX);
-    prefs.save();
+    StartupPrefs::update(|prefs| {
+        prefs.recent.retain(|p| p != path);
+        prefs.recent.insert(0, path.to_path_buf());
+        prefs.recent.truncate(RECENT_MAX);
+    });
 }
 
 /// Sessions connues, de la plus récemment modifiée à la plus ancienne.
@@ -95,14 +187,49 @@ pub fn list() -> Vec<SessionInfo> {
     out
 }
 
-/// Résumé d'une session (lit son fichier) ; `None` si elle est absente ou illisible.
+/// Résumé d'une session (lit son fichier) ; `None` si elle est absente. Une session
+/// illisible reste dans la liste, signalée : l'ouvrir reprend sa version précédente
+/// (voir `Project::open`), ses prises sont toujours dans son dossier Audio.
 pub fn info(path: &Path) -> Option<SessionInfo> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let p = Project::load(path).ok()?;
+    let p = match Project::load(path) {
+        Ok(p) => p,
+        Err(e) => {
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let summary = if crate::project::newer_format(&text).is_some() {
+                "Version plus récente de TracksPlus requise".to_string()
+            } else if crate::project::backup_paths(path)
+                .iter()
+                .any(|b| b.is_file())
+            {
+                "Fichier illisible · ouvrir pour reprendre la version précédente".to_string()
+            } else {
+                format!("Fichier illisible ({})", short_error(&e))
+            };
+            return Some(SessionInfo {
+                path: path.to_path_buf(),
+                lower: name.to_lowercase(),
+                name,
+                modified,
+                tracks: 0,
+                takes: 0,
+                date: fmt_date(modified),
+                summary,
+            });
+        }
+    };
     let sr = p.sample_rate.max(1) as f64;
     let tracks = p.tracks.len();
     let takes = p.tracks.iter().map(|t| t.clips.len()).sum();
     let duration = p.end() as f64 / sr;
+    let mut summary = fmt_summary(tracks, takes, duration);
+    if p.read_only.is_some() {
+        summary += " · version plus récente (lecture seule)";
+    }
     Some(SessionInfo {
         path: path.to_path_buf(),
         lower: p.name.to_lowercase(),
@@ -111,8 +238,15 @@ pub fn info(path: &Path) -> Option<SessionInfo> {
         tracks,
         takes,
         date: fmt_date(modified),
-        summary: fmt_summary(tracks, takes, duration),
+        summary,
     })
+}
+
+/// Cause d'une erreur, courte (première ligne de la cause la plus profonde).
+fn short_error(e: &anyhow::Error) -> String {
+    let s = e.root_cause().to_string();
+    let first = s.lines().next().unwrap_or_default();
+    first.chars().take(60).collect()
 }
 
 /// « 4 pistes · 12 prises · 12:34 », ou « 2 pistes · vide ».
@@ -217,6 +351,36 @@ mod tests {
         assert_eq!(ia.lower, "a");
         assert_eq!(fmt_summary(4, 12, 754.0), "4 pistes · 12 prises · 12:34");
         assert!(info(&root.join("absent.tracksplus")).is_none());
+        // Session illisible : toujours dans la liste, signalée (ses prises existent).
+        a.tracks[0].name = "B".into();
+        a.save().unwrap();
+        a.save_checkpoint().unwrap();
+        std::fs::write(a.file_path(), b"abime").unwrap();
+        let bad = info(&a.file_path()).unwrap();
+        assert_eq!(bad.name, "A");
+        assert!(
+            bad.summary.contains("version précédente"),
+            "{}",
+            bad.summary
+        );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Réglages : un fichier absent donne `None`, un fichier illisible une erreur (jamais
+    /// des réglages par défaut, qui l'écraseraient ensuite, copie de sécurité comprise).
+    #[test]
+    fn unreadable_prefs_are_an_error_not_defaults() {
+        let dir = std::env::temp_dir().join(format!("tp-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("startup.json");
+        assert!(matches!(read_prefs::<StartupPrefs>(&p), Ok(None)));
+        std::fs::write(&p, br#"{"backup_dir":"E:\\Copie","recent":[],"futur":1}"#).unwrap();
+        let s = read_prefs::<StartupPrefs>(&p).unwrap().unwrap();
+        assert_eq!(s.backup_dir, Some(PathBuf::from("E:\\Copie")));
+        assert_eq!(serde_json::to_value(&s).unwrap()["futur"], 1);
+        std::fs::write(&p, b"{\"backup_dir\": tronqu").unwrap();
+        assert!(read_prefs::<StartupPrefs>(&p).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

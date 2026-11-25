@@ -647,9 +647,8 @@ impl App {
             Some(Outcome::Cancel) => {}
             Some(Outcome::Pick(files)) => match b.kind {
                 Kind::Sounds { slot, .. } => {
-                    let mut prefs = crate::sessions::StartupPrefs::load();
-                    prefs.sound_dir = Some(b.dir.clone());
-                    prefs.save();
+                    let dir = b.dir.clone();
+                    crate::sessions::StartupPrefs::update(|prefs| prefs.sound_dir = Some(dir));
                     self.assign_files(slot, files);
                 }
                 Kind::Session => {

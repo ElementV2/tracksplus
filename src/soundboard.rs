@@ -1,8 +1,11 @@
 //! Modèle du soundboard (pages de pads), sauvegarde, et chargement des sons
 //! (WAV, AIFF, MP3, AAC/M4A, FLAC, OGG…) rééchantillonnés à la fréquence de la carte.
 
+use crate::project::{
+    Extra, FORMAT_VERSION, lenient, lenient_f32, lenient_f64, parse_json, write_format_version,
+};
 use crate::sampler::{MAX_PAGES, PADS_PER_PAGE, PadMode, PadParams, SAMPLE_PEAK, SampleData};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rubato::{FftFixedIn, Resampler};
 use serde::{Deserialize, Serialize};
@@ -50,27 +53,32 @@ pub struct Pad {
     pub path: PathBuf,
     #[serde(default)]
     pub color: u8,
-    #[serde(default)]
+    // Nombres : `null` (NaN écrit par serde_json) ne rend pas tout le soundboard illisible.
+    #[serde(default, deserialize_with = "lenient_f32")]
     pub gain_db: f32,
     /// Début (s).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub start: f64,
     /// Fin (s). `None` = fin du fichier.
     #[serde(default)]
     pub end: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub fade_in: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub fade_out: f64,
-    #[serde(default)]
+    /// Valeurs inconnues (version plus récente) : réglage par défaut, fichier protégé.
+    #[serde(default, deserialize_with = "lenient")]
     pub mode: PadMode,
     #[serde(default)]
     pub looped: bool,
     /// Nom de touche clavier (egui::Key::name).
     #[serde(default)]
     pub key: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub midi: Option<MidiKey>,
+    /// Champs inconnus (version plus récente) : réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Pad {
@@ -93,6 +101,7 @@ impl Pad {
             looped: false,
             key: None,
             midi: None,
+            extra: Extra::new(),
         }
     }
 
@@ -129,7 +138,13 @@ pub fn db_to_gain(db: f32) -> f32 {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Page {
     pub name: String,
+    /// Un pad illisible (version plus récente, fichier abîmé) laisse sa case vide au lieu de
+    /// rendre tout le soundboard illisible ; le fichier est alors protégé.
+    #[serde(deserialize_with = "lenient_pads")]
     pub pads: Vec<Option<Pad>>,
+    /// Champs inconnus (version plus récente) : réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Page {
@@ -137,12 +152,35 @@ impl Page {
         Self {
             name,
             pads: vec![None; PADS_PER_PAGE],
+            extra: Extra::new(),
         }
     }
 }
 
+/// Pads d'une page, chacun lu à part (voir `Page::pads`).
+fn lenient_pads<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Option<Pad>>, D::Error> {
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|v| crate::project::lenient(v).unwrap_or(None))
+        .collect())
+}
+
+/// Le fichier de soundboard de la session ne doit pas être écrasé : illisible, ou écrit par
+/// une version plus récente. Le soundboard affiché est celui d'alors (`snapshot`) : tant
+/// qu'il n'est pas modifié, rien n'est écrit ; à la première vraie modification, le fichier
+/// est d'abord mis de côté sous un autre nom (voir `Board::release_guard`).
+#[derive(Clone, Debug)]
+pub struct BoardGuard {
+    pub reason: String,
+    snapshot: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Board {
+    /// Version du format (toujours écrite à `FORMAT_VERSION`).
+    #[serde(default, serialize_with = "write_format_version")]
+    pub format_version: u32,
     pub cols: usize,
     pub rows: usize,
     pub pages: Vec<Page>,
@@ -157,17 +195,17 @@ pub struct Board {
     pub midi_port: Option<String>,
     /// Ancien « mode de la page » (le mode se règle maintenant pad par pad) : conservé
     /// pour relire les anciens fichiers, sans effet.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub default_mode: PadMode,
     /// LED du contrôleur.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub led_mode: crate::midi::LedMode,
     /// Port de sortie des LED (`None` = celui du contrôleur choisi).
     #[serde(default)]
     pub led_port: Option<String>,
     /// Disposition : calquée sur la grille du contrôleur quand il en a une (chaque case à
     /// l'écran = le pad physique au même endroit), sinon MIDI learn pad par pad.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub layout: PadLayout,
     /// Mode spectacle : pads jouables, édition verrouillée (suppression, déplacement,
     /// remplacement, réglages, pages). Gardé avec la session.
@@ -180,6 +218,12 @@ pub struct Board {
     /// Anti-rebond des pads « Lecture-Stop » (ms, 0 = désactivé).
     #[serde(default = "default_debounce")]
     pub debounce_ms: u32,
+    /// Champs inconnus (version plus récente) : réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: Extra,
+    /// Fichier de la session à ne pas écraser (voir `BoardGuard`).
+    #[serde(skip)]
+    pub guard: Option<BoardGuard>,
 }
 
 fn default_debounce() -> u32 {
@@ -215,6 +259,9 @@ impl Default for Board {
             locked: false,
             network_pads: Vec::new(),
             debounce_ms: default_debounce(),
+            format_version: FORMAT_VERSION,
+            extra: Extra::new(),
+            guard: None,
         }
     }
 }
@@ -278,12 +325,21 @@ impl Board {
 
     /// Soundboard de la session `dir` (vide s'il n'y en a pas encore). Les chemins des sons
     /// sont relatifs au dossier de la session dans le fichier : on les rend absolus.
+    /// Un fichier illisible est une erreur (jamais un soundboard vide qui l'écraserait) ; un
+    /// fichier d'une version plus récente est lu, protégé (`guard`).
     pub fn load_session(dir: &Path) -> Result<Self> {
         let path = dir.join(BOARD_FILE);
-        if !path.exists() {
-            return Ok(Board::default());
+        // `exists()` répondrait « absent » sur une erreur d'accès : le soundboard serait vu
+        // comme neuf, puis écrasé.
+        match path.try_exists() {
+            Ok(false) => return Ok(Board::default()),
+            Ok(true) => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("Accès à {}", path.display())));
+            }
         }
-        let mut b = Self::load(&path)?;
+        crate::project::clean_stale_temps(&path);
+        let (mut b, newer) = Self::load_checked(&path)?;
         let mut network = Vec::new();
         for page in &mut b.pages {
             for pad in page.pads.iter_mut().flatten() {
@@ -300,12 +356,62 @@ impl Board {
             }
         }
         b.network_pads = network;
+        if newer {
+            b.protect("soundboard enregistré par une version plus récente de TracksPlus".into());
+        }
         Ok(b)
     }
 
+    /// Protège le fichier de soundboard de la session tel qu'il est sur le disque (voir
+    /// `BoardGuard`), le soundboard affiché étant celui d'à présent.
+    pub fn protect(&mut self, reason: String) {
+        self.guard = None;
+        let snapshot = self.content_key();
+        self.guard = Some(BoardGuard { reason, snapshot });
+    }
+
+    /// Contenu propre à la session (sans les réglages de l'ordinateur), pour savoir si le
+    /// soundboard a vraiment été modifié.
+    fn content_key(&self) -> String {
+        let mut c = self.clone();
+        c.guard = None;
+        c.take_devices(&Board::default());
+        serde_json::to_string(&c).unwrap_or_default()
+    }
+
+    /// Soundboard protégé modifié depuis (voir `BoardGuard`).
+    pub fn changed_since_guard(&self) -> bool {
+        self.guard
+            .as_ref()
+            .is_some_and(|g| g.snapshot != self.content_key())
+    }
+
+    /// Fin de la protection, avant d'écrire un soundboard modifié : le fichier protégé de la
+    /// session `dir` est mis de côté (`soundboard.illisible-AAAAMMJJ-HHMMSS.json`, importable)
+    /// sans rien écraser. Renvoie son nouveau chemin (`None` : plus de fichier).
+    pub fn release_guard(&mut self, dir: &Path) -> Result<Option<PathBuf>> {
+        if self.guard.is_none() {
+            return Ok(None);
+        }
+        let path = dir.join(BOARD_FILE);
+        let aside = match crate::project::set_aside(&path, "illisible", true) {
+            Ok(p) => Some(p),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context("Mise de côté de l'ancien soundboard"));
+            }
+        };
+        self.guard = None;
+        Ok(aside)
+    }
+
     /// Enregistre le soundboard dans la session `dir`, avec des chemins relatifs pour les
-    /// sons du dossier de la session (la session reste valable si on la déplace).
+    /// sons du dossier de la session (la session reste valable si on la déplace). Refusé
+    /// tant que le fichier en place est protégé (`guard`).
     pub fn save_session(&self, dir: &Path) -> Result<()> {
+        if let Some(g) = &self.guard {
+            bail!("{} : le fichier n'est pas remplacé", g.reason);
+        }
         let mut b = self.clone();
         for page in &mut b.pages {
             for pad in page.pads.iter_mut().flatten() {
@@ -346,11 +452,28 @@ impl Board {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let s = std::fs::read_to_string(path)
+        Self::load_checked(path).map(|(b, _)| b)
+    }
+
+    /// Comme `load` ; `true` si le fichier vient d'une version plus récente (numéro de
+    /// format, ou valeurs inconnues remplacées par défaut) : à ne pas réécrire tel quel.
+    pub fn load_checked(path: &Path) -> Result<(Self, bool)> {
+        let s = crate::project::read_retrying(path)
             .with_context(|| format!("Lecture de {}", path.display()))?;
-        let mut b: Board = serde_json::from_str(&s).context("Fichier de soundboard invalide")?;
+        let (mut b, unknown): (Board, bool) = match parse_json(&s) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(v) = crate::project::newer_format(&s) {
+                    bail!(
+                        "soundboard enregistré par une version plus récente de TracksPlus (format {v})"
+                    );
+                }
+                return Err(anyhow::Error::new(e).context("Fichier de soundboard invalide"));
+            }
+        };
         b.normalize();
-        Ok(b)
+        let newer = unknown || b.format_version > FORMAT_VERSION;
+        Ok((b, newer))
     }
 
     pub fn load_default() -> Self {
@@ -360,13 +483,7 @@ impl Board {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(d) = path.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        let tmp = path.with_extension("tmp");
-        crate::project::write_synced(&tmp, serde_json::to_string_pretty(self)?.as_bytes())?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        crate::project::write_atomic(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn has_pads(&self) -> bool {
@@ -892,6 +1009,105 @@ fn compare_files(a: &Path, b: &Path, size: u64, full_max: u64, edge: u64) -> std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn board_with_pad(dir: &Path) -> Board {
+        let mut b = Board::default();
+        b.set(0, Some(Pad::new(dir.join("kick.wav"), 3)));
+        b
+    }
+
+    /// Soundboard illisible : erreur (jamais un soundboard vide sans message) ; le soundboard
+    /// affiché à la place, protégé, n'écrase jamais le fichier tant qu'il n'est pas modifié,
+    /// puis le met de côté (importable) avant d'écrire.
+    #[test]
+    fn unreadable_board_is_never_overwritten() {
+        let dir = fresh_dir("sbguard");
+        let path = dir.join(BOARD_FILE);
+        std::fs::write(&path, b"{\"cols\": 6, \"pages\": [ abime").unwrap();
+        assert!(Board::load_session(&dir).is_err());
+        let mut shown = Board::default();
+        shown.protect("soundboard illisible".into());
+        assert!(!shown.changed_since_guard());
+        // Réglages de l'ordinateur changés : ce n'est pas une modification du soundboard.
+        shown.midi_port = Some("Launchpad".into());
+        assert!(!shown.changed_since_guard());
+        // Écriture refusée (fermeture, copie de sécurité…).
+        assert!(shown.save_session(&dir).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"cols\": 6, \"pages\": [ abime"
+        );
+        // Vraie modification : l'ancien fichier est mis de côté, puis le nouveau écrit.
+        shown.set(0, Some(Pad::new(dir.join("kick.wav"), 0)));
+        assert!(shown.changed_since_guard());
+        let aside = shown.release_guard(&dir).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"{\"cols\": 6, \"pages\": [ abime"
+        );
+        assert!(aside.extension().is_some_and(|e| e == "json"));
+        shown.save_session(&dir).unwrap();
+        assert!(Board::load_session(&dir).unwrap().has_pads());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Soundboard d'une version plus récente : lu (valeurs inconnues → défaut, champs
+    /// inconnus gardés), mais protégé ; un NaN écrit en `null` ne le rend pas illisible.
+    #[test]
+    fn newer_board_is_loaded_but_protected() {
+        let dir = fresh_dir("sbnewer");
+        let path = dir.join(BOARD_FILE);
+        let mut b = board_with_pad(&dir);
+        b.save_session(&dir).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["format_version"], FORMAT_VERSION);
+        // NaN sérialisé par serde_json : `null`.
+        v["pages"][0]["pads"][0]["gain_db"] = serde_json::Value::Null;
+        v["pages"][0]["pads"][0]["futur"] = "x".into();
+        v["nouveau_reglage"] = 3.into();
+        std::fs::write(&path, v.to_string()).unwrap();
+        let back = Board::load_session(&dir).unwrap();
+        assert!(
+            back.guard.is_none(),
+            "champs inconnus seuls : pas de protection"
+        );
+        let pad = back.pad(0).unwrap();
+        assert_eq!((pad.gain_db, pad.color), (0.0, 3));
+        assert_eq!(pad.extra["futur"], "x");
+        back.save_session(&dir).unwrap();
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(again["nouveau_reglage"], 3);
+        assert_eq!(again["pages"][0]["pads"][0]["futur"], "x");
+
+        // Nouvelle variante de mode de pad, et pad illisible : lu, mais protégé.
+        v["pages"][0]["pads"][0]["mode"] = "Stutter".into();
+        v["pages"][0]["pads"][1] = serde_json::json!({ "pas": "un pad" });
+        std::fs::write(&path, v.to_string()).unwrap();
+        let back = Board::load_session(&dir).unwrap();
+        assert!(back.guard.is_some());
+        assert_eq!(back.pad(0).unwrap().mode, PadMode::Toggle);
+        assert!(back.pad(1).is_none());
+        assert!(back.save_session(&dir).is_err());
+        // Numéro de format plus récent : protégé aussi.
+        b.save_session(&dir).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["format_version"] = 42.into();
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert!(Board::load_session(&dir).unwrap().guard.is_some());
+        b = Board::load(&path).unwrap();
+        assert!(b.guard.is_none(), "import : pas de protection");
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn sounds_are_copied_into_the_session() {

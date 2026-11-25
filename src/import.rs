@@ -247,7 +247,13 @@ pub fn import_file(
         .open(&part_path)
         .and_then(|f| f.sync_all())
         .context("écriture sur le disque")?;
-    std::fs::rename(&part_path, &dst).context("écriture dans le dossier Audio")?;
+    // Jamais par-dessus un fichier existant (autre prise du même nom) : il serait perdu.
+    match crate::project::rename_no_replace(&part_path, &dst) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("un fichier « {file} » existe déjà dans le dossier Audio")
+        }
+        r => r.context("écriture dans le dossier Audio")?,
+    }
     part.0 = None;
     let name = src
         .file_stem()
