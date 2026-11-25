@@ -18,7 +18,7 @@ use std::io::BufWriter;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -401,6 +401,55 @@ pub fn wait_backups(timeout: Duration) {
     }
 }
 
+/// Arrêt d'urgence demandé (fin de session Windows, erreur fatale de l'interface) : voir
+/// `emergency_finish`. Définitif : le processus se termine juste après.
+static EMERGENCY: AtomicBool = AtomicBool::new(false);
+/// Threads d'écriture encore en vie (prises et copies de sécurité).
+static WRITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Compte un thread d'écriture tant qu'il vit (même s'il s'arrête sur une erreur).
+struct WriterAlive;
+
+impl WriterAlive {
+    fn new() -> Self {
+        WRITERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for WriterAlive {
+    fn drop(&mut self) {
+        WRITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Arrêt d'urgence, sans passer par l'interface (qui n'est peut-être plus là) : chaque
+/// thread d'écriture écrit ce qui est déjà arrivé dans ses tampons, ferme ses fichiers
+/// (en-têtes WAV à jour) et s'arrête, sans attendre la fin de la prise. Le journal de
+/// récupération reste en place : les prises sont réintégrées au prochain lancement.
+/// Attend au plus `timeout` ; `true` si tous les threads ont terminé. Sans prise en cours,
+/// rend la main tout de suite. Ne s'annule pas : à n'appeler qu'à la fin du processus.
+pub fn emergency_finish(timeout: Duration) -> bool {
+    if WRITERS.load(Ordering::Acquire) == 0 {
+        return true;
+    }
+    EMERGENCY.store(true, Ordering::Release);
+    let t0 = Instant::now();
+    while WRITERS.load(Ordering::Acquire) > 0 {
+        if t0.elapsed() > timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Fin de la boucle d'écriture : à l'arrêt, quand plus rien n'arrive (ou que rien n'a
+/// avancé depuis `STALL_TIMEOUT`) ; en urgence, dès que ce qui était arrivé est écrit.
+fn writer_should_exit(stop: bool, emergency: bool, drained: bool, stalled: bool) -> bool {
+    emergency || (stop && (drained || stalled))
+}
+
 /// Erreurs signalées avant le démarrage du thread (copie impossible…) ajoutées à celles
 /// du thread principal.
 fn errors_merge(into: &Errors, early: &Errors) {
@@ -504,9 +553,12 @@ impl Recorder {
         let stop2 = stop.clone();
         let errors: Errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let errors2 = errors.clone();
+        // Compté avant le départ du thread : un arrêt d'urgence juste après l'attend aussi.
+        let alive = WriterAlive::new();
         let handle = std::thread::Builder::new()
             .name("tracksplus-disk-writer".into())
             .spawn(move || {
+                let _alive = alive;
                 raise_disk_thread_priority();
                 let move_aside = backup_dir.is_some();
                 if let Some(d) = &backup_dir {
@@ -786,12 +838,16 @@ fn run(
             }
         }
 
-        if stop.load(Ordering::Acquire) {
+        let emergency = EMERGENCY.load(Ordering::Acquire);
+        let stopping = stop.load(Ordering::Acquire);
+        if stopping || emergency {
             let drained = lanes
                 .iter()
                 .all(|l| l.cons.is_abandoned() && l.cons.is_empty());
-            // On n'abandonne que si plus rien n'arrive (carte débranchée, etc.).
-            if drained || last_progress.elapsed() > STALL_TIMEOUT {
+            // On n'abandonne que si plus rien n'arrive (carte débranchée, etc.), sauf en
+            // urgence : ce qui était arrivé vient d'être écrit, on ferme les fichiers.
+            let stalled = last_progress.elapsed() > STALL_TIMEOUT;
+            if writer_should_exit(stopping, emergency, drained, stalled) {
                 break;
             }
         }
@@ -826,6 +882,21 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_exit_waits_for_the_end_except_in_emergency() {
+        // Prise en cours : on continue, même si la source se tait un moment.
+        assert!(!writer_should_exit(false, false, false, true));
+        assert!(!writer_should_exit(false, false, true, false));
+        // Arrêt : seulement une fois tout écrit, ou si plus rien n'avance.
+        assert!(!writer_should_exit(true, false, false, false));
+        assert!(writer_should_exit(true, false, true, false));
+        assert!(writer_should_exit(true, false, false, true));
+        // Urgence (fin de session Windows, erreur fatale) : tout de suite, prise en cours
+        // ou non, même si l'entrée envoie encore du son.
+        assert!(writer_should_exit(false, true, false, false));
+        assert!(writer_should_exit(true, true, false, false));
+    }
     use crate::project::{Clip, Project};
     use crate::render::{PeakData, TrackRenderer};
     use parking_lot::RwLock;

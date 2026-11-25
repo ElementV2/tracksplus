@@ -674,8 +674,25 @@ impl App {
         for p in paths {
             app.cache.request(&p, Some(&cc.egui_ctx));
         }
+        install_crash_safety(cc);
+        // Relance automatique après une erreur fatale : on revient dans la même session,
+        // même si aucune prise n'était en cours.
+        let relaunched = crate::shutdown::relaunched();
+        let reopen = recovery::interrupted_session().or_else(|| {
+            if relaunched {
+                recovery::last_session()
+            } else {
+                None
+            }
+        });
+        if relaunched {
+            app.notify(
+                "TracksPlus a redémarré tout seul après une erreur interne (détails dans crash.log) : vérifiez la session et relancez l'enregistrement si besoin",
+                true,
+            );
+        }
         // Enregistrement interrompu lors de la dernière utilisation : on restaure.
-        if let Some(path) = recovery::interrupted_session() {
+        if let Some(path) = reopen {
             // Protégé : une session illisible ne doit pas empêcher l'application de démarrer
             // (sinon elle planterait à chaque lancement, le journal étant toujours là).
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4745,6 +4762,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.now = ctx.input(|i| i.time);
+            self.crash_safety_tick(ctx);
             self.engine.collect_garbage();
             if self.cache.poll() {
                 self.sb.midi_dirty = true;
@@ -4781,10 +4799,23 @@ impl eframe::App for App {
                 true,
             );
         }
-        // Hors du garde-fou : le message d'erreur et la confirmation de fermeture doivent
-        // s'afficher même si le reste de l'interface a planté.
-        self.toast_ui(&ctx);
-        self.confirm_close_dialog(&ctx);
+        // À part : le message d'erreur et la confirmation de fermeture doivent s'afficher
+        // même si le reste de l'interface a planté. Chacun a son propre garde-fou : une
+        // erreur ici ne doit pas non plus remonter jusqu'à eframe (fin du processus).
+        let toast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.toast_ui(&ctx)));
+        if toast.is_err() {
+            // Le message lui-même pose problème : on le retire (sinon erreur à chaque image).
+            self.toast = None;
+        }
+        let dialog = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.confirm_close_dialog(&ctx)
+        }));
+        if dialog.is_err() {
+            self.notify(
+                "Erreur interne de la confirmation de fermeture (l'audio continue)",
+                true,
+            );
+        }
         // 60 images/s quand quelque chose bouge (son, transport, animation), 10 sinon
         // (`logic` repasse toutes les 100 ms) : pas de calcul inutile à l'arrêt.
         if self.needs_animation() {
@@ -4793,6 +4824,117 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Fermeture voulue : pas de relance automatique, même si eframe plante ensuite.
+        crate::shutdown::mark_exit_requested();
+        self.shutdown();
+    }
+}
+
+impl Drop for App {
+    /// Normalement déjà fait par `on_exit`. Sinon (erreur fatale du rendu, de winit ou
+    /// d'eframe qui remonte jusqu'à `main`, fin anormale de la boucle d'événements),
+    /// l'application est détruite pendant la remontée de l'erreur : c'est la dernière
+    /// occasion d'arrêter la prise, de finaliser ses fichiers et de sauvegarder la session.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Garde-fous du processus, à l'ouverture de la fenêtre : erreurs de la carte graphique
+/// (qui feraient sinon planter toute l'application) et fin de session Windows.
+fn install_crash_safety(cc: &eframe::CreationContext<'_>) {
+    if let Some(rs) = &cc.wgpu_render_state {
+        // Par défaut, wgpu plante sur toute erreur non rattrapée (mémoire graphique
+        // épuisée, erreur de validation) : on la note et l'application continue.
+        rs.device
+            .on_uncaptured_error(Arc::new(|e: eframe::wgpu::Error| {
+                // Filtre par genre d'erreur : une erreur répétée à chaque image (avec des
+                // détails qui changent) n'écrit qu'une ligne par seconde.
+                let key = match &e {
+                    eframe::wgpu::Error::OutOfMemory { .. } => "wgpu-out-of-memory",
+                    eframe::wgpu::Error::Validation { .. } => "wgpu-validation",
+                    eframe::wgpu::Error::Internal { .. } => "wgpu-internal",
+                };
+                crate::log_error(key, &format!("Erreur de la carte graphique : {e}"));
+            }));
+        // Pilote réinitialisé : egui ne recrée pas le contexte graphique, l'affichage ne
+        // reviendra pas. La prise, elle, continue.
+        rs.device.set_device_lost_callback(|reason, msg| {
+            if reason != eframe::wgpu::DeviceLostReason::Destroyed {
+                crate::shutdown::set_gpu_lost();
+                crate::log_error(
+                    "wgpu-device-lost",
+                    &format!("Carte graphique perdue ({reason:?}) : {msg}"),
+                );
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(h) = cc.window_handle()
+            && let RawWindowHandle::Win32(w) = h.as_raw()
+        {
+            crate::shutdown::install(w.hwnd.get());
+        }
+    }
+}
+
+impl App {
+    /// Toutes les 100 ms (`logic`) : état partagé avec la fin de session Windows et la fin
+    /// du processus, messages des incidents survenus hors de l'interface.
+    fn crash_safety_tick(&mut self, ctx: &egui::Context) {
+        let busy = self.is_recording() || self.finishing.is_some();
+        crate::shutdown::set_take_in_progress(busy);
+        crate::shutdown::sync_block_reason(busy);
+        // Fermeture acceptée (pas de confirmation à demander) : une erreur pendant la
+        // fermeture ne doit pas relancer l'application.
+        if !busy && self.export_job.is_none() && ctx.input(|i| i.viewport().close_requested()) {
+            crate::shutdown::mark_exit_requested();
+        }
+        if crate::shutdown::session_ended() {
+            // Windows ferme la session : les prises ont été finalisées en urgence. Si le
+            // processus n'est pas encore tué, on termine proprement (prises réintégrées,
+            // session sauvegardée) et on ferme.
+            crate::shutdown::mark_exit_requested();
+            self.shutdown();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if crate::shutdown::take_save_request() {
+            // Arrêt de Windows annoncé : session et soundboard sauvegardés tout de suite
+            // (la prise en cours, elle, est protégée par son journal).
+            self.autosave();
+        }
+        if crate::shutdown::take_shutdown_refused() {
+            self.notify(
+                "Windows a demandé l'arrêt de l'ordinateur pendant l'enregistrement : arrêt bloqué, la prise continue. Arrêtez la prise avant d'éteindre",
+                true,
+            );
+        }
+        if crate::shutdown::take_gpu_lost() {
+            self.notify(
+                "Affichage perdu (carte graphique réinitialisée) : la prise continue. Arrêtez-la au clavier (deux appuis sur la touche d'arrêt), puis relancez TracksPlus",
+                true,
+            );
+        }
+    }
+
+    /// Fermeture propre, une seule fois (`on_exit`, ou destruction de l'application après
+    /// une erreur fatale). Protégée : si elle échoue en route, les prises encore en
+    /// écriture sont au moins finalisées (le journal permet de les réintégrer ensuite).
+    fn shutdown(&mut self) {
+        if !crate::shutdown::begin_shutdown() {
+            return;
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown_steps()));
+        if res.is_err() {
+            crate::recorder::emergency_finish(std::time::Duration::from_secs(10));
+            crate::recorder::wait_backups(std::time::Duration::from_secs(10));
+        }
+    }
+
+    fn shutdown_steps(&mut self) {
         self.midi.leds_off(self.board.led_mode);
         self.stop();
         self.finish_export_for_exit();

@@ -37,7 +37,9 @@ id3 = { version = "1.17.4", default-features = false }
 # Sans cette option, cpal laisse le callback en priorité normale (risque de décrochages
 # dès que l'interface ou l'antivirus travaillent).
 cpal = { version = "0.18.2", features = ["realtime"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Shutdown"] }
+# Fenêtre principale (HWND) : arrêt de Windows bloqué pendant une prise (voir shutdown.rs).
+raw-window-handle = "0.6.2"
 
 [dev-dependencies]
 # Tests : aucune allocation dans les callbacks audio (règle n°1 du temps réel).
