@@ -1125,6 +1125,26 @@ impl App {
     }
 
     /// Alertes en direct pendant un enregistrement (bandeau rouge en haut).
+    /// Prise illisible pendant la lecture (fichier absent, déplacé ou abîmé) : elle est
+    /// jouée en silence, on le dit au lieu de laisser croire à une piste vide.
+    fn poll_play_errors(&mut self) {
+        let errs: Vec<String> = match &self.player {
+            Some(p) => p.errors.try_iter().take(8).collect(),
+            None => return,
+        };
+        if let Some(first) = errs.first() {
+            let more = if errs.len() > 1 {
+                format!(" (+{} autre(s))", errs.len() - 1)
+            } else {
+                String::new()
+            };
+            self.notify(
+                format!("Lecture : prise illisible, jouée en silence — {first}{more}"),
+                true,
+            );
+        }
+    }
+
     pub fn live_alerts(&mut self) -> Vec<String> {
         let mut alerts = Vec::new();
         if !self.is_recording() {
@@ -4021,6 +4041,7 @@ impl eframe::App for App {
             self.complete_journal();
             self.poll_finishing(false);
             self.poll_save_as();
+            self.poll_play_errors();
             self.poll_import();
             self.soundboard_background(ctx);
             self.update_background(ctx);

@@ -337,7 +337,8 @@ impl WavSource {
         let frames = reader.duration() as u64;
         Ok(Self {
             float: spec.sample_format == SampleFormat::Float,
-            scale: 1.0 / (1u64 << (spec.bits_per_sample.max(1) - 1)) as f32,
+            // En-tête abîmé : nombre de bits borné (pas de décalage hors limites).
+            scale: 1.0 / (1u64 << (spec.bits_per_sample.clamp(1, 32) - 1)) as f32,
             channels: spec.channels.max(1) as usize,
             reader,
             pos: 0,
@@ -384,11 +385,16 @@ impl WavSource {
         let errs = std::cell::Cell::new(0u64);
         let n = if self.float {
             fill(
-                self.reader.samples::<f32>().take(total).map(|s| {
-                    s.unwrap_or_else(|_| {
+                self.reader.samples::<f32>().take(total).map(|s| match s {
+                    // NaN / infini dans un fichier flottant abîmé : silence (ils
+                    // contamineraient mixage, vumètres et formes d'onde).
+                    // Bornés à +24 dB : la somme de deux canaux ne peut pas déborder.
+                    Ok(v) if v.is_finite() => v.clamp(-16.0, 16.0),
+                    Ok(_) => 0.0,
+                    Err(_) => {
                         errs.set(errs.get() + 1);
                         0.0
-                    })
+                    }
                 }),
                 fc,
                 out_ch,

@@ -52,6 +52,10 @@ pub struct Clip {
 /// Longueur minimale d'une prise après rognage ou coupe (en échantillons).
 pub const MIN_CLIP: u64 = 64;
 
+/// Position maximale acceptée dans une session (≈ 2,9 ans à 192 kHz) : un fichier abîmé
+/// ou fabriqué ne peut pas provoquer de débordement dans les calculs de positions.
+pub const MAX_POS: u64 = 1 << 44;
+
 impl Clip {
     pub fn end(&self) -> u64 {
         self.start + self.len
@@ -440,9 +444,13 @@ impl Project {
     /// Corrige un fichier incohérent (ancien, partiel ou modifié à la main) : fréquence
     /// nulle, identifiant suivant déjà utilisé, fondus plus longs que la prise.
     pub fn validate(&mut self) {
-        if self.sample_rate == 0 {
+        if !(8_000..=768_000).contains(&self.sample_rate) {
             self.sample_rate = DEFAULT_SAMPLE_RATE;
         }
+        for m in &mut self.markers {
+            m.pos = m.pos.min(MAX_POS);
+        }
+        self.renumber_if_broken();
         let max_id = self
             .tracks
             .iter()
@@ -450,12 +458,16 @@ impl Project {
             .chain(self.markers.iter().map(|m| m.id))
             .max()
             .unwrap_or(0);
-        self.next_id = self.next_id.max(max_id + 1);
+        self.next_id = self.next_id.max(max_id.saturating_add(1));
         for (i, t) in self.tracks.iter_mut().enumerate() {
             if t.name.trim().is_empty() {
                 t.name = format!("Piste {}", i + 1);
             }
             for c in &mut t.clips {
+                c.start = c.start.min(MAX_POS);
+                c.offset = c.offset.min(MAX_POS);
+                c.len = c.len.min(MAX_POS);
+                c.src_len = c.src_len.min(MAX_POS);
                 c.clamp_fades();
                 // Un fichier de session partagé ne doit jamais faire lire ou écrire hors du
                 // dossier Audio/ (« ../../ », chemin absolu, partage réseau \\hôte\…).
@@ -466,6 +478,36 @@ impl Project {
                 }
             }
         }
+    }
+
+    /// Identifiants en double ou démesurés (fichier abîmé ou fabriqué) : tout est
+    /// renuméroté, sinon les prises se confondraient et le compteur déborderait.
+    fn renumber_if_broken(&mut self) {
+        let ids: Vec<u64> = self
+            .tracks
+            .iter()
+            .flat_map(|t| std::iter::once(t.id).chain(t.clips.iter().map(|c| c.id)))
+            .chain(self.markers.iter().map(|m| m.id))
+            .collect();
+        let unique: HashSet<u64> = ids.iter().copied().collect();
+        if unique.len() == ids.len() && ids.iter().all(|&i| i < MAX_POS) && self.next_id < MAX_POS {
+            return;
+        }
+        let mut next = 1;
+        let mut alloc = || {
+            next += 1;
+            next - 1
+        };
+        for t in &mut self.tracks {
+            t.id = alloc();
+            for c in &mut t.clips {
+                c.id = alloc();
+            }
+        }
+        for m in &mut self.markers {
+            m.id = alloc();
+        }
+        self.next_id = alloc();
     }
 
     /// "Enregistrer sous" : copie les fichiers audio dans le nouveau dossier.

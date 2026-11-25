@@ -4,6 +4,8 @@ mod app;
 mod audio;
 mod encode;
 mod export;
+#[cfg(test)]
+mod fuzz_tests;
 mod import;
 mod midi;
 mod player;

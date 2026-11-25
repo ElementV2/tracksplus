@@ -119,6 +119,8 @@ pub struct Player {
     pub audible: Arc<Vec<AtomicBool>>,
     /// Niveaux de lecture par piste (même indexation).
     pub meters: Arc<TrackMeters>,
+    /// Prises illisibles pendant la lecture (fichier absent ou abîmé : jouées en silence).
+    pub errors: crossbeam_channel::Receiver<String>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -130,6 +132,7 @@ struct Mixer {
     pos: u64,
     tbuf: Vec<f32>,
     mix: Vec<f32>,
+    errors: crossbeam_channel::Sender<String>,
 }
 
 impl Mixer {
@@ -147,6 +150,9 @@ impl Mixer {
             let ch = t.channels();
             let buf = &mut self.tbuf[..BLOCK * ch];
             t.render(self.pos, buf);
+            for e in t.take_errors() {
+                let _ = self.errors.send(e);
+            }
             self.meters.store(*i, self.pos, buf, ch);
             if ch == 2 {
                 for (m, s) in self.mix.iter_mut().zip(buf.iter()) {
@@ -191,7 +197,9 @@ impl Player {
             .filter(|(_, t)| !t.is_empty())
             .collect();
         let meters = Arc::new(TrackMeters::new(pos, project.tracks.len()));
+        let (err_tx, errors) = crossbeam_channel::unbounded();
         let mut mixer = Mixer {
+            errors: err_tx,
             tracks,
             audible: audible.clone(),
             meters: meters.clone(),
@@ -222,6 +230,7 @@ impl Player {
             Self {
                 audible,
                 meters,
+                errors,
                 stop,
                 handle: Some(handle),
             },
