@@ -242,7 +242,10 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
 ## Utilisation avec Dante
 
 1. Réglages → Carte son : pilote **ASIO** (Windows) ou **CoreAudio** (macOS) → **Dante
-   Virtual Soundcard**, à la même fréquence que le réseau Dante.
+   Virtual Soundcard**, à la même fréquence que le réseau Dante. La DVS doit être démarrée
+   en mode **ASIO** (en mode WDM, ses canaux sont dans Windows : choisissez alors le pilote
+   WASAPI). Tous les pilotes ASIO installés sont listés, même quand un autre est en service ;
+   « Actualiser la liste » relit les cartes après un changement de mode de la DVS.
 2. Multipiste : bouton **+** pour chaque entrée (mono ou stéréo), renommez, armez, ⏺.
 3. Réglages → Carte son : sortie Soundboard sur la paire Dante dédiée aux pads.
 
@@ -255,16 +258,35 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
   débranché ne gêne jamais l'enregistrement principal.
 - **Fichiers BWF** : chaque prise porte son heure d'enregistrement (TimeReference) et le nom
   de sa piste ; Pro Tools, Nuendo ou Reaper peuvent la poser à son heure réelle.
-- **Carte son perdue pendant une prise** (DVS arrêté, câble USB, horloge Dante perdue : plus
-  aucun échantillon depuis 3 s) : comme Pro Tools, Cubase / Nuendo ou REAPER, la prise est
-  arrêtée et enregistrée telle quelle, avec un message clair. Puis la carte est **reconnectée
-  automatiquement** dès qu'elle revient (les pads en cours sur une autre sortie ne sont pas
-  coupés).
+- **Signal interrompu pendant une prise** (horloge Dante perdue quelques secondes, sans
+  erreur du pilote) : la prise **reste ouverte**, avec l'alerte rouge. Au retour du signal, le
+  trou est comblé par du silence : la suite reste à sa place, à l'heure réelle. Trou plus long
+  que la réserve des tampons : la prise est coupée là et relancée à la bonne place.
+- **Carte son perdue pendant une prise** (DVS arrêtée, câble USB débranché, plus de 20 s sans
+  signal) : la prise est arrêtée et enregistrée telle quelle, puis **relancée toute seule** sur
+  les mêmes pistes dès le retour de la carte, posée à l'heure réelle (« RELANCE DE LA PRISE EN
+  ATTENTE » dans le transport ; Stop ou Échap l'annule ; abandon après 3 min). Désactivable :
+  Réglages → Enregistrement.
+- **Chaque flux surveillé en permanence** (entrée, sorties, soundboard, monitoring), même hors
+  prise et fenêtre réduite : seul le flux mort est rouvert, ceux qui marchent ne sont jamais
+  coupés. Carte rebranchée sur un autre port USB retrouvée ; contrôleur MIDI rebranché
+  reconnecté tout seul.
+- **Journal des incidents** : chaque incident (signal perdu, trou comblé, carte perdue ou
+  reconnectée, prise relancée) est noté avec l'heure dans `Journal des incidents.txt`, dans le
+  dossier de la session, et un repère est posé sur la timeline à l'endroit concerné.
 - **Disque qui revient** (clé rebranchée, place libérée) : la piste reprend toute seule,
   calée sur les autres.
 - **Aucune prise perdue** : fichiers lisibles même après un crash ou une coupure de courant.
   Au redémarrage, la session est rouverte, les fichiers réparés et les prises replacées sur
-  la timeline.
+  la timeline. Après une erreur grave, TracksPlus termine proprement les prises en cours et
+  se relance tout seul dans la session. Pendant une prise, Windows ne peut pas s'éteindre ni
+  fermer la session sans que les prises soient d'abord terminées et sauvegardées.
+- **Sessions protégées** : un fichier de session ou de soundboard illisible n'est jamais
+  écrasé (il est mis de côté) ; les versions précédentes sont gardées et reprises
+  automatiquement. Une session enregistrée par une version plus récente s'ouvre en lecture
+  seule.
+- **Fichiers piégés ou abîmés** (sons des pads, imports) : décodés à part, mémoire bornée :
+  ils ne peuvent pas faire planter l'application.
 - **Disque en retard** : 4 à 15 s de réserve par piste ; au-delà, du silence remplace les
   trames manquantes, la piste reste calée. Alerte immédiate, et dès 30 min de place restante.
 - **Prises longues** : au-delà de 2 Go, la prise continue sans coupure dans `nom_p2.wav`,
@@ -285,7 +307,9 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
 - Une erreur d'interface n'arrête jamais l'audio (journalisée dans `crash.log`, dossier
   `%APPDATA%\TracksPlus`).
 - Un export annulé ne laisse pas de fichier incomplet.
-- Mises à jour vérifiées (empreinte SHA-256) avant installation, après une sauvegarde.
+- Mises à jour **signées par l'éditeur** et vérifiées (signature Ed25519 et empreinte
+  SHA-256) avant installation, après une sauvegarde : une version non signée n'est jamais
+  installée automatiquement.
 - Une seule instance : relancer TracksPlus ramène la fenêtre déjà ouverte.
 
 ## Préparer l'ordinateur avant un spectacle
