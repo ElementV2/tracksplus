@@ -1,3 +1,7 @@
 /target
 *.tmp
 /dist
+
+# Clé privée de signature des versions (jamais sur GitHub)
+/.signing/
+*signing-key*

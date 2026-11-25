@@ -12,7 +12,8 @@
 #
 # Prérequis : GitHub CLI connecté (winget install GitHub.cli, puis gh auth login), les
 # prérequis de scripts\package-windows.ps1, et la clé privée de signature de l'éditeur
-# (%USERPROFILE%\.tracksplus\release-signing-key.txt, ou $env:TRACKSPLUS_SIGNING_KEY).
+# (.signing\release-signing-key.txt dans ce dossier, jamais envoyé sur GitHub ; sinon
+# %USERPROFILE%\.tracksplus\release-signing-key.txt, ou $env:TRACKSPLUS_SIGNING_KEY).
 # Chaque fichier publié est accompagné de sa signature (<fichier>.sig) : l'application
 # refuse toute mise à jour qui n'est pas signée par cette clé. Sans elle, plus aucune mise
 # à jour automatique n'est possible : gardez-en une copie de sauvegarde hors de ce PC.
@@ -25,7 +26,12 @@ Set-Location $root
 
 if (-not (Test-Path $Notes)) { throw "Notes de version introuvables : $Notes" }
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "GitHub CLI introuvable : winget install GitHub.cli" }
-$key = if ($env:TRACKSPLUS_SIGNING_KEY) { $env:TRACKSPLUS_SIGNING_KEY } else { Join-Path $env:USERPROFILE '.tracksplus\release-signing-key.txt' }
+$key = if ($env:TRACKSPLUS_SIGNING_KEY) { $env:TRACKSPLUS_SIGNING_KEY }
+       elseif (Test-Path (Join-Path $root '.signing\release-signing-key.txt')) { Join-Path $root '.signing\release-signing-key.txt' }
+       else { Join-Path $env:USERPROFILE '.tracksplus\release-signing-key.txt' }
+# La clé ne doit jamais partir sur GitHub.
+git check-ignore -q $key 2>$null
+if ($key.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $LASTEXITCODE -ne 0) { throw "La clé $key n'est pas exclue de Git (.gitignore)" }
 if (-not (Test-Path $key)) { throw "Clé de signature introuvable : $key (sans elle, les mises à jour seraient refusées)" }
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
@@ -37,8 +43,12 @@ if (git status --porcelain) { throw "Des modifications ne sont pas commitées." 
 git fetch --quiet origin
 $branch = git rev-parse --abbrev-ref HEAD
 if ((git rev-parse HEAD) -ne (git rev-parse "origin/$branch")) { throw "La branche $branch n'est pas poussée sur GitHub." }
-gh release view $tag 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) { throw "La release $tag existe déjà : montez la version dans Cargo.toml." }
+# (« release not found » attendu : jamais une erreur bloquante, Windows PowerShell 5.1 compris.)
+$ErrorActionPreference = 'Continue'
+gh release view $tag *> $null
+$exists = $LASTEXITCODE -eq 0
+$ErrorActionPreference = 'Stop'
+if ($exists) { throw "La release $tag existe déjà : montez la version dans Cargo.toml." }
 
 & (Join-Path $PSScriptRoot 'package-windows.ps1')
 if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "La construction du paquet a échoué" }
