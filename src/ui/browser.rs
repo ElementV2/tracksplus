@@ -616,8 +616,9 @@ impl App {
                 Kind::Session => {
                     if let Some(f) = files.first() {
                         self.stop();
-                        self.autosave();
-                        self.load_session(f);
+                        if self.save_before_leaving() {
+                            self.load_session(f);
+                        }
                     }
                 }
             },

@@ -248,6 +248,8 @@ pub struct SbState {
     pub copies: Vec<crate::ui::soundboard::PendingCopy>,
     /// Pad renommé directement dans la grille (double-clic) : emplacement, nom en cours.
     pub renaming: Option<(u16, String)>,
+    /// Dernier pad supprimé (emplacement, pad) : Ctrl+Z dans le soundboard le rétablit.
+    pub deleted: Option<(u16, crate::soundboard::Pad)>,
 }
 
 pub struct App {
@@ -298,6 +300,8 @@ pub struct App {
     pub disk_stalled: bool,
     /// Dernière alerte « sauvegarde impossible » (pour ne pas la répéter en boucle).
     pub save_error_at: f64,
+    /// Dernier changement de session refusé faute de sauvegarde (voir `save_before_leaving`).
+    pub leave_anyway_at: f64,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
     /// La prise en cours est faite en écoutant les pistes existantes.
@@ -478,6 +482,7 @@ impl App {
             save_as_job: None,
             disk_stalled: false,
             save_error_at: f64::NEG_INFINITY,
+            leave_anyway_at: f64::NEG_INFINITY,
             rec_latency: 0,
             rec_overdub: false,
             journal_pending: None,
@@ -1425,9 +1430,9 @@ impl App {
 
     /// Enregistre le soundboard : réglages du contrôleur pour l'ordinateur, pads dans la
     /// session (qui est créée sur le disque si c'est son premier contenu).
-    pub fn save_board_now(&mut self) {
+    pub fn save_board_now(&mut self) -> bool {
         if self.board_changed.take().is_none() {
-            return;
+            return true;
         }
         if let Err(e) = self.board.save_devices() {
             self.notify(
@@ -1436,18 +1441,53 @@ impl App {
             );
         }
         if !self.board.has_pads() && !self.project.file_path().exists() {
-            return;
+            return true;
         }
         if !self.project.file_path().exists() {
             if let Err(e) = self.project.save() {
                 self.notify(format!("{e:#}"), true);
-                return;
+                self.board_changed = Some(self.now + 29.0);
+                return false;
             }
             recovery::remember_session(&self.project);
         }
         if let Err(e) = self.board.save_session(&self.project.dir) {
             self.notify(format!("Soundboard non sauvegardé : {e:#}"), true);
+            // Toujours à sauvegarder : nouvel essai à la prochaine sauvegarde automatique.
+            self.board_changed = Some(self.now + 29.0);
+            return false;
         }
+        true
+    }
+
+    /// Avant d'ouvrir ou de créer une autre session : tout est sauvegardé, sinon on
+    /// n'abandonne pas la session en cours (disque plein, clé retirée…). Un second essai
+    /// dans les 10 s passe outre, pour ne jamais rester bloqué.
+    pub fn save_before_leaving(&mut self) -> bool {
+        let mut ok = true;
+        if self.project.dirty
+            && self.worth_saving()
+            && let Err(e) = self.project.save()
+        {
+            self.project.dirty = true;
+            ok = false;
+            self.notify(format!("Sauvegarde de la session impossible : {e:#}"), true);
+        }
+        ok &= self.save_board_now();
+        if ok {
+            return true;
+        }
+        if self.now - self.leave_anyway_at < 10.0 {
+            self.leave_anyway_at = f64::NEG_INFINITY;
+            return true;
+        }
+        self.leave_anyway_at = self.now;
+        self.notify(
+            "Session en cours non sauvegardée : changement annulé. Recommencez pour \
+             changer quand même (les modifications non sauvegardées seront perdues).",
+            true,
+        );
+        false
     }
 
     /// Soundboard de la session qui vient d'être ouverte ou créée (les réglages du
@@ -1478,6 +1518,7 @@ impl App {
     /// Remplace le soundboard affiché (sons à charger, MIDI, sortie).
     fn set_board(&mut self, b: Board) {
         self.engine.pad(PadCmd::StopAll);
+        self.sb.deleted = None;
         self.board = b;
         self.retain_sounds();
         self.board_changed = None;
@@ -1581,6 +1622,12 @@ impl App {
         self.view.want_scroll_y = Some(0.0);
         self.selection = None;
         self.selected_tracks.clear();
+        // Les numéros de pistes recommencent à 1 dans chaque session : rien de l'ancienne
+        // ne doit viser une piste de la nouvelle.
+        self.expanded_tracks.clear();
+        self.renaming_track = None;
+        self.ruler_anchor = None;
+        self.clip_drag = None;
     }
 
     /// « Ouvrir une session… » : explorateur intégré (la session choisie s'ouvre).
@@ -1710,7 +1757,21 @@ impl App {
                         true,
                     );
                 }
-                self.set_board(b);
+                // Même soundboard, chemins vers la copie : les pads en cours continuent de
+                // jouer (pas de StopAll), page et sélection sont gardées.
+                for (slot, pad) in b.all_pads() {
+                    if let Some(old) = self.board.pad(slot) {
+                        self.cache.alias(&old.path, &pad.path);
+                    }
+                }
+                self.board = b;
+                self.retain_sounds();
+                let paths: Vec<PathBuf> =
+                    self.board.all_pads().map(|(_, p)| p.path.clone()).collect();
+                for p in paths {
+                    self.cache.request(&p, None);
+                }
+                self.sb.midi_dirty = true;
                 self.board_changed = Some(self.now);
                 self.save_board_now();
                 recovery::remember_session(&self.project);
@@ -1753,7 +1814,9 @@ impl App {
 
     fn create_session(&mut self, d: NewSessionDialog) {
         self.stop();
-        self.autosave();
+        if !self.save_before_leaving() {
+            return;
+        }
         let name = project::sanitize(&d.name);
         let dir = d.parent.join(&name);
         if dir.join(format!("{name}.{PROJECT_EXT}")).exists() {
@@ -1909,7 +1972,7 @@ impl App {
             return;
         }
         self.close_dialogs();
-        let s = self.export_last.clone().unwrap_or_else(|| ExportSettings {
+        let mut s = self.export_last.clone().unwrap_or_else(|| ExportSettings {
             sample_rate: self.project.sample_rate,
             depth: BitDepth::I24,
             stems: true,
@@ -1920,6 +1983,11 @@ impl App {
             range: None,
             ..Default::default()
         });
+        // Dossier mémorisé relatif à la session : celui d'une autre session (et ses
+        // exports) n'est jamais réutilisé ni écrasé.
+        if s.dir.is_relative() {
+            s.dir = self.project.dir.join(&s.dir);
+        }
         let with_audio: HashSet<u64> = self
             .project
             .tracks
@@ -2032,6 +2100,8 @@ impl App {
             });
             if redo {
                 self.redo();
+            } else if undo && self.tab == 1 && self.sb.deleted.is_some() {
+                self.restore_deleted_pad();
             } else if undo {
                 self.undo();
             }
@@ -2535,8 +2605,11 @@ impl App {
                 .font(t::semibold(10.5))
                 .color(t::TEXT_3),
         );
+        // Sélecteur de fichier bloquant puis arrêt des pads : jamais pendant le spectacle.
+        let idle = self.is_stopped() && self.pads_status().0 == 0;
         if ui
-            .button("Importer un soundboard…")
+            .add_enabled(idle, egui::Button::new("Importer un soundboard…"))
+            .on_disabled_hover_text("Arrêtez la lecture, la prise et les pads d'abord")
             .on_hover_text("Reprend les pads d'un autre soundboard (ancien soundboard, autre session) ; ses sons sont copiés dans cette session")
             .clicked()
         {
@@ -3786,9 +3859,15 @@ impl App {
                 RangeChoice::Selection => self.selection,
                 RangeChoice::All => None,
             };
+            let dir = match s.dir.strip_prefix(&self.project.dir) {
+                Ok(rel) => rel.to_path_buf(),
+                // Dossier choisi explicitement hors de la session : gardé tel quel.
+                Err(_) => s.dir.clone(),
+            };
             self.export_last = Some(ExportSettings {
                 tracks: Vec::new(),
                 range: None,
+                dir,
                 ..s.clone()
             });
             match ExportJob::start(&self.project, s) {

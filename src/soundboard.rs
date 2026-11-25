@@ -489,6 +489,18 @@ impl SampleCache {
         }
     }
 
+    /// Même son sous un autre chemin (fichier copié par « Enregistrer sous ») : aucun
+    /// nouveau décodage, le pad reste jouable sans interruption.
+    pub fn alias(&mut self, from: &Path, to: &Path) {
+        if from == to || self.map.contains_key(to) {
+            return;
+        }
+        if let Some(LoadState::Ready(s)) = self.map.get(from) {
+            let s = s.clone();
+            self.map.insert(to.to_path_buf(), LoadState::Ready(s));
+        }
+    }
+
     pub fn reload(&mut self, path: &Path) {
         self.map.remove(path);
         self.request(path, None);

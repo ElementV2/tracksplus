@@ -16,6 +16,16 @@ impl App {
                 self.updater.check(ctx);
             }
         }
+        // Le spectacle a repris pendant le téléchargement (lecture, prise, pad) : jamais
+        // de fermeture surprise. L'installation attend un nouveau clic dans la fenêtre.
+        if self.update_install && (!self.is_stopped() || self.pads_status().0 > 0) {
+            self.update_install = false;
+            self.notify(
+                "Mise à jour reportée : installez-la depuis le menu quand vous serez prêt",
+                false,
+            );
+            return;
+        }
         // Installeur prêt après « Installer et redémarrer » : on le lance et on ferme.
         if self.update_install
             && let State::Ready { file, .. } = self.updater.state()
@@ -163,7 +173,8 @@ impl App {
         }
         let state = self.updater.state();
         let mut close = false;
-        let recording = self.is_recording();
+        // Lecture, prise ou pads en cours : pas d'installation (elle fermerait l'application).
+        let recording = !self.is_stopped() || self.pads_status().0 > 0;
         let installed = update::installed();
         egui::Modal::new(egui::Id::unique("update_dlg"))
             .frame(t::window_frame())
@@ -238,7 +249,7 @@ impl App {
                                     !recording,
                                 );
                                 if recording {
-                                    resp.on_hover_text("Indisponible pendant une prise");
+                                    resp.on_hover_text("Arrêtez la lecture, la prise et les pads d'abord");
                                 } else if resp.clicked() {
                                     self.update_install = true;
                                     self.updater.download(r.clone(), ui.ctx());
@@ -292,12 +303,34 @@ impl App {
                     }
                     State::Ready { release, .. } => {
                         Self::release_header(ui, &release.version);
-                        ui.label(
-                            egui::RichText::new(
-                                "Installation : TracksPlus va se fermer puis se relancer.",
-                            )
-                            .color(t::TEXT_2),
-                        );
+                        if self.update_install {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Installation : TracksPlus va se fermer puis se relancer.",
+                                )
+                                .color(t::TEXT_2),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("Mise à jour téléchargée et vérifiée.")
+                                    .color(t::TEXT_2),
+                            );
+                            ui.add_space(10.0);
+                            let busy = !self.is_stopped() || self.pads_status().0 > 0;
+                            let resp = w::primary_button(
+                                ui,
+                                Some(Icon::Download),
+                                "Installer et redémarrer",
+                                !busy,
+                            );
+                            if busy {
+                                resp.on_hover_text(
+                                    "Arrêtez la lecture, la prise et les pads d'abord",
+                                );
+                            } else if resp.clicked() {
+                                self.update_install = true;
+                            }
+                        }
                     }
                 }
                 ui.add_space(14.0);

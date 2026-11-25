@@ -1072,6 +1072,11 @@ impl App {
         let Some(drag) = self.clip_drag.take() else {
             return;
         };
+        if self.editing_locked() {
+            // Prise lancée pendant le geste : on remet les prises où elles étaient.
+            self.revert_clip_drag(&drag);
+            return;
+        }
         let mut d = sample as i64 - drag.anchor as i64;
         let exclude: HashSet<u64> = drag.origs.iter().map(|(_, c)| c.id).collect();
         let points = if self.snap && !no_snap {
@@ -1177,10 +1182,25 @@ impl App {
         });
     }
 
+    /// Annule un geste en cours (prises remises dans leur état d'origine).
+    fn revert_clip_drag(&mut self, drag: &ClipDrag) {
+        for (track_id, o) in &drag.origs {
+            if let Some(t) = self.project.track_mut(*track_id)
+                && let Some(c) = t.clips.iter_mut().find(|c| c.id == o.id)
+            {
+                *c = o.clone();
+            }
+        }
+    }
+
     fn end_clip_drag(&mut self) {
         let Some(drag) = self.clip_drag.take() else {
             return;
         };
+        if self.editing_locked() {
+            self.revert_clip_drag(&drag);
+            return;
+        }
         let moved_track = match (drag.mode, drag.target, drag.origs.first()) {
             (DragMode::Move, Some(row), Some((from, _))) => match self.project.tracks.get(row) {
                 Some(t) => (t.id != *from).then_some((*from, t.id)),

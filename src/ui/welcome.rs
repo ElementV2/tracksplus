@@ -154,7 +154,11 @@ impl App {
     fn welcome_action(&mut self, wl: Welcome, action: Option<Action>) {
         match action {
             None => self.welcome = Some(wl),
-            Some(Action::Open(path)) => self.load_session(&path),
+            Some(Action::Open(path)) => {
+                if self.save_before_leaving() {
+                    self.load_session(&path);
+                }
+            }
             Some(Action::New) => self.open_new_session(),
             // Explorateur intégré ; au lancement, l'accueil revient si on l'annule.
             Some(Action::Browse) => self.open_session(),

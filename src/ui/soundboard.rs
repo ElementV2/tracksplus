@@ -41,6 +41,8 @@ const BIG_SOUND: u64 = 32 * 1024 * 1024;
 /// Copie d'un gros son vers le dossier « Sons » de la session, en cours.
 pub struct PendingCopy {
     src: PathBuf,
+    /// Session dans laquelle le son est copié (elle a pu être fermée entre-temps).
+    dir: PathBuf,
     rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
 }
 
@@ -123,7 +125,7 @@ impl App {
 
     /// Pads en lecture : nombre, temps restant (s) du dernier à finir hors boucles, et
     /// présence d'une boucle.
-    fn pads_status(&self) -> (usize, Option<f64>, bool) {
+    pub(crate) fn pads_status(&self) -> (usize, Option<f64>, bool) {
         let (mut n, mut rem, mut looped) = (0, None::<f64>, false);
         for (slot, pad) in self.board.all_pads() {
             let Some(pos) = self.pad_playing(slot) else {
@@ -290,9 +292,12 @@ impl App {
             // tout ce qu'il lui faut, même si l'original est déplacé ou supprimé. Un gros
             // fichier est copié en arrière-plan : le pad joue l'original en attendant.
             let sounds = self.project.dir.join(crate::soundboard::SOUNDS_DIR);
-            let big = f.parent() != Some(sounds.as_path())
-                && std::fs::metadata(&f).is_ok_and(|m| m.len() > BIG_SOUND);
-            let f = if big {
+            // Toujours en arrière-plan (copie + écriture forcée sur le disque) : même de
+            // petits fichiers, à vingt sur un disque lent, figeraient l'interface en plein
+            // spectacle.
+            let outside = f.parent() != Some(sounds.as_path());
+            let big = outside && std::fs::metadata(&f).is_ok_and(|m| m.len() > BIG_SOUND);
+            let f = if outside {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let (src, dir) = (f.clone(), self.project.dir.clone());
                 std::thread::spawn(move || {
@@ -301,12 +306,18 @@ impl App {
                             .map_err(|e| format!("{e:#}")),
                     );
                 });
-                self.sb.copies.push(PendingCopy { src: f.clone(), rx });
-                let name = f
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.notify(format!("Copie de « {name} » dans la session…"), false);
+                self.sb.copies.push(PendingCopy {
+                    src: f.clone(),
+                    dir: self.project.dir.clone(),
+                    rx,
+                });
+                if big {
+                    let name = f
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.notify(format!("Copie de « {name} » dans la session…"), false);
+                }
                 f
             } else {
                 match crate::soundboard::copy_into_session(&f, &self.project.dir) {
@@ -381,14 +392,32 @@ impl App {
         let mut done = Vec::new();
         self.sb.copies.retain(|c| match c.rx.try_recv() {
             Ok(res) => {
-                done.push((c.src.clone(), res));
+                done.push((c.src.clone(), c.dir.clone(), res));
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
         });
-        for (src, res) in done {
+        for (src, dir, res) in done {
             match res {
+                Ok(dst) if dir != self.project.dir => {
+                    // Session changée pendant la copie : on met à jour son soundboard sur
+                    // le disque, pour qu'elle ne dépende pas de l'original.
+                    if let Ok(mut b) = crate::soundboard::Board::load_session(&dir) {
+                        let mut used = false;
+                        for page in &mut b.pages {
+                            for pad in page.pads.iter_mut().flatten() {
+                                if pad.path == src {
+                                    pad.path = dst.clone();
+                                    used = true;
+                                }
+                            }
+                        }
+                        if used {
+                            let _ = b.save_session(&dir);
+                        }
+                    }
+                }
                 Ok(dst) => {
                     let mut used = false;
                     for page in &mut self.board.pages {
@@ -810,6 +839,8 @@ impl App {
             self.sb.learn_midi = None;
             self.sb.drag_pad = None;
             self.board.pages.remove(i);
+            // Emplacements renumérotés : le pad supprimé ne saurait plus où revenir.
+            self.sb.deleted = None;
             self.sb.page = self.sb.page.min(self.board.pages.len() - 1);
             self.sb.selected = None;
             self.board_modified();
@@ -1863,6 +1894,10 @@ impl App {
     /// Supprime un pad (Suppr, ou clic droit → « Supprimer le pad »).
     pub fn delete_pad(&mut self, slot: u16) {
         self.engine.pad(PadCmd::Stop { slot });
+        if let Some(p) = self.board.pad(slot).cloned() {
+            self.sb.deleted = Some((slot, p));
+            self.notify("Pad supprimé · Ctrl+Z pour le rétablir", false);
+        }
         self.board.set(slot, None);
         if self.sb.selected == Some(slot) {
             self.sb.selected = None;
@@ -1871,6 +1906,22 @@ impl App {
             self.sb.renaming = None;
         }
         self.board_modified();
+    }
+
+    /// Rétablit le dernier pad supprimé, à sa place si elle est toujours libre.
+    pub fn restore_deleted_pad(&mut self) {
+        let Some((slot, pad)) = self.sb.deleted.take() else {
+            return;
+        };
+        if self.board.pad(slot).is_some() {
+            self.notify("Emplacement du pad supprimé déjà occupé", true);
+            return;
+        }
+        self.cache.request(&pad.path, None);
+        self.board.set(slot, Some(pad));
+        self.sb.selected = Some(slot);
+        self.board_modified();
+        self.notify("Pad rétabli", false);
     }
 
     fn wave_editor(
