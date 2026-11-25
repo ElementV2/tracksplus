@@ -80,11 +80,15 @@ pub struct SettingsDialog {
     pub error: Option<String>,
     /// Onglet affiché : 0 = carte son, 1 = enregistrement, 2 = soundboard.
     pub tab: usize,
+    /// Pilote ASIO ouvert par le moteur à l'ouverture des réglages (les autres pilotes
+    /// ASIO ne peuvent pas être interrogés pendant ce temps, voir `list_devices_in_use`).
+    pub asio_in_use: Option<String>,
 }
 
 impl SettingsDialog {
-    fn new(prefs: &AudioPrefs) -> Self {
+    fn new(prefs: &AudioPrefs, asio_in_use: Option<String>) -> Self {
         let mut d = Self {
+            asio_in_use,
             prefs: prefs.clone(),
             hosts: audio::host_names(),
             ins: Vec::new(),
@@ -103,7 +107,8 @@ impl SettingsDialog {
     }
 
     fn refresh(&mut self) {
-        let (ins, outs) = audio::list_devices(self.prefs.host.as_deref());
+        let (ins, outs) =
+            audio::list_devices_in_use(self.prefs.host.as_deref(), self.asio_in_use.as_deref());
         self.ins = ins;
         self.outs = outs;
         (self.default_in, self.default_out) =
@@ -1067,6 +1072,10 @@ pub struct App {
     last_reopen: Option<(f64, f64)>,
     /// La prise en cours a été coupée par un trou de l'entrée plus long que les tampons.
     take_split: bool,
+    /// Silence inséré dans la prise en cours déjà repéré (trames, voir `watch_take`).
+    gap_seen: u64,
+    /// Interruption du signal d'entrée en cours déjà notée dans le journal des incidents.
+    stall_logged: bool,
     /// Chien de garde des flux (`audio::SLOT_*`) : dernier battement de cœur vu et instant
     /// où il a changé ; dernier passage (un saut = veille ou interface figée).
     hb: [(u64, f64); audio::SLOTS],
@@ -1305,6 +1314,8 @@ impl App {
             announce: false,
             last_reopen: None,
             take_split: false,
+            gap_seen: 0,
+            stall_logged: false,
             hb: [(0, 0.0); audio::SLOTS],
             hb_tick: 0.0,
             resume: None,
@@ -1435,7 +1446,7 @@ impl App {
             app.notify(launch_warnings.join(" · "), true);
         }
         if let Some(e) = err {
-            let mut d = SettingsDialog::new(&app.prefs);
+            let mut d = SettingsDialog::new(&app.prefs, app.asio_in_use());
             d.error = Some(e);
             app.settings_dlg = Some(d);
         }
@@ -1446,6 +1457,37 @@ impl App {
     /// avertissement reste affiché jusqu'au clic : on ne peut pas le manquer.
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         self.notify_level(text, if error { Level::Warn } else { Level::Info });
+    }
+
+    /// Note un événement dans le journal des incidents de la session ouverte (dossier des
+    /// réglages tant qu'aucune session n'est ouverte). Ne bloque jamais.
+    pub fn incident(&self, text: impl AsRef<str>) {
+        let dir = if self.start_screen {
+            match dirs::config_dir() {
+                Some(d) => d.join("TracksPlus"),
+                None => return,
+            }
+        } else {
+            self.project.dir.clone()
+        };
+        crate::incidents::log(&dir, text.as_ref());
+    }
+
+    /// Repère posé tout seul sur la timeline à l'endroit d'un incident (trou, coupure,
+    /// carte perdue, relance), aussi noté dans le journal des incidents.
+    fn incident_marker(&mut self, pos: u64, name: String) {
+        let id = self.project.add_marker(pos);
+        if let Some(m) = self.project.markers.iter_mut().find(|m| m.id == id) {
+            m.name = name.clone();
+        }
+        self.incident(format!(
+            "Repère « {name} » posé à {}",
+            fmt_time(pos, self.sr())
+        ));
+        // Sauvegardé sous peu (sauvegarde automatique en arrière-plan), même en pleine prise.
+        if self.is_recording() {
+            self.last_autosave = self.last_autosave.min(self.now - 20.0);
+        }
     }
 
     /// Texte du message affiché (ses messages réunis), retiré de l'écran : pour le reprendre
@@ -1459,6 +1501,11 @@ impl App {
     /// Message avec son importance (voir `Level`).
     pub fn notify_level(&mut self, text: impl Into<String>, level: Level) {
         let text = text.into();
+        // État de la carte, prise interrompue, coupée ou relancée : aussi dans le journal
+        // des incidents de la session (le message à l'écran finit par partir).
+        if level >= Level::Device {
+            self.incident(text.clone());
+        }
         // Une erreur pas encore lue n'est jamais effacée par un nouveau message (ex. « prise
         // arrêtée, carte perdue » puis « carte reconnectée ») : il s'ajoute à la suite.
         if let Some(t) = &mut self.toast
@@ -1474,6 +1521,14 @@ impl App {
             error,
             until: if error { f64::INFINITY } else { self.now + 3.5 },
         });
+    }
+
+    /// Pilote ASIO ouvert par le moteur (`None` hors ASIO ou carte fermée).
+    pub fn asio_in_use(&self) -> Option<String> {
+        let st = &self.engine.status;
+        (st.host == "ASIO")
+            .then(|| st.input.clone().or_else(|| st.output.clone()))
+            .flatten()
     }
 
     pub fn sr(&self) -> u32 {
@@ -2011,6 +2066,13 @@ impl App {
         // Surveillance du signal à partir de maintenant (et pas du début de l'image : une
         // préparation lente ne doit pas faire croire à une carte perdue).
         self.rec_watch = (0, self.now + t0.elapsed().as_secs_f64());
+        self.gap_seen = 0;
+        self.stall_logged = false;
+        self.incident(format!(
+            "Prise lancée à {} ({} piste(s))",
+            fmt_time(self.playhead, self.sr()),
+            self.live.len()
+        ));
         if !skipped.is_empty() {
             self.notify(
                 format!(
@@ -2207,6 +2269,12 @@ impl App {
                 self.player = None;
             }
             Transport::Recording { start } => {
+                let len = self.engine.shared.rec_frames.load(Ordering::Relaxed);
+                self.incident(format!(
+                    "Prise arrêtée ({} enregistrées depuis {})",
+                    fmt_time(len, self.sr()),
+                    fmt_time(start, self.sr())
+                ));
                 // 1) Le callback rend les cibles ; leurs producteurs sont libérés ici.
                 let released = self
                     .engine
@@ -2870,6 +2938,31 @@ impl App {
             0
         };
         let base = start + offset + frames;
+        let sr = self.sr();
+        // Silence inséré à la place d'un trou de l'entrée : repère à cet endroit.
+        let gap = sh.rec_gap_frames.load(Ordering::Relaxed);
+        if gap > self.gap_seen {
+            let d = gap - self.gap_seen;
+            let at = start + offset + sh.rec_gap_at.load(Ordering::Relaxed);
+            self.gap_seen = gap;
+            self.stall_logged = false;
+            self.incident_marker(
+                at,
+                format!("Trou {} (silence)", fmt_gap(d as f64 / sr as f64)),
+            );
+        }
+        let sh = &self.engine.shared;
+        // Signal d'entrée interrompu (pas encore de trou comblé) : noté une fois.
+        if !self.stall_logged && self.now - self.rec_watch.1 > 1.0 {
+            self.stall_logged = true;
+            self.incident(format!(
+                "Plus de signal d'entrée pendant la prise, à {} : la prise reste ouverte",
+                fmt_time(base, sr)
+            ));
+        } else if self.stall_logged && self.now - self.rec_watch.1 < 0.5 {
+            self.stall_logged = false;
+            self.incident("Signal d'entrée revenu");
+        }
         let missing = sh.rec_gap_overflow.load(Ordering::Acquire);
         if missing > 0 {
             // Le son qui revient tombe `missing` trames après la fin de la prise (figée),
@@ -2882,6 +2975,10 @@ impl App {
                 hb_seen: None,
             });
             self.take_split = true;
+            self.incident_marker(
+                base,
+                format!("Coupure : trou {}", fmt_gap(missing as f64 / sr as f64)),
+            );
             self.stop();
             return;
         }
@@ -2898,6 +2995,7 @@ impl App {
             hb_seen: None,
         });
         self.lost_during_take = true;
+        self.incident_marker(base, "Carte son perdue".into());
         self.stop();
     }
 
@@ -2969,6 +3067,10 @@ impl App {
                 self.playhead = resume_position(pos, gap, self.sr());
                 self.record();
                 if self.is_recording() {
+                    self.incident_marker(
+                        self.playhead,
+                        format!("Reprise auto (trou {})", fmt_gap(gap)),
+                    );
                     self.notify_level(
                         format!(
                             "Prise relancée automatiquement à {} (trou de {})",
@@ -4718,7 +4820,7 @@ impl App {
 
     pub fn open_settings(&mut self) {
         self.close_dialogs();
-        self.settings_dlg = Some(SettingsDialog::new(&self.prefs));
+        self.settings_dlg = Some(SettingsDialog::new(&self.prefs, self.asio_in_use()));
     }
 
     pub fn open_new_session(&mut self) {
@@ -5621,6 +5723,17 @@ impl App {
                         }
                     });
                     ui.end_row();
+                    // Carte branchée, Dante Virtual Soundcard passée en ASIO… après
+                    // l'ouverture des réglages : la liste est relue à la demande.
+                    ui.label("");
+                    if ui
+                        .small_button("Actualiser la liste")
+                        .on_hover_text("Relit les cartes son et les pilotes présents")
+                        .clicked()
+                    {
+                        dlg.refresh();
+                    }
+                    ui.end_row();
                     if dlg.listed_host != dlg.prefs.host {
                         dlg.refresh();
                     }
@@ -5633,7 +5746,11 @@ impl App {
                             dlg.prefs.input = None;
                         }
                         for d in &dlg.ins {
-                            let txt = format!("{}   {} canaux", d.name, d.channels);
+                            let txt = match (&d.note, d.channels) {
+                                (None, ch) => format!("{}   {ch} canaux", d.name),
+                                (Some(n), 0) => format!("{}   ({n})", d.name),
+                                (Some(n), ch) => format!("{}   {ch} canaux ({n})", d.name),
+                            };
                             // L'entrée ne touche jamais aux sorties : chacune se règle à part.
                             if ui.selectable_label(dlg.prefs.input.as_deref() == Some(&d.name), txt).clicked() {
                                 dlg.prefs.input = Some(d.name.clone());
@@ -7444,10 +7561,11 @@ fn dest_combo(
             for d in outs {
                 for l in (0..d.channels.max(2)).step_by(2) {
                     let sel = device.as_deref() == Some(&d.name) && *left == l;
-                    if ui
-                        .selectable_label(sel, out_dest_label(&d.name, d.channels, l))
-                        .clicked()
-                    {
+                    let label = match &d.note {
+                        None => out_dest_label(&d.name, d.channels, l),
+                        Some(n) => format!("{}   ({n})", out_dest_label(&d.name, d.channels, l)),
+                    };
+                    if ui.selectable_label(sel, label).clicked() {
                         *device = Some(d.name.clone());
                         *left = l;
                     }

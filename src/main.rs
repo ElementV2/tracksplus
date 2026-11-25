@@ -13,6 +13,7 @@ mod fuzz_tests;
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 mod import;
+mod incidents;
 mod isolate;
 mod midi;
 mod player;

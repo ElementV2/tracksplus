@@ -130,6 +130,10 @@ pub struct DeviceInfo {
     pub default_rate: Option<u32>,
     /// Tailles de buffer acceptées (trames), si le pilote les indique.
     pub buffer: Option<(u32, u32)>,
+    /// État à afficher quand le périphérique n'a pas pu être interrogé (pilote ASIO déclaré
+    /// mais non ouvert : un autre pilote ASIO est en service, ou la carte n'est pas
+    /// démarrée). `None` : périphérique prêt.
+    pub note: Option<String>,
 }
 
 pub fn host_names() -> Vec<String> {
@@ -191,12 +195,27 @@ fn ranges_info(
         rates,
         default_rate,
         buffer,
+        note: None,
     }
 }
 
 /// Liste les périphériques d'entrée et de sortie d'un pilote.
+///
+/// ASIO n'ouvre qu'un pilote à la fois par application : pendant qu'un pilote est en
+/// service, les autres refusent de s'ouvrir et disparaîtraient de la liste. Tous les
+/// pilotes ASIO déclarés dans Windows sont donc listés : ceux qui n'ont pas pu être
+/// interrogés gardent leurs caractéristiques vues la dernière fois, avec leur état
+/// (`DeviceInfo::note`). `in_use` : pilote ASIO ouvert par le moteur en ce moment.
 pub fn list_devices(host: Option<&str>) -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
+    list_devices_in_use(host, None)
+}
+
+pub fn list_devices_in_use(
+    host: Option<&str>,
+    in_use: Option<&str>,
+) -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
     let host = find_host(host);
+    let asio = host.id().name() == "ASIO";
     let mut ins = Vec::new();
     let mut outs = Vec::new();
     if let Ok(devs) = host.devices() {
@@ -218,7 +237,127 @@ pub fn list_devices(host: Option<&str>) -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
             }
         }
     }
+    if asio {
+        add_unlisted_asio(&mut ins, &mut outs, &asio_driver_names(), in_use);
+    }
     (ins, outs)
+}
+
+/// Conseil ajouté quand un pilote ASIO ne s'ouvre pas : la Dante Virtual Soundcard ne
+/// répond en ASIO que si elle a été démarrée dans ce mode (sinon ses canaux sont dans
+/// Windows, en WASAPI).
+fn asio_hint(host: &str, device: &str) -> &'static str {
+    if host == "ASIO" && device.to_lowercase().contains("dante") {
+        " : démarrez la Dante Virtual Soundcard en mode ASIO (en mode WDM, choisissez le pilote WASAPI)"
+    } else {
+        ""
+    }
+}
+
+/// Dernières caractéristiques connues de chaque pilote ASIO (entrée, sortie), pour les
+/// montrer même quand il ne peut pas être interrogé.
+static ASIO_SEEN: Mutex<Vec<(Option<DeviceInfo>, Option<DeviceInfo>)>> = Mutex::new(Vec::new());
+
+/// Complète les listes avec les pilotes ASIO déclarés mais non interrogés (`registered`),
+/// et retient les caractéristiques de ceux qui l'ont été.
+fn add_unlisted_asio(
+    ins: &mut Vec<DeviceInfo>,
+    outs: &mut Vec<DeviceInfo>,
+    registered: &[String],
+    in_use: Option<&str>,
+) {
+    let mut seen = ASIO_SEEN.lock();
+    let name_of = |e: &(Option<DeviceInfo>, Option<DeviceInfo>)| {
+        e.0.as_ref().or(e.1.as_ref()).map(|d| d.name.clone())
+    };
+    // Pilotes interrogés : leurs caractéristiques sont retenues.
+    let listed: Vec<String> = ins
+        .iter()
+        .chain(outs.iter())
+        .map(|d| d.name.clone())
+        .collect();
+    for name in &listed {
+        let entry = (
+            ins.iter().find(|d| &d.name == name).cloned(),
+            outs.iter().find(|d| &d.name == name).cloned(),
+        );
+        seen.retain(|e| name_of(e).as_deref() != Some(name));
+        seen.push(entry);
+    }
+    let note = match in_use {
+        Some(cur) => format!("disponible · « {cur} » sera fermé à l'application"),
+        None => {
+            "ne répond pas · carte non démarrée ? (Dante Virtual Soundcard : mode ASIO)".to_string()
+        }
+    };
+    for name in registered {
+        if listed.iter().any(|l| l == name) {
+            continue;
+        }
+        let known = seen.iter().find(|e| name_of(e).as_deref() == Some(name));
+        let blank = || DeviceInfo {
+            name: name.clone(),
+            channels: 0,
+            rates: Vec::new(),
+            default_rate: None,
+            buffer: None,
+            note: None,
+        };
+        let (i, o) = match known {
+            Some((i, o)) => (i.clone(), o.clone()),
+            None => (Some(blank()), Some(blank())),
+        };
+        for (list, d) in [(&mut *ins, i), (&mut *outs, o)] {
+            if let Some(mut d) = d {
+                d.note = Some(note.clone());
+                list.push(d);
+            }
+        }
+    }
+}
+
+/// Pilotes ASIO déclarés dans Windows (`HKLM\SOFTWARE\ASIO`), dans l'ordre du registre.
+#[cfg(all(windows, feature = "asio"))]
+fn asio_driver_names() -> Vec<String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+    };
+    let path: Vec<u16> = r"SOFTWARE\ASIO".encode_utf16().chain([0]).collect();
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY : chaîne terminée par un zéro, `key` reçoit la clé ouverte (fermée plus bas).
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for i in 0..256u32 {
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        // SAFETY : `buf` fait `len` caractères ; les paramètres optionnels sont nuls.
+        let r = unsafe {
+            RegEnumKeyExW(
+                key,
+                i,
+                buf.as_mut_ptr(),
+                &mut len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if r != 0 {
+            break;
+        }
+        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+    }
+    // SAFETY : clé ouverte ci-dessus.
+    unsafe { RegCloseKey(key) };
+    names
+}
+
+#[cfg(not(all(windows, feature = "asio")))]
+fn asio_driver_names() -> Vec<String> {
+    Vec::new()
 }
 
 /// État partagé entre l'interface et les callbacks audio (atomiques uniquement).
@@ -283,6 +422,9 @@ pub struct Shared {
     /// Silence inséré dans la prise en cours à la place d'un trou de l'entrée (trames) :
     /// la suite reste à sa place sur la timeline.
     pub rec_gap_frames: AtomicU64,
+    /// Position dans la prise (trames depuis son début) du dernier silence inséré : là où
+    /// l'interface pose le repère du trou.
+    pub rec_gap_at: AtomicU64,
     /// Trou de l'entrée plus long que la place libre des tampons disque : trames de silence
     /// qui n'ont pas pu être insérées (0 = aucun). La prise est alors figée (la suite irait
     /// au mauvais endroit de la timeline) et l'interface la relance à sa place.
@@ -327,6 +469,7 @@ impl Shared {
             out_latency: AtomicU32::new(0),
             heartbeat: std::array::from_fn(|_| AtomicU64::new(0)),
             rec_gap_frames: AtomicU64::new(0),
+            rec_gap_at: AtomicU64::new(0),
             rec_gap_overflow: AtomicU64::new(0),
             rec_gap_overflow_ns: AtomicU64::new(0),
             stream_dead: std::sync::atomic::AtomicU8::new(0),
@@ -874,11 +1017,12 @@ impl ReopenJob {
 
         let has = |slot: usize| slots & slot_bit(slot) != 0;
         let absent = |slot: usize| {
+            let name = plan.want[slot].label();
             (
                 format!(
-                    "{} « {} » introuvable",
+                    "{} « {name} » introuvable{}",
                     slot_title(slot),
-                    plan.want[slot].label()
+                    asio_hint(&plan.host_name, &name)
                 ),
                 true,
             )
@@ -2018,6 +2162,9 @@ impl InState {
             }
         }
         let sh = &self.shared;
+        // Seul ce callback fait avancer `rec_frames` : lu puis avancé sans course.
+        sh.rec_gap_at
+            .store(sh.rec_frames.load(Ordering::Relaxed), Ordering::Relaxed);
         sh.rec_frames.fetch_add(n as u64, Ordering::Release);
         sh.rec_gap_frames.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -3706,5 +3853,54 @@ mod tests {
         assert!(frames[..50].iter().all(|f| **f == [-1.0, 1.0]));
         assert!(frames[50..80].iter().all(|f| **f == [0.0, 0.0]));
         assert!(frames[80..].iter().all(|f| **f == [-1.0, 1.0]));
+    }
+}
+
+#[cfg(test)]
+mod asio_list_tests {
+    use super::*;
+
+    fn asio_dev(name: &str, ch: u16) -> DeviceInfo {
+        DeviceInfo {
+            name: name.into(),
+            channels: ch,
+            rates: vec![48000],
+            default_rate: Some(48000),
+            buffer: Some((32, 2048)),
+            note: None,
+        }
+    }
+
+    /// Pilote ASIO déclaré mais non interrogé (un autre est ouvert, ou la carte n'est pas
+    /// démarrée) : toujours listé, avec ses caractéristiques connues et son état.
+    #[test]
+    fn asio_drivers_are_listed_even_when_another_is_open() {
+        let dante = "Dante Virtual Soundcard (x64) [test]";
+        let rme = "ASIO Fireface USB [test]";
+        let reg = vec![rme.to_string(), dante.to_string()];
+        // Premier passage : les deux répondent, leurs caractéristiques sont retenues.
+        let (mut ins, mut outs) = (
+            vec![asio_dev(rme, 18), asio_dev(dante, 16)],
+            vec![asio_dev(rme, 18), asio_dev(dante, 16)],
+        );
+        add_unlisted_asio(&mut ins, &mut outs, &reg, None);
+        assert_eq!(ins.len(), 2);
+        assert!(ins.iter().all(|d| d.note.is_none()));
+        // Le Fireface est ouvert : la Dante ne peut plus être interrogée.
+        let (mut ins, mut outs) = (vec![asio_dev(rme, 18)], vec![asio_dev(rme, 18)]);
+        add_unlisted_asio(&mut ins, &mut outs, &reg, Some(rme));
+        let d = ins.iter().find(|d| d.name == dante).expect("Dante listée");
+        assert_eq!(d.channels, 16, "caractéristiques connues gardées");
+        assert!(d.note.as_deref().unwrap().contains("sera fermé"));
+        assert!(outs.iter().any(|d| d.name == dante));
+        // Pilote jamais vu, rien d'ouvert : listé quand même, « ne répond pas ».
+        let other = "Pilote inconnu [test]".to_string();
+        let (mut ins, mut outs) = (Vec::new(), Vec::new());
+        add_unlisted_asio(&mut ins, &mut outs, std::slice::from_ref(&other), None);
+        assert_eq!(ins[0].name, other);
+        assert_eq!(ins[0].channels, 0);
+        assert!(ins[0].note.as_deref().unwrap().contains("ne répond pas"));
+        assert!(asio_hint("ASIO", dante).contains("mode ASIO"));
+        assert_eq!(asio_hint("WASAPI", dante), "");
     }
 }
