@@ -1684,6 +1684,17 @@ impl App {
         None
     }
 
+    /// Numéro de la première entrée de la carte ouverte, moins un : en WASAPI, Windows
+    /// découpe une carte en paires (« Analog (5+6) ») et une seule s'ouvre ; ses entrées
+    /// s'affichent sous leur vrai numéro (5 et 6), pas 1 et 2.
+    pub fn in_base(&self) -> u16 {
+        let st = &self.engine.status;
+        if st.host == "ASIO" {
+            return 0;
+        }
+        st.input.as_deref().map_or(0, audio::channel_base)
+    }
+
     /// Pilote ASIO ouvert par le moteur (`None` hors ASIO ou carte fermée).
     pub fn asio_in_use(&self) -> Option<String> {
         let st = &self.engine.status;
@@ -6070,6 +6081,9 @@ impl App {
                     } else {
                         let cur = dlg.prefs.input.clone().unwrap_or_else(|| "Par défaut (Windows)".into());
                         let shown = combo_text(ui, &cur, combo_w);
+                        // Windows découpe la carte en paires et WASAPI n'en ouvre qu'une.
+                        let pairs = dlg.card.is_some() && ins.len() > 1;
+                        ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("in").width(combo_w).selected_text(shown).show_ui(ui, |ui| {
                             if (dlg.card.is_none() || ins.is_empty())
                                 && ui.selectable_label(dlg.prefs.input.is_none(), "Par défaut (Windows)").clicked()
@@ -6086,6 +6100,10 @@ impl App {
                                     dlg.prefs.input = Some(d.name.clone());
                                 }
                             }
+                        });
+                        if pairs {
+                            ui.label(egui::RichText::new("ASIO : toutes les entrées").color(t::TEXT_3));
+                        }
                         });
                     }
                     ui.end_row();
@@ -6512,6 +6530,7 @@ impl App {
             return;
         };
         let in_ch = self.engine.status.in_channels;
+        let in_base = self.in_base();
         let mut close = false;
         let mut create = false;
         let resp = egui::Modal::new(egui::Id::unique("tracks_dlg"))
@@ -6547,6 +6566,7 @@ impl App {
                             &mut d.first,
                             d.stereo,
                             in_ch,
+                            in_base,
                             &self.project.tracks,
                             None,
                         );

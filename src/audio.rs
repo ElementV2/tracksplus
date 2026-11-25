@@ -302,6 +302,38 @@ pub fn list_devices_in_use(
     (ins, outs)
 }
 
+/// Premier canal d'un périphérique d'entrée découpé par Windows, moins un : « Analog (5+6)
+/// (RME Fireface UC) » → 4, « DVS Transmit 3-4 (…) » → 2 ; 0 si le nom n'en dit rien. Sert
+/// à afficher les vrais numéros d'entrée de la carte (WASAPI n'en ouvre qu'une paire).
+pub fn channel_base(device: &str) -> u16 {
+    let b = device.as_bytes();
+    let num = |mut i: usize| -> Option<(u32, usize)> {
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        (i > start)
+            .then(|| device[start..i].parse().ok().map(|n| (n, i)))
+            .flatten()
+    };
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit()
+            && (i == 0 || !b[i - 1].is_ascii_digit())
+            && let Some((a, j)) = num(i)
+            && j < b.len()
+            && (b[j] == b'+' || b[j] == b'-')
+            && let Some((c, _)) = num(j + 1)
+            && c == a + 1
+            && a >= 1
+        {
+            return (a - 1).min(u16::MAX as u32) as u16;
+        }
+        i += 1;
+    }
+    0
+}
+
 /// Conseil ajouté quand un pilote ASIO ne s'ouvre pas : la Dante Virtual Soundcard ne
 /// répond en ASIO que si elle a été démarrée dans ce mode (sinon ses canaux sont dans
 /// Windows, en WASAPI).
@@ -4176,6 +4208,19 @@ mod asio_list_tests {
 
     /// Pilote ASIO déclaré mais non interrogé (un autre est ouvert, ou la carte n'est pas
     /// démarrée) : toujours listé, avec ses caractéristiques connues et son état.
+    #[test]
+    fn windows_pairs_give_their_real_channel_numbers() {
+        assert_eq!(channel_base("Analog (5+6) (RME Fireface UC)"), 4);
+        assert_eq!(channel_base("Analog (1+2) (RME Fireface UC)"), 0);
+        assert_eq!(
+            channel_base("DVS Transmit  3-4 (Dante Virtual Soundcard)"),
+            2
+        );
+        assert_eq!(channel_base("Microphone (Realtek(R) Audio)"), 0);
+        assert_eq!(channel_base("Dante Virtual Soundcard (x64)"), 0);
+        assert_eq!(channel_base("Ligne 12-14"), 0);
+    }
+
     #[test]
     fn asio_drivers_are_listed_even_when_another_is_open() {
         let dante = "Dante Virtual Soundcard (x64) [test]";

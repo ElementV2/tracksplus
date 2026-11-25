@@ -167,11 +167,12 @@ impl Track {
             .is_some_and(|i| (i as usize) + self.channels() <= in_ch as usize)
     }
 
-    /// Libellé court de l'entrée : « IN 3 », « IN 3-4 » ou « IN — ».
-    pub fn input_label(&self) -> String {
+    /// Libellé court de l'entrée : « IN 3 », « IN 3-4 » ou « IN — ». `base` : numéro de la
+    /// première entrée de la carte ouverte moins un (WASAPI : « Analog (5+6) » → 4).
+    pub fn input_label(&self, base: u16) -> String {
         match self.input {
-            Some(i) if self.stereo => format!("IN {}-{}", i + 1, i + 2),
-            Some(i) => format!("IN {}", i + 1),
+            Some(i) if self.stereo => format!("IN {}-{}", base + i + 1, base + i + 2),
+            Some(i) => format!("IN {}", base + i + 1),
             None => "IN —".into(),
         }
     }

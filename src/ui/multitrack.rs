@@ -1378,6 +1378,7 @@ impl App {
         let stopped = self.is_stopped();
         let editable = !self.editing_locked();
         let in_ch = self.engine.status.in_channels;
+        let in_base = self.in_base();
         let blink = (self.now * 1.6).fract() < 0.55;
         let (pointer, press_origin, shift, command) = ui.input(|i| {
             (
@@ -1709,7 +1710,7 @@ impl App {
                 }
                 let input = track.input;
                 let stereo = track.stereo;
-                let label = track.input_label();
+                let label = track.input_label(in_base);
                 let chans: Vec<u16> = track.inputs().collect();
                 let ms: Vec<MeterState> = if is_audio {
                     // Piste audio : niveau de lecture, une barre par canal du fichier.
@@ -1789,7 +1790,7 @@ impl App {
                             // En changeant de mode, l'entrée est d'abord recalée (paire paire).
                             let cur = input.map(|i| if s { i & !1 } else { i });
                             new_input =
-                                input_picker(ui, cur, s, in_ch, &self.project.tracks, Some(tid));
+                                input_picker(ui, cur, s, in_ch, in_base, &self.project.tracks, Some(tid));
                             if new_input.is_some() {
                                 ui.close();
                             }
@@ -1860,7 +1861,7 @@ impl App {
                             ui.label(egui::RichText::new("Entrée").font(t::regular(11.5)).color(t::TEXT_2));
                             let mut cur = input.map(|i| if s { i & !1 } else { i });
                             ui.add_enabled_ui(stopped, |ui| {
-                                if input_combo(ui, &format!("tp_in{tid}"), 186.0, &mut cur, s, in_ch, &self.project.tracks, Some(tid)) {
+                                if input_combo(ui, &format!("tp_in{tid}"), 186.0, &mut cur, s, in_ch, in_base, &self.project.tracks, Some(tid)) {
                                     new_input = Some(cur);
                                 }
                             });
@@ -2600,6 +2601,7 @@ pub fn input_combo(
     value: &mut Option<u16>,
     stereo: bool,
     in_ch: u16,
+    base: u16,
     tracks: &[crate::project::Track],
     me: Option<u64>,
 ) -> bool {
@@ -2612,9 +2614,9 @@ pub fn input_combo(
     let step: u16 = if stereo { 2 } else { 1 };
     let label = |i: u16| {
         if stereo {
-            format!("Entrées {}-{}", i + 1, i + 2)
+            format!("Entrées {}-{}", base + i + 1, base + i + 2)
         } else {
-            format!("Entrée {}", i + 1)
+            format!("Entrée {}", base + i + 1)
         }
     };
     let cur = value.map_or("Aucune entrée".to_string(), label);
@@ -2668,6 +2670,7 @@ fn input_picker(
     current: Option<u16>,
     stereo: bool,
     in_ch: u16,
+    base: u16,
     tracks: &[crate::project::Track],
     me: Option<u64>,
 ) -> Option<Option<u16>> {
@@ -2716,9 +2719,9 @@ fn input_picker(
                     t::TEXT
                 };
                 let text = if stereo {
-                    format!("{}-{}", i + 1, i + 2)
+                    format!("{}-{}", base + i + 1, base + i + 2)
                 } else {
-                    format!("{}", i + 1)
+                    format!("{}", base + i + 1)
                 };
                 ui.painter()
                     .text(r.center(), Align2::CENTER_CENTER, text, t::medium(10.5), fg);
