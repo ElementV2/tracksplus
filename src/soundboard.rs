@@ -173,6 +173,10 @@ pub struct Board {
     /// remplacement, réglages, pages). Gardé avec la session.
     #[serde(default)]
     pub locked: bool,
+    /// Sons sur un partage réseau désignés par le fichier de session lui-même (hors de la
+    /// session) : jamais ouverts automatiquement (voir `load_session`).
+    #[serde(skip)]
+    pub network_pads: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -202,6 +206,7 @@ impl Default for Board {
             led_port: None,
             layout: PadLayout::Auto,
             locked: false,
+            network_pads: Vec::new(),
         }
     }
 }
@@ -271,13 +276,22 @@ impl Board {
             return Ok(Board::default());
         }
         let mut b = Self::load(&path)?;
+        let mut network = Vec::new();
         for page in &mut b.pages {
             for pad in page.pads.iter_mut().flatten() {
-                if pad.path.is_relative() {
-                    pad.path = dir.join(&pad.path);
+                if !is_network_path(&pad.path) {
+                    if pad.path.is_relative() {
+                        pad.path = dir.join(&pad.path);
+                    }
+                } else {
+                    // Sécurité : ouvrir un fichier sur \\serveur\… envoie l'identifiant
+                    // Windows (chiffré) à ce serveur. Une session reçue d'ailleurs ne doit pas
+                    // pouvoir le déclencher toute seule : le son est marqué indisponible.
+                    network.push(pad.path.clone());
                 }
             }
         }
+        b.network_pads = network;
         Ok(b)
     }
 
@@ -304,6 +318,11 @@ impl Board {
             for pad in page.pads.iter_mut().flatten() {
                 if let Some(p) = done.get(&pad.path) {
                     pad.path = p.clone();
+                    continue;
+                }
+                // Son réseau imposé par un fichier de session : jamais lu automatiquement.
+                if self.network_pads.contains(&pad.path) {
+                    missing.push(pad.path.clone());
                     continue;
                 }
                 match copy_into_session(&pad.path, dir) {
@@ -752,6 +771,15 @@ fn resample_stereo(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Chemin sur un partage réseau (`\\serveur\partage\…` ou `//serveur/…`).
+pub fn is_network_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    // `\\?\C:\…` : chemin local écrit sous forme longue (pas un partage).
+    let local_verbatim =
+        s.starts_with("\\\\?\\") && !s[4..].to_ascii_uppercase().starts_with("UNC");
+    (s.starts_with("\\\\") || s.starts_with("//")) && !local_verbatim
+}
+
 pub fn is_audio_file(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
@@ -1024,6 +1052,31 @@ mod tests {
         let c = Board::load(&path).unwrap();
         assert_eq!(c.pad(3).unwrap().name, "Applause");
         assert_eq!(c.all_pads().count(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Pads sur un partage réseau désignés par un fichier de session : repérés au
+    /// chargement, jamais copiés automatiquement ; les sons de la session restent normaux.
+    #[test]
+    fn network_pads_are_flagged_not_opened() {
+        use std::path::Path;
+        assert!(is_network_path(Path::new(r"\\attaquant\partage\a.wav")));
+        assert!(is_network_path(Path::new("//serveur/partage/a.wav")));
+        assert!(is_network_path(Path::new(r"\\?\UNC\serveur\p\a.wav")));
+        assert!(!is_network_path(Path::new(r"\\?\C:\Sons\a.wav")));
+        assert!(!is_network_path(Path::new(r"C:\Sons\a.wav")));
+        let dir = std::env::temp_dir().join(format!("tp-unc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut b = Board::default();
+        b.set(0, Some(Pad::new(PathBuf::from(r"\\attaquant\p\a.wav"), 0)));
+        b.set(1, Some(Pad::new(PathBuf::from("Sons/b.wav"), 0)));
+        b.save(&dir.join(BOARD_FILE)).unwrap();
+        let mut l = Board::load_session(&dir).unwrap();
+        assert_eq!(l.network_pads, vec![PathBuf::from(r"\\attaquant\p\a.wav")]);
+        assert_eq!(l.pad(1).unwrap().path, dir.join("Sons/b.wav"));
+        let missing = l.adopt_sounds(&dir.join("copie"));
+        assert!(missing.contains(&PathBuf::from(r"\\attaquant\p\a.wav")));
         std::fs::remove_dir_all(dir).ok();
     }
 }

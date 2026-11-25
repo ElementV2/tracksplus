@@ -2075,6 +2075,24 @@ impl App {
             }
         };
         b.take_devices(&self.board);
+        let network = b.network_pads.clone();
+        if !network.is_empty() {
+            for p in &network {
+                self.cache.map.insert(
+                    p.clone(),
+                    crate::soundboard::LoadState::Failed(
+                        "Son sur un partage réseau, hors de la session : remplacez-le (clic droit) pour le copier dans la session".into(),
+                    ),
+                );
+            }
+            self.notify(
+                format!(
+                    "{} son(s) du soundboard sur un partage réseau non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
+                    network.len()
+                ),
+                true,
+            );
+        }
         if fresh {
             // Nouvelle session : même taille de grille que jusqu'ici.
             b.cols = self.board.cols;
