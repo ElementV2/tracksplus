@@ -214,6 +214,8 @@ pub struct Shared {
     epoch: std::time::Instant,
     /// Données perdues car le disque n'a pas suivi.
     pub overruns: AtomicU32,
+    /// Idem pour la copie de sécurité (second disque).
+    pub copy_overruns: AtomicU32,
     /// Trous de lecture.
     pub underruns: AtomicU32,
     /// Taille réelle des blocs reçus du pilote (trames par appel), entrée et sortie :
@@ -226,9 +228,9 @@ pub struct Shared {
     /// n'ont aucune conséquence (et certains pilotes, surtout virtuels, en signalent).
     pub counting: AtomicBool,
     pub last_error: Mutex<Option<String>>,
-    /// Carte son disparue ou flux invalidé (DVS relancé, USB débranché, périphérique par
-    /// défaut changé, fréquence modifiée dans le pilote) : l'interface la rouvre.
-    pub device_lost: AtomicBool,
+    /// Flux disparus ou invalidés (DVS relancé, USB débranché, fréquence modifiée dans
+    /// le pilote), un bit par flux (`LOST_*`) : l'interface les rouvre.
+    pub device_lost: std::sync::atomic::AtomicU8,
     /// Crêtes L/R de la lecture multipiste (bits f32).
     pub master_play: [AtomicU32; 2],
     /// Crêtes L/R du soundboard (bits f32).
@@ -259,13 +261,14 @@ impl Shared {
             out_cb_ns: AtomicU64::new(0),
             epoch: std::time::Instant::now(),
             overruns: AtomicU32::new(0),
+            copy_overruns: AtomicU32::new(0),
             underruns: AtomicU32::new(0),
             xruns: AtomicU32::new(0),
             counting: AtomicBool::new(false),
             in_block: AtomicU32::new(0),
             out_block: AtomicU32::new(0),
             last_error: Mutex::new(None),
-            device_lost: AtomicBool::new(false),
+            device_lost: std::sync::atomic::AtomicU8::new(0),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
             master_mon: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -318,14 +321,14 @@ impl Shared {
         (base + ahead).min(cur)
     }
 
-    fn on_error(&self, err: cpal::Error) {
+    /// `stream` : bit `LOST_*` du flux qui signale l'erreur.
+    fn on_error(&self, err: cpal::Error, stream: u8) {
+        // (« DeviceChanged » n'est pas une perte : le flux continue, selon cpal.)
         if matches!(
             err.kind(),
-            cpal::ErrorKind::DeviceNotAvailable
-                | cpal::ErrorKind::StreamInvalidated
-                | cpal::ErrorKind::DeviceChanged
+            cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated
         ) {
-            self.device_lost.store(true, Ordering::Release);
+            self.device_lost.fetch_or(stream, Ordering::Release);
         }
         if err.kind() == cpal::ErrorKind::Xrun {
             if self.counting.load(Ordering::Relaxed) {
@@ -337,6 +340,12 @@ impl Shared {
         }
     }
 }
+
+/// Flux concernés par une perte de périphérique (`Shared::device_lost`).
+pub const LOST_INPUT: u8 = 1;
+pub const LOST_OUTPUT: u8 = 2;
+pub const LOST_PADS: u8 = 4;
+pub const LOST_MONITOR: u8 = 8;
 
 /// Durée → trames à la fréquence `sr` (saturé, sans allocation).
 fn to_frames(d: std::time::Duration, sr: u32) -> u32 {
@@ -353,6 +362,9 @@ pub struct RecTarget {
     pub prod: Producer<f32>,
     /// Trames perdues (tampon plein) pas encore compensées par du silence.
     pub pending: usize,
+    /// Copie de sécurité (second disque) : son propre tampon, rempli ici même — elle ne
+    /// dépend en rien du disque principal. (tampon, trames perdues à compenser)
+    pub copy: Option<(Producer<f32>, usize)>,
 }
 
 impl RecTarget {
@@ -362,7 +374,14 @@ impl RecTarget {
             width: 1,
             prod,
             pending: 0,
+            copy: None,
         }
+    }
+
+    /// Avec copie de sécurité vers `copy`.
+    pub fn with_copy(mut self, copy: Option<Producer<f32>>) -> Self {
+        self.copy = copy.map(|p| (p, 0));
+        self
     }
 
     /// Paire stéréo `left`, `left + 1`.
@@ -372,6 +391,7 @@ impl RecTarget {
             width: 2,
             prod,
             pending: 0,
+            copy: None,
         }
     }
 }
@@ -747,6 +767,7 @@ impl Engine {
             &self.shared.xruns,
             &self.shared.underruns,
             &self.shared.overruns,
+            &self.shared.copy_overruns,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -891,15 +912,17 @@ struct InState {
 impl InState {
     /// Décrochage non signalé par le pilote : l'instant de capture d'un bloc doit suivre
     /// celui du précédent de sa durée exacte, quelle que soit la régularité de livraison
-    /// (rafales comprises). Un saut plus grand que la durée d'un bloc (et que 3 ms) veut
-    /// dire que des échantillons ont été perdus en amont.
+    /// (rafales comprises). Un saut de plus de deux blocs (et de 10 ms) au-delà veut dire
+    /// que des échantillons ont été perdus en amont.
     fn check_capture_gap(&mut self, capture: cpal::StreamInstant, frames: usize) {
         if let Some((prev, n)) = self.last_capture
             && let Some(dt) = capture.checked_duration_since(prev)
             && self.sample_rate > 0
         {
             let expected = n as f64 / self.sample_rate as f64;
-            let tolerance = (frames as f64 / self.sample_rate as f64).max(0.003);
+            // Au moins deux blocs et 10 ms : l'horloge système de certains pilotes ASIO
+            // est grossière (pas de fausse alerte), une vraie coupure dépasse largement.
+            let tolerance = (2.0 * frames as f64 / self.sample_rate as f64).max(0.010);
             if dt.as_secs_f64() > expected + tolerance
                 && self.shared.counting.load(Ordering::Relaxed)
             {
@@ -1003,16 +1026,21 @@ impl InState {
         if !st.targets.is_empty() {
             for t in &mut st.targets {
                 let cs = t.channels;
-                let lost = feed_target(t, frames, |f, k| {
+                let sample = |f: usize, k: usize| {
                     let c = cs[k];
                     if c < ch {
                         data[f * ch + c].to_sample::<f32>()
                     } else {
                         0.0
                     }
-                });
-                if lost {
+                };
+                if feed(&mut t.prod, &mut t.pending, t.width, frames, &sample) {
                     sh.overruns.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some((p, pending)) = &mut t.copy
+                    && feed(p, pending, t.width, frames, &sample)
+                {
+                    sh.copy_overruns.fetch_add(1, Ordering::Relaxed);
                 }
             }
             sh.rec_frames.fetch_add(frames as u64, Ordering::Release);
@@ -1040,7 +1068,7 @@ where
             }
             st.process(data);
         },
-        move |e| err_shared.on_error(e),
+        move |e| err_shared.on_error(e, LOST_INPUT),
         None,
     )?;
     Ok(stream)
@@ -1051,22 +1079,34 @@ where
 /// à leur place dès que le tampon a de nouveau de la place. Retourne `true` en cas de perte.
 /// `sample(trame, k)` donne l'échantillon du k-ième canal de la cible. Tout se compte en
 /// trames entières : une piste stéréo ne se désentrelace jamais.
+#[cfg(test)]
 fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize, usize) -> f32) -> bool {
-    let w = t.width.max(1);
-    if t.pending > 0 {
-        let z = t.pending.min(t.prod.slots() / w);
-        if let Ok(chunk) = t.prod.write_chunk_uninit(z * w) {
+    feed(&mut t.prod, &mut t.pending, t.width, frames, &sample)
+}
+
+/// Écrit un bloc dans un tampon disque (voir `feed_target`).
+fn feed(
+    prod: &mut Producer<f32>,
+    pending: &mut usize,
+    width: usize,
+    frames: usize,
+    sample: &impl Fn(usize, usize) -> f32,
+) -> bool {
+    let w = width.max(1);
+    if *pending > 0 {
+        let z = (*pending).min(prod.slots() / w);
+        if let Ok(chunk) = prod.write_chunk_uninit(z * w) {
             chunk.fill_from_iter(std::iter::repeat_n(0.0f32, z * w));
         }
-        t.pending -= z;
+        *pending -= z;
     }
-    let n = if t.pending > 0 {
+    let n = if *pending > 0 {
         0
     } else {
-        frames.min(t.prod.slots() / w)
+        frames.min(prod.slots() / w)
     };
     if n > 0
-        && let Ok(chunk) = t.prod.write_chunk_uninit(n * w)
+        && let Ok(chunk) = prod.write_chunk_uninit(n * w)
     {
         // Cas courants spécialisés (pas de division par échantillon).
         match w {
@@ -1076,7 +1116,7 @@ fn feed_target(t: &mut RecTarget, frames: usize, sample: impl Fn(usize, usize) -
         };
     }
     if n < frames {
-        t.pending += frames - n;
+        *pending += frames - n;
         return true;
     }
     false
@@ -1499,6 +1539,13 @@ where
     T: SizedSample + FromSample<f32> + Send + 'static,
 {
     let err_shared = st.shared.clone();
+    let role = if st.main {
+        LOST_OUTPUT
+    } else if st.monitor.is_some() {
+        LOST_MONITOR
+    } else {
+        LOST_PADS
+    };
     let stream = dev.build_output_stream::<T, _, _>(
         cfg,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
@@ -1559,7 +1606,7 @@ where
                 done += n;
             }
         },
-        move |e| err_shared.on_error(e),
+        move |e| err_shared.on_error(e, role),
         None,
     )?;
     Ok(stream)
@@ -1595,8 +1642,11 @@ mod tests {
             st.check_capture_gap(at(k * 480), 480);
         }
         assert_eq!(shared.xruns.load(Ordering::Relaxed), 0);
-        // 960 trames manquantes (20 ms) : un décrochage.
-        st.check_capture_gap(at(10 * 480 + 960), 480);
+        // Petit retard d'horloge (5 ms) : pas d'alerte.
+        st.check_capture_gap(at(10 * 480 + 240), 480);
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 0);
+        // 1920 trames manquantes (40 ms) : un décrochage.
+        st.check_capture_gap(at(11 * 480 + 240 + 1920), 480);
         assert_eq!(shared.xruns.load(Ordering::Relaxed), 1);
     }
 
@@ -1629,9 +1679,11 @@ mod tests {
         };
         let (p1, _c1) = rtrb::RingBuffer::new(4096);
         let (p2, _c2) = rtrb::RingBuffer::new(1 << 20);
+        // Copie de sécurité sur la piste stéréo, avec un petit tampon (pertes comprises).
+        let (p3, _c3) = rtrb::RingBuffer::new(4096);
         tx.send(InCmd::Record(vec![
             RecTarget::new(1, p1),
-            RecTarget::stereo(4, p2),
+            RecTarget::stereo(4, p2).with_copy(Some(p3)),
         ]))
         .unwrap();
         let data_f = vec![0.25f32; 256 * 8];
@@ -1981,15 +2033,16 @@ mod tests {
     fn on_error_never_blocks() {
         let sh = Shared::new();
         let guard = sh.last_error.lock();
-        sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into());
+        sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into(), LOST_PADS);
         drop(guard);
-        sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into());
+        sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into(), LOST_PADS);
         assert!(sh.last_error.lock().is_some());
         // Carte disparue : signalée pour la reconnexion automatique (un décrochage, non).
-        assert!(sh.device_lost.load(Ordering::Acquire));
+        assert_eq!(sh.device_lost.load(Ordering::Acquire), LOST_PADS);
         let sh2 = Shared::new();
-        sh2.on_error(cpal::ErrorKind::Xrun.into());
-        assert!(!sh2.device_lost.load(Ordering::Acquire));
+        sh2.on_error(cpal::ErrorKind::Xrun.into(), LOST_INPUT);
+        sh2.on_error(cpal::ErrorKind::DeviceChanged.into(), LOST_INPUT);
+        assert_eq!(sh2.device_lost.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2005,10 +2058,10 @@ mod tests {
     #[test]
     fn xruns_count_only_while_active() {
         let sh = Shared::new();
-        sh.on_error(cpal::ErrorKind::Xrun.into());
+        sh.on_error(cpal::ErrorKind::Xrun.into(), LOST_INPUT);
         assert_eq!(sh.xruns.load(Ordering::Relaxed), 0, "à l'arrêt : ignoré");
         sh.counting.store(true, Ordering::Relaxed);
-        sh.on_error(cpal::ErrorKind::Xrun.into());
+        sh.on_error(cpal::ErrorKind::Xrun.into(), LOST_INPUT);
         assert_eq!(sh.xruns.load(Ordering::Relaxed), 1);
         assert!(
             sh.last_error.lock().is_none(),

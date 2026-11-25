@@ -91,7 +91,13 @@ impl Voice {
         let fade = fade.max(64);
         match self.release {
             Some((rem, _)) if rem <= fade => {}
-            _ => self.release = Some((fade, fade)),
+            // Fondu déjà en cours, plus long : on le raccourcit en partant du niveau
+            // actuel (jamais de remontée du volume, ex. second appui sur la panique).
+            Some((rem, total)) => {
+                let k = rem as f64 / total.max(1) as f64;
+                self.release = Some((((k * fade as f64).floor() as usize).max(1), fade));
+            }
+            None => self.release = Some((fade, fade)),
         }
     }
 }
@@ -158,7 +164,9 @@ impl Sampler {
                 params,
             } => {
                 let debounce = (self.sample_rate * DEBOUNCE_MS / 1000) as u64;
-                if params.mode != PadMode::Gate
+                // Seulement pour « Lecture-Stop » : là, un rebond arrêterait le son à peine
+                // lancé. (« Relancer » doit rester jouable en appuis rapides.)
+                if params.mode == PadMode::Toggle
                     && let Some(last) = self.last_press.get_mut(slot as usize)
                 {
                     if *last != 0 && self.clock.saturating_sub(*last) < debounce {
@@ -551,5 +559,33 @@ mod tests {
             s.render(&mut out, 1024, &pos);
         }
         assert!(out.iter().all(|&x| x == 0.0));
+    }
+
+    /// Second appui sur la panique pendant le fondu : jamais de remontée du volume.
+    #[test]
+    fn second_panic_never_raises_level() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        tx.send(PadCmd::Press {
+            slot: 0,
+            sample: sample(96000),
+            params: params(PadMode::Toggle, 96000),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 2048];
+        s.render(&mut out, 1024, &pos);
+        tx.send(PadCmd::FadeAll { frames: 48000 }).unwrap();
+        for _ in 0..24 {
+            out.fill(0.0);
+            s.render(&mut out, 1024, &pos);
+        }
+        let before = out[2046].abs();
+        tx.send(PadCmd::StopAll).unwrap();
+        out.fill(0.0);
+        s.render(&mut out, 1024, &pos);
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(peak <= before + 1e-6, "{peak} > {before}");
     }
 }

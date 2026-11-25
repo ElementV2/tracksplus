@@ -12,13 +12,13 @@ use crate::project::RecFormat;
 use crate::render::{PeakAccum, Peaks};
 use crossbeam_channel::Sender;
 use hound::WavSpec;
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::Consumer;
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -116,8 +116,6 @@ pub struct Recorder {
     handle: Option<JoinHandle<Vec<RecResult>>>,
     /// Copie de sécurité sur un second disque (son propre thread et ses propres tampons).
     backup: Option<Box<Recorder>>,
-    /// Échantillons que la copie n'a pas pu recevoir (second disque trop lent).
-    copy_lost: Arc<AtomicU64>,
 }
 
 struct SegWriter {
@@ -134,48 +132,6 @@ struct SegWriter {
 struct Lane {
     cons: Consumer<f32>,
     st: LaneState,
-    /// Copie de sécurité (second disque) : mêmes échantillons, vers un autre thread.
-    copy: Option<CopyOut>,
-}
-
-/// Envoi des échantillons vers l'enregistreur de la copie de sécurité. Jamais bloquant :
-/// si le second disque ne suit pas, la copie perd des échantillons (remplacés par du
-/// silence, elle reste calée), l'enregistrement principal n'est jamais ralenti.
-struct CopyOut {
-    prod: Producer<f32>,
-    /// Échantillons perdus, à remplacer par du silence dès qu'il y a de la place.
-    pending: usize,
-    lost: Arc<AtomicU64>,
-}
-
-impl CopyOut {
-    fn forward(&mut self, a: &[f32], b: &[f32]) {
-        if self.prod.is_abandoned() {
-            return;
-        }
-        if self.pending > 0 {
-            let z = self.pending.min(self.prod.slots());
-            if let Ok(c) = self.prod.write_chunk_uninit(z) {
-                c.fill_from_iter(std::iter::repeat_n(0.0f32, z));
-            }
-            self.pending -= z;
-        }
-        let total = a.len() + b.len();
-        let n = if self.pending > 0 {
-            0
-        } else {
-            total.min(self.prod.slots())
-        };
-        if n > 0
-            && let Ok(c) = self.prod.write_chunk_uninit(n)
-        {
-            c.fill_from_iter(a.iter().chain(b).copied().take(n));
-        }
-        if n < total {
-            self.pending += total - n;
-            self.lost.fetch_add((total - n) as u64, Ordering::Relaxed);
-        }
-    }
 }
 
 struct LaneState {
@@ -415,6 +371,25 @@ impl LaneState {
     }
 }
 
+/// Copies de sécurité en train de se terminer (voir `wait_backups`).
+static BACKUP_FINISHING: parking_lot::Mutex<Vec<JoinHandle<()>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// À la fermeture de l'application : laisse les copies de sécurité finir d'écrire (au
+/// plus `timeout`, un second disque mort ne bloque pas la fermeture).
+pub fn wait_backups(timeout: Duration) {
+    let t0 = Instant::now();
+    loop {
+        let mut v = BACKUP_FINISHING.lock();
+        v.retain(|h| !h.is_finished());
+        if v.is_empty() || t0.elapsed() > timeout {
+            return;
+        }
+        drop(v);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Erreurs signalées avant le démarrage du thread (copie impossible…) ajoutées à celles
 /// du thread principal.
 fn errors_merge(into: &Errors, early: &Errors) {
@@ -450,7 +425,7 @@ impl Recorder {
         specs: Vec<RecSpec>,
         sample_rate: u32,
         format: RecFormat,
-        backup: Option<PathBuf>,
+        backup: Option<(PathBuf, Vec<Consumer<f32>>)>,
     ) -> std::io::Result<Self> {
         Self::spawn(specs, sample_rate, format, MAX_SEGMENT_BYTES, backup)
     }
@@ -460,48 +435,45 @@ impl Recorder {
         sample_rate: u32,
         format: RecFormat,
         max_bytes: u64,
-        backup: Option<PathBuf>,
+        backup: Option<(PathBuf, Vec<Consumer<f32>>)>,
     ) -> std::io::Result<Self> {
+        // Heure du début de la prise, la même pour toutes les pistes et pour la copie de
+        // sécurité : tous les fichiers restent calés entre eux dans un logiciel qui les
+        // place à leur heure (TimeReference du BWF).
+        let take_time = chrono::Local::now().naive_local();
+        let time_ref = {
+            use chrono::Timelike;
+            let t = take_time.time();
+            t.num_seconds_from_midnight() as u64 * sample_rate as u64
+                + t.nanosecond() as u64 * sample_rate as u64 / 1_000_000_000
+        };
+        let clock = (take_time, time_ref);
         let errors: Errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let copy_lost = Arc::new(AtomicU64::new(0));
-        let mut copies = Vec::new();
         let mut backup_rec = None;
-        if let Some(dir) = backup {
-            // Tampon de la copie : 3 à 10 s dans un budget de 128 Mo.
-            let channels: usize = specs.iter().map(|s| s.channels.max(1) as usize).sum();
-            let per_sec = sample_rate as usize * channels.max(1) * 4;
-            let secs = ((128usize << 20) / per_sec.max(1)).clamp(3, 10);
-            let mut bspecs = Vec::new();
-            for s in &specs {
-                let width = s.channels.max(1) as usize;
-                let (prod, cons) = RingBuffer::new(sample_rate as usize * secs * width);
-                copies.push(Some(CopyOut {
-                    prod,
-                    pending: 0,
-                    lost: copy_lost.clone(),
-                }));
-                bspecs.push(RecSpec {
+        if let Some((dir, conss)) = backup {
+            // Mêmes pistes, alimentées directement par le callback audio (tampons à
+            // part) : la copie ne dépend en rien du disque principal.
+            let bspecs: Vec<RecSpec> = specs
+                .iter()
+                .zip(conss)
+                .map(|(s, cons)| RecSpec {
                     track_id: s.track_id,
                     file: s.file.clone(),
                     path: dir.join(&s.file),
                     peaks: Default::default(),
                     cons,
                     channels: s.channels,
-                });
-            }
-            match Self::spawn_writer(bspecs, sample_rate, format, max_bytes, Some(dir), vec![]) {
+                })
+                .collect();
+            match Self::spawn_writer(bspecs, sample_rate, format, max_bytes, Some(dir), clock) {
                 Ok(r) => backup_rec = Some(Box::new(r)),
-                Err(e) => {
-                    copies.clear();
-                    errors
-                        .lock()
-                        .push(format!("copie de sécurité impossible : {e}"));
-                }
+                Err(e) => errors
+                    .lock()
+                    .push(format!("copie de sécurité impossible : {e}")),
             }
         }
-        let mut me = Self::spawn_writer(specs, sample_rate, format, max_bytes, None, copies)?;
+        let mut me = Self::spawn_writer(specs, sample_rate, format, max_bytes, None, clock)?;
         me.backup = backup_rec;
-        me.copy_lost = copy_lost;
         errors_merge(&me.errors, &errors);
         Ok(me)
     }
@@ -515,7 +487,7 @@ impl Recorder {
         format: RecFormat,
         max_bytes: u64,
         backup_dir: Option<PathBuf>,
-        copies: Vec<Option<CopyOut>>,
+        clock: (chrono::NaiveDateTime, u64),
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -536,8 +508,8 @@ impl Recorder {
                     max_bytes,
                     stop2,
                     errors2,
-                    copies,
                     move_aside,
+                    clock,
                 )
             })?;
         Ok(Self {
@@ -545,7 +517,6 @@ impl Recorder {
             errors,
             handle: Some(handle),
             backup: None,
-            copy_lost: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -567,10 +538,6 @@ impl Recorder {
                 v.push("copie de sécurité arrêtée (erreur interne)".into());
             }
         }
-        let lost = self.copy_lost.load(Ordering::Relaxed);
-        if lost > 0 {
-            v.push("copie de sécurité : le second disque ne suit pas (silence inséré)".into());
-        }
         v
     }
 
@@ -589,12 +556,14 @@ impl Recorder {
         let res = self.finish_main();
         // La copie se termine à part (son disque peut être lent) : l'enregistrement
         // principal rend la main sans l'attendre.
-        if let Some(b) = backup {
-            let _ = std::thread::Builder::new()
+        if let Some(b) = backup
+            && let Ok(h) = std::thread::Builder::new()
                 .name("tracksplus-backup-finish".into())
                 .spawn(move || {
                     let _ = b.finish();
-                });
+                })
+        {
+            BACKUP_FINISHING.lock().push(h);
         }
         res
     }
@@ -657,19 +626,9 @@ fn run(
     max_bytes: u64,
     stop: Arc<AtomicBool>,
     errors: Errors,
-    copies: Vec<Option<CopyOut>>,
     move_aside: bool,
+    (take_time, time_ref): (chrono::NaiveDateTime, u64),
 ) -> Vec<RecResult> {
-    let mut copies = copies.into_iter();
-    // Heure du début de la prise (la même pour toutes les pistes : elles restent calées
-    // entre elles dans un logiciel qui place les fichiers à leur heure).
-    let take_time = chrono::Local::now().naive_local();
-    let time_ref = {
-        use chrono::Timelike;
-        let t = take_time.time();
-        t.num_seconds_from_midnight() as u64 * sample_rate as u64
-            + t.nanosecond() as u64 * sample_rate as u64 / 1_000_000_000
-    };
     let mut lanes: Vec<Lane> = specs
         .into_iter()
         .map(|spec| {
@@ -700,7 +659,6 @@ fn run(
             Lane {
                 cons: spec.cons,
                 st,
-                copy: copies.next().flatten(),
             }
         })
         .collect();
@@ -736,9 +694,6 @@ fn run(
             let bytes_per_frame = (st.wav.bits_per_sample / 8) as u64 * width as u64;
             let max_frames = (max_bytes.saturating_sub(1024) / bytes_per_frame).max(1);
             let (a, b) = chunk.as_slices();
-            if let Some(c) = &mut lane.copy {
-                c.forward(a, b);
-            }
             for &s in a.iter().chain(b) {
                 // Position dans la trame, indépendante de l'état du fichier : même après
                 // une erreur d'écriture, les canaux restent dans le bon ordre.
@@ -1275,6 +1230,8 @@ mod tests {
         for (backup, ok) in [(copy.clone(), true), (base.join("bloque/Audio"), false)] {
             let file = if ok { "a.wav" } else { "b.wav" };
             let (mut prod, cons) = rtrb::RingBuffer::new(100_000);
+            // Second tampon, rempli en même temps (par le callback audio dans l'app).
+            let (mut cprod, ccons) = rtrb::RingBuffer::new(100_000);
             let rec = Recorder::start_with_backup(
                 vec![RecSpec {
                     track_id: 1,
@@ -1286,14 +1243,17 @@ mod tests {
                 }],
                 48000,
                 RecFormat::Int24,
-                Some(backup.clone()),
+                Some((backup.clone(), vec![ccons])),
             )
             .unwrap();
             assert!(rec.has_backup());
             for i in 0..2 * 30_000 {
-                prod.push(((i % 97) as f32 - 48.0) / 100.0).unwrap();
+                let v = ((i % 97) as f32 - 48.0) / 100.0;
+                prod.push(v).unwrap();
+                cprod.push(v).unwrap();
             }
             drop(prod);
+            drop(cprod);
             if !ok {
                 // Erreur signalée par le thread de la copie, sans toucher au principal.
                 let t0 = Instant::now();

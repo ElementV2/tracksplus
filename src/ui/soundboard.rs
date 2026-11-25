@@ -209,7 +209,7 @@ impl App {
                 BtnStyle::Ghost
             },
             playing,
-            "Tout arrêter, tout de suite (Échap)",
+            "Tout arrêter (Échap) : fondu d'une seconde ; second appui pendant le fondu : arrêt net",
         )
         .clicked()
         {
@@ -946,6 +946,11 @@ impl App {
                 self.board.locked = !locked;
                 self.sb.drag_pad = None;
                 self.sb.renaming = None;
+                // Une affectation MIDI / clavier en attente transformerait le premier appui
+                // du spectacle en réaffectation au lieu de jouer le pad.
+                self.sb.learn_midi = None;
+                self.sb.learn_key = None;
+                self.sb.midi_dirty = true;
                 self.board_changed = Some(self.now);
             }
             ui.add_space(4.0);
@@ -1050,6 +1055,16 @@ impl App {
     /// Onglet « Soundboard » des réglages : contrôleur MIDI, LED, disposition et taille de
     /// la grille (la sortie des pads se règle dans l'onglet « Carte son »).
     pub fn sb_settings(&mut self, ui: &mut egui::Ui) {
+        if self.board.locked {
+            ui.label(
+                egui::RichText::new(
+                    "Mode spectacle actif : déverrouillez le soundboard (cadenas) pour modifier ces réglages.",
+                )
+                .color(t::TEXT_3),
+            );
+            ui.add_space(6.0);
+            ui.disable();
+        }
         egui::Grid::new("sb_settings_grid")
                     .num_columns(2)
                     .spacing([16.0, 10.0])

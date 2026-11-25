@@ -264,6 +264,14 @@ fn record_buffer_secs(sr: u32, channels: usize) -> usize {
     (BUDGET / per_sec.max(1)).clamp(4, 15)
 }
 
+/// Travail du thread de la copie de sécurité de la session.
+pub struct BackupJob {
+    project: Project,
+    dir: PathBuf,
+    journal: Option<recovery::Journal>,
+    done: bool,
+}
+
 const OUTPUT_STALLED: &str =
     "La sortie audio ne répond pas : vérifiez la carte son (Réglages audio pour la relancer)";
 
@@ -321,6 +329,9 @@ pub struct App {
     pub backup_root: Option<PathBuf>,
     /// Problèmes de la copie de sécurité pendant la dernière prise (affichés à la fin).
     pub backup_warn: Vec<String>,
+    /// Thread qui tient à jour le double de la session sur le second disque.
+    pub backup_jobs: Option<std::sync::mpsc::Sender<BackupJob>>,
+    pub backup_thread: Option<std::thread::JoinHandle<()>>,
     /// Carte son perdue : prochain essai de réouverture (secondes) et délai courant.
     pub reconnect: Option<(f64, f64)>,
     /// Mesure de l'espace disque libre en cours (thread).
@@ -508,6 +519,8 @@ impl App {
             leave_anyway_at: f64::NEG_INFINITY,
             backup_root: crate::sessions::StartupPrefs::load().backup_dir,
             backup_warn: Vec::new(),
+            backup_jobs: None,
+            backup_thread: None,
             reconnect: None,
             disk_job: None,
             rec_latency: 0,
@@ -795,6 +808,11 @@ impl App {
         let mut used = HashSet::new();
         self.live.clear();
         let ring_secs = record_buffer_secs(sr, armed.iter().map(|a| if a.3 { 2 } else { 1 }).sum());
+        // Copie de sécurité : un second tampon par piste, rempli par le callback audio
+        // lui-même (même taille que le principal) — si le disque principal se bloque, la
+        // copie continue.
+        let backup = self.backup_session_dir();
+        let mut copy_conss = Vec::new();
         for (track_id, name, input, stereo) in armed {
             // Nom unique sur le disque et dans cette prise, sans tenir compte de la casse.
             let file = self.project.new_take_file_avoiding(&name, &used);
@@ -810,11 +828,19 @@ impl App {
                 cons,
                 channels: width,
             });
-            targets.push(if stereo {
-                RecTarget::stereo(input as usize, prod)
-            } else {
-                RecTarget::new(input as usize, prod)
+            let copy = backup.is_some().then(|| {
+                let (p, c) = rtrb::RingBuffer::new(sr as usize * ring_secs * width as usize);
+                copy_conss.push(c);
+                p
             });
+            targets.push(
+                if stereo {
+                    RecTarget::stereo(input as usize, prod)
+                } else {
+                    RecTarget::new(input as usize, prod)
+                }
+                .with_copy(copy),
+            );
             self.live.push(LiveTake { track_id, peaks });
         }
         // Sécurité : la session et le journal des prises sont écrits AVANT de lancer
@@ -849,21 +875,19 @@ impl App {
         // Copie de sécurité : double de la session (fichier de session et journal compris)
         // sur le second disque, écrit dans un thread — un disque en veille ne retarde pas
         // la prise ; s'il est absent, la prise principale se fait quand même.
-        let backup = self.backup_session_dir();
-        if let Some(bdir) = &backup {
-            let (mut copy, j, bdir) = (self.project.clone(), journal_copy.clone(), bdir.clone());
-            std::thread::spawn(move || {
-                copy.dir = bdir.clone();
-                let _ = copy.save();
-                let _ = recovery::write_journal(&bdir, &j);
-            });
-        }
+        self.backup_session_job(Some(journal_copy.clone()), false);
         self.backup_warn.clear();
+        if self.backup_root.is_some() && backup.is_none() {
+            self.notify(
+                "Copie de sécurité inactive pour cette session : elle est déjà sur le disque de secours",
+                false,
+            );
+        }
         let recorder = match Recorder::start_with_backup(
             specs,
             sr,
             self.project.rec_format,
-            backup.map(|d| d.join(project::AUDIO_DIR)),
+            backup.map(|d| (d.join(project::AUDIO_DIR), copy_conss)),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -960,6 +984,12 @@ impl App {
                             .into_iter()
                             .filter(|e| e.starts_with("copie"))
                             .collect();
+                        if self.engine.shared.copy_overruns.load(Ordering::Relaxed) > 0 {
+                            self.backup_warn.push(
+                                "le second disque n'a pas suivi (silence inséré dans la copie)"
+                                    .into(),
+                            );
+                        }
                         let (tx, rx) = std::sync::mpsc::channel();
                         std::thread::spawn(move || {
                             let _ = tx.send(rec.finish());
@@ -997,6 +1027,9 @@ impl App {
         j.play_offset = self.engine.shared.rec_play_offset.load(Ordering::Relaxed);
         j.latency = self.rec_latency;
         let _ = recovery::write_journal(&self.project.dir, &j);
+        // Journal complété aussi sur la copie de sécurité (prise recalée correctement si
+        // c'est elle qu'on récupère).
+        self.backup_session_job(Some(j.clone()), false);
     }
 
     /// Fin de prise terminée en arrière-plan : on intègre les prises. `wait` : attendre
@@ -1212,10 +1245,12 @@ impl App {
     /// logiciels pro, on la rouvre tout seul. Jamais pendant une prise (elle se termine
     /// proprement par Stop, la suite est récupérable) ; la lecture, elle, est arrêtée.
     fn watch_device(&mut self) {
+        use crate::audio::{LOST_OUTPUT, LOST_PADS};
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
-        if lost && self.reconnect.is_none() {
+        if lost != 0 && self.reconnect.is_none() {
             self.reconnect = Some((self.now + 1.0, 1.0));
-            if matches!(self.transport, Transport::Playing { .. }) {
+            // Lecture multipiste arrêtée seulement si c'est sa sortie qui a disparu.
+            if lost & LOST_OUTPUT != 0 && matches!(self.transport, Transport::Playing { .. }) {
                 self.stop();
             }
             if !self.is_recording() {
@@ -1228,20 +1263,40 @@ impl App {
         if self.now < at || !self.is_stopped() {
             return;
         }
+        // Rouvrir la carte coupe tous les pads : on attend qu'ils aient fini, sauf si
+        // c'est justement leur sortie qui a disparu (ils sont muets de toute façon).
+        let pads_dead =
+            lost & LOST_PADS != 0 || (lost & LOST_OUTPUT != 0 && self.prefs.pad_output.is_none());
+        if self.pads_status().0 > 0 && !pads_dead {
+            return;
+        }
         self.engine.pad(PadCmd::StopAll);
         // L'ancien pilote est libéré avant (ASIO n'en accepte qu'un à la fois).
         self.engine = Engine::offline();
-        match Engine::open(&self.prefs, &self.prefs.pad_out()) {
+        let opened = Engine::open(&self.prefs, &self.prefs.pad_out());
+        let complete = match &opened {
+            // Tous les périphériques choisis sont-ils revenus ? (Sinon le moteur tourne avec
+            // ce qui est là, et on réessaie : DVS met parfois plusieurs secondes.)
             Ok(e) => {
-                self.engine = e;
-                self.reconnect = None;
-                self.cache.set_sample_rate(self.engine.status.sample_rate);
-                self.sync_engine_to_board();
-                self.notify("Carte son reconnectée", false);
+                let back =
+                    |want: &Option<String>, got: &Option<String>| want.is_none() || want == got;
+                back(&self.prefs.input, &e.status.input)
+                    && back(&self.prefs.output, &e.status.output)
             }
+            Err(_) => false,
+        };
+        if let Ok(e) = opened {
+            self.engine = e;
+            self.cache.set_sample_rate(self.engine.status.sample_rate);
+            self.sync_engine_to_board();
+        }
+        if complete {
+            self.reconnect = None;
+            self.notify("Carte son reconnectée", false);
+        } else {
             // Essais de plus en plus espacés (jusqu'à 10 s) : l'interface ne saccade pas
             // tant que la carte est absente.
-            Err(_) => self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0))),
+            self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0)));
         }
     }
 
@@ -1259,26 +1314,73 @@ impl App {
         self.backup_root = d;
     }
 
-    /// Dossier de la session dans la copie de sécurité (`<second disque>/<session>`).
+    /// Dossier de la session dans la copie de sécurité : `<second disque>/<session> (code)`,
+    /// le code distinguant deux sessions de même nom rangées à des endroits différents.
+    /// `None` si la session est elle-même sur le disque de secours (copie ouverte après
+    /// une panne du disque principal) : jamais deux écritures dans le même dossier.
     pub fn backup_session_dir(&self) -> Option<PathBuf> {
-        self.backup_root
-            .as_ref()
-            .map(|r| r.join(project::sanitize(&self.project.name)))
+        let root = self.backup_root.as_ref()?;
+        // Comparaison sans accès disque (le second disque peut être en veille) ; casse et
+        // séparateurs ignorés comme sous Windows.
+        let norm = |p: &Path| {
+            p.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_lowercase()
+        };
+        let (r, d) = (norm(root), norm(&self.project.dir));
+        let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
+        if inside(&d, &r) || inside(&r, &d) {
+            return None;
+        }
+        // FNV-1a : code stable d'une version à l'autre de l'application.
+        let code = d.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        });
+        Some(root.join(format!(
+            "{} ({:08x})",
+            project::sanitize(&self.project.name),
+            code as u32
+        )))
     }
 
-    /// Met à jour le double de la session sur le second disque (prises de la dernière
-    /// prise comprises) et y retire le journal, dans un thread.
-    fn sync_backup_session(&self) {
-        let Some(bdir) = self.backup_session_dir() else {
+    /// Met à jour le double de la session sur le second disque : fichier de session, et
+    /// journal de la prise en cours (`journal`) ou son retrait (`done`). Un seul thread,
+    /// travaux dans l'ordre : un ancien état n'écrase jamais un plus récent, même si le
+    /// second disque est lent à se réveiller.
+    fn backup_session_job(&mut self, journal: Option<recovery::Journal>, done: bool) {
+        let Some(dir) = self.backup_session_dir() else {
             return;
         };
-        let mut copy = self.project.clone();
-        std::thread::spawn(move || {
-            copy.dir = bdir.clone();
-            if copy.save().is_ok() {
-                recovery::remove_journal(&bdir);
-            }
+        let tx = self.backup_jobs.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<BackupJob>();
+            let h = std::thread::Builder::new()
+                .name("tracksplus-backup-session".into())
+                .spawn(move || {
+                    for mut job in rx {
+                        job.project.dir = job.dir.clone();
+                        let saved = job.project.save().is_ok();
+                        if let Some(j) = &job.journal {
+                            let _ = recovery::write_journal(&job.dir, j);
+                        } else if job.done && saved {
+                            recovery::remove_journal(&job.dir);
+                        }
+                    }
+                })
+                .ok();
+            self.backup_thread = h;
+            tx
         });
+        let _ = tx.send(BackupJob {
+            project: self.project.clone(),
+            dir,
+            journal,
+            done,
+        });
+    }
+
+    fn sync_backup_session(&mut self) {
+        self.backup_session_job(None, true);
     }
 
     /// Prise illisible pendant la lecture (fichier absent, déplacé ou abîmé) : elle est
@@ -1333,6 +1435,12 @@ impl App {
         let ov = self.engine.shared.overruns.load(Ordering::Relaxed);
         if ov > 0 {
             alerts.push(format!("{ov} pertes de données : le disque ne suit pas"));
+        }
+        if self.engine.shared.copy_overruns.load(Ordering::Relaxed) > 0 {
+            alerts.push(
+                "Copie de sécurité : le second disque ne suit pas (la prise principale continue)"
+                    .into(),
+            );
         }
         if let Some(r) = &self.recorder {
             for e in r.errors() {
@@ -4340,6 +4448,16 @@ impl eframe::App for App {
         self.autosave();
         self.board_changed = Some(0.0);
         self.save_board_now();
+        // Copie de sécurité : fichiers des prises et double de la session finis d'écrire
+        // sur le second disque (borné : un disque mort ne bloque pas la fermeture).
+        crate::recorder::wait_backups(std::time::Duration::from_secs(15));
+        self.backup_jobs = None;
+        if let Some(h) = self.backup_thread.take() {
+            let t0 = std::time::Instant::now();
+            while !h.is_finished() && t0.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 }
 
