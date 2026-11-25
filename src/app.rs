@@ -704,6 +704,9 @@ impl App {
         self.engine.pad(PadCmd::SetOutput {
             left: (self.prefs.pad_out().left as usize).min(out_ch - 1),
         });
+        self.engine.pad(PadCmd::SetDebounce {
+            ms: self.board.debounce_ms,
+        });
         self.midi.shared.lock().tx = self.engine.pad_tx.clone();
         self.sb.midi_dirty = true;
     }
@@ -738,6 +741,8 @@ impl App {
             || self.finishing.is_some()
             || self.save_as_job.is_some()
             || self.audio_import.is_some()
+            || self.confirm_close
+            || self.sb.confirm_delete_page.is_some()
     }
 
     pub fn play(&mut self) {
@@ -1742,7 +1747,7 @@ impl App {
             ),
             _ => {}
         }
-        if let Some(e) = self.engine.shared.last_error.lock().clone() {
+        if let Some(e) = self.engine.shared.error_text() {
             alerts.push(format!("Carte son : {e}"));
         }
         alerts
@@ -2289,6 +2294,19 @@ impl App {
         };
         let name = self.project.name.clone();
         let dir = parent.join(project::sanitize(&name));
+        // Même dossier que la session actuelle : rien ne serait copié, ce n'est pas une
+        // nouvelle session (on ne prétend pas le contraire).
+        let same = |a: &Path, b: &Path| {
+            let c = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            c(a) == c(b)
+        };
+        if same(&dir, &self.project.dir) || same(&parent, &self.project.dir) {
+            self.notify(
+                "C'est déjà le dossier de cette session : choisissez un autre dossier pour en faire une copie",
+                true,
+            );
+            return;
+        }
         // Copie des prises et des sons dans un thread (fenêtre de progression) : l'interface
         // ne se fige pas, même avec des Go d'audio.
         let mut p = self.project.clone();
@@ -2645,6 +2663,9 @@ impl App {
         self.new_dlg = None;
         self.update_dlg = false;
         self.browser = None;
+        // Échap = « Annuler » des confirmations.
+        self.confirm_close = false;
+        self.sb.confirm_delete_page = None;
     }
 
     pub fn dialog_open(&self) -> bool {
@@ -3298,7 +3319,7 @@ impl App {
                     sh.overruns.store(0, Ordering::Relaxed);
                 }
             }
-            if let Some(e) = sh.last_error.lock().clone() {
+            if let Some(e) = sh.error_text() {
                 ui.label(
                     egui::RichText::new(format!("⚠ {e}"))
                         .font(t::medium(11.5))

@@ -177,6 +177,13 @@ pub struct Board {
     /// session) : jamais ouverts automatiquement (voir `load_session`).
     #[serde(skip)]
     pub network_pads: Vec<PathBuf>,
+    /// Anti-rebond des pads « Lecture-Stop » (ms, 0 = désactivé).
+    #[serde(default = "default_debounce")]
+    pub debounce_ms: u32,
+}
+
+fn default_debounce() -> u32 {
+    150
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -207,6 +214,7 @@ impl Default for Board {
             layout: PadLayout::Auto,
             locked: false,
             network_pads: Vec::new(),
+            debounce_ms: default_debounce(),
         }
     }
 }

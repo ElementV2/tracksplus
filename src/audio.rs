@@ -228,6 +228,8 @@ pub struct Shared {
     /// n'ont aucune conséquence (et certains pilotes, surtout virtuels, en signalent).
     pub counting: AtomicBool,
     pub last_error: Mutex<Option<String>>,
+    /// Dernière erreur d'un flux (code de `error_code`, 0 = aucune).
+    pub stream_error: std::sync::atomic::AtomicU8,
     /// Flux disparus ou invalidés (DVS relancé, USB débranché, fréquence modifiée dans
     /// le pilote), un bit par flux (`LOST_*`) : l'interface les rouvre.
     pub device_lost: std::sync::atomic::AtomicU8,
@@ -268,6 +270,7 @@ impl Shared {
             in_block: AtomicU32::new(0),
             out_block: AtomicU32::new(0),
             last_error: Mutex::new(None),
+            stream_error: std::sync::atomic::AtomicU8::new(0),
             device_lost: std::sync::atomic::AtomicU8::new(0),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -334,10 +337,44 @@ impl Shared {
             if self.counting.load(Ordering::Relaxed) {
                 self.xruns.fetch_add(1, Ordering::Relaxed);
             }
-        } else if let Some(mut e) = self.last_error.try_lock() {
-            // Jamais d'attente côté flux audio : message abandonné si l'interface lit.
-            *e = Some(err.to_string());
+        } else {
+            // Rien à allouer ni à verrouiller ici (ce rappel peut tourner sur le thread
+            // audio) : juste le genre d'erreur, l'interface écrit le message.
+            self.stream_error
+                .store(error_code(err.kind()), Ordering::Release);
         }
+    }
+
+    /// Dernière erreur à afficher : ouverture de la carte, sinon erreur d'un flux.
+    pub fn error_text(&self) -> Option<String> {
+        if let Some(e) = self.last_error.lock().clone() {
+            return Some(e);
+        }
+        let msg = match self.stream_error.load(Ordering::Acquire) {
+            0 => return None,
+            1 => "la carte son n'est plus disponible (débranchée ou pilote arrêté)",
+            2 => "flux audio interrompu par le pilote (réglage changé, pilote relancé)",
+            3 => "carte son occupée par une autre application",
+            4 => "réglage refusé par la carte son",
+            5 => "accès à la carte son refusé par le système",
+            6 => "ressources du pilote épuisées",
+            _ => "erreur du pilote audio",
+        };
+        Some(msg.to_string())
+    }
+}
+
+/// Code (sans allocation) d'une erreur de flux, voir `Shared::error_text`.
+fn error_code(k: cpal::ErrorKind) -> u8 {
+    use cpal::ErrorKind as K;
+    match k {
+        K::DeviceNotAvailable => 1,
+        K::StreamInvalidated => 2,
+        K::DeviceBusy => 3,
+        K::UnsupportedConfig | K::InvalidInput => 4,
+        K::PermissionDenied | K::RealtimeDenied => 5,
+        K::ResourceExhausted => 6,
+        _ => 7,
     }
 }
 
@@ -2108,7 +2145,10 @@ mod tests {
         sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into(), LOST_PADS);
         drop(guard);
         sh.on_error(cpal::ErrorKind::DeviceNotAvailable.into(), LOST_PADS);
-        assert!(sh.last_error.lock().is_some());
+        assert!(
+            sh.error_text()
+                .is_some_and(|t| t.contains("plus disponible"))
+        );
         // Carte disparue : signalée pour la reconnexion automatique (un décrochage, non).
         assert_eq!(sh.device_lost.load(Ordering::Acquire), LOST_PADS);
         let sh2 = Shared::new();

@@ -70,6 +70,16 @@ pub enum PadCmd {
     FadeAll {
         frames: usize,
     },
+    /// Anti-rebond des pads « Lecture-Stop » (ms, 0 = désactivé).
+    SetDebounce {
+        ms: u32,
+    },
+    /// Deux pads échangent leur place (pad déplacé dans la grille) : les sons en cours
+    /// suivent leur pad, sans coupure.
+    Swap {
+        a: u16,
+        b: u16,
+    },
     SetOutput {
         left: usize,
     },
@@ -109,11 +119,11 @@ fn smooth(x: f32) -> f32 {
     s * s
 }
 
-/// Deux appuis sur le même pad à moins de 150 ms : rebond d'un bouton MIDI ou double-clic
-/// involontaire — le second est ignoré (sinon un pad « appui = lecture / appui = stop »
-/// s'arrêterait aussitôt lancé). Comme la protection « double GO » des logiciels de
-/// spectacle.
-const DEBOUNCE_MS: usize = 150;
+/// Deux appuis sur le même pad à moins de 150 ms (par défaut, réglable) : rebond d'un
+/// bouton MIDI ou double-clic involontaire — le second est ignoré (sinon un pad « appui =
+/// lecture / appui = stop » s'arrêterait aussitôt lancé). Comme la protection « double GO »
+/// des logiciels de spectacle.
+const DEBOUNCE_MS: u32 = 150;
 
 pub struct Sampler {
     voices: Vec<Voice>,
@@ -121,6 +131,7 @@ pub struct Sampler {
     clock: u64,
     /// Horloge du dernier appui pris en compte, par pad (alloué une fois).
     last_press: Vec<u64>,
+    debounce_ms: u32,
     rx: Receiver<PadCmd>,
     garbage: Sender<Arc<SampleData>>,
     pub left: usize,
@@ -138,6 +149,7 @@ impl Sampler {
             voices: Vec::with_capacity(MAX_VOICES),
             clock: 0,
             last_press: vec![0; MAX_PADS],
+            debounce_ms: DEBOUNCE_MS,
             rx,
             garbage,
             left,
@@ -155,6 +167,25 @@ impl Sampler {
         self.sample_rate / 100 // 10 ms
     }
 
+    fn swap(&mut self, a: u16, b: u16, pad_pos: &[AtomicU64]) {
+        for v in &mut self.voices {
+            if v.slot == a {
+                v.slot = b;
+            } else if v.slot == b {
+                v.slot = a;
+            }
+        }
+        let (ia, ib) = (a as usize, b as usize);
+        if ia < pad_pos.len() && ib < pad_pos.len() {
+            let x = pad_pos[ia].load(Ordering::Relaxed);
+            pad_pos[ia].store(pad_pos[ib].load(Ordering::Relaxed), Ordering::Relaxed);
+            pad_pos[ib].store(x, Ordering::Relaxed);
+        }
+        if ia < self.last_press.len() && ib < self.last_press.len() {
+            self.last_press.swap(ia, ib);
+        }
+    }
+
     fn handle(&mut self, cmd: PadCmd) {
         let quick = self.quick();
         match cmd {
@@ -163,7 +194,7 @@ impl Sampler {
                 sample,
                 params,
             } => {
-                let debounce = (self.sample_rate * DEBOUNCE_MS / 1000) as u64;
+                let debounce = self.sample_rate as u64 * self.debounce_ms as u64 / 1000;
                 // Seulement pour « Lecture-Stop » : là, un rebond arrêterait le son à peine
                 // lancé. (« Relancer » doit rester jouable en appuis rapides.)
                 if params.mode == PadMode::Toggle
@@ -243,13 +274,20 @@ impl Sampler {
                 }
             }
             PadCmd::SetOutput { left } => self.left = left,
+            // Traité dans `render` (il faut les positions des pads).
+            PadCmd::Swap { .. } => {}
+            PadCmd::SetDebounce { ms } => self.debounce_ms = ms,
         }
     }
 
     /// Mixe les voix dans `out` (stéréo entrelacé, `frames` trames) en additionnant.
     pub fn render(&mut self, out: &mut [f32], frames: usize, pad_pos: &[AtomicU64]) {
         while let Ok(cmd) = self.rx.try_recv() {
-            self.handle(cmd);
+            if let PadCmd::Swap { a, b } = cmd {
+                self.swap(a, b, pad_pos);
+            } else {
+                self.handle(cmd);
+            }
         }
         self.clock += frames as u64;
         for v in &mut self.voices {
@@ -587,5 +625,28 @@ mod tests {
         s.render(&mut out, 1024, &pos);
         let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
         assert!(peak <= before + 1e-6, "{peak} > {before}");
+    }
+
+    /// Pad déplacé pendant qu'il joue : le son continue, à sa nouvelle place.
+    #[test]
+    fn swap_keeps_playing_sound() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        tx.send(PadCmd::Press {
+            slot: 0,
+            sample: sample(48000),
+            params: params(PadMode::Toggle, 48000),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 2048];
+        s.render(&mut out, 1024, &pos);
+        tx.send(PadCmd::Swap { a: 0, b: 3 }).unwrap();
+        out.fill(0.0);
+        s.render(&mut out, 1024, &pos);
+        assert!(out.iter().all(|&x| x != 0.0), "pas de coupure");
+        assert_eq!(pos[0].load(Ordering::Relaxed), 0);
+        assert!(pos[3].load(Ordering::Relaxed) > 1024);
     }
 }

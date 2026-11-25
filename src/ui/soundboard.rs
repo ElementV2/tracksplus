@@ -137,8 +137,8 @@ impl App {
         if src == dst {
             return;
         }
-        self.engine.pad(PadCmd::Stop { slot: src });
-        self.engine.pad(PadCmd::Stop { slot: dst });
+        // Les sons en cours suivent leur pad (pas de coupure en plein spectacle).
+        self.engine.pad(PadCmd::Swap { a: src, b: dst });
         let a = self.board.pad(src).cloned();
         let b = self.board.pad(dst).cloned();
         self.board.set(dst, a);
@@ -1267,6 +1267,21 @@ impl App {
                         }
 
                         });
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("Anti-rebond").color(t::TEXT_2)).on_hover_text(
+                            "Pads « Lecture-Stop » : un second appui plus rapproché est ignoré \
+                             (rebond d'un bouton MIDI, double-clic). 0 = désactivé.",
+                        );
+                        let mut ms = self.board.debounce_ms;
+                        if ui
+                            .add(egui::Slider::new(&mut ms, 0..=500).suffix(" ms"))
+                            .changed()
+                        {
+                            self.board.debounce_ms = ms;
+                            self.engine.pad(PadCmd::SetDebounce { ms });
+                            self.board_changed = Some(self.now);
+                        }
                         ui.end_row();
                     });
         ui.add_space(10.0);

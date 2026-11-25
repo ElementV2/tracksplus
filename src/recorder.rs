@@ -260,11 +260,22 @@ fn open_segment(
     };
     let file = match create() {
         Err(e) if move_aside && e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let secs = std::time::SystemTime::now()
+            // Nom libre garanti (jamais d'écrasement d'un ancien fichier mis de côté).
+            let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let mut aside = path.as_os_str().to_os_string();
-            aside.push(format!(".ancien-{secs}"));
+            let aside = (0..1000)
+                .map(|n| {
+                    let mut a = path.as_os_str().to_os_string();
+                    a.push(if n == 0 {
+                        format!(".ancien-{stamp}")
+                    } else {
+                        format!(".ancien-{stamp}-{n}")
+                    });
+                    PathBuf::from(a)
+                })
+                .find(|a| !a.exists())
+                .ok_or_else(|| std::io::Error::other("trop d'anciens fichiers homonymes"))?;
             std::fs::rename(path, &aside)?;
             create()?
         }

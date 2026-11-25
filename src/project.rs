@@ -644,7 +644,9 @@ impl Project {
 
 /// Fusion pour Annuler / Rétablir : prend les prises de `snap`, garde la configuration
 /// des pistes de `current` (armement, entrées, mute/solo, noms), rétablit les pistes
-/// supprimées depuis et conserve celles créées depuis.
+/// supprimées depuis. Les pistes créées depuis reviennent à leur état d'alors : sans
+/// prise (une piste d'enregistrement reste, réglages compris) ; une piste audio (import,
+/// glisser-déposer) n'existait pas, elle disparaît — annuler un import l'annule vraiment.
 pub fn merge_clips(mut current: Vec<Track>, snap: Vec<Track>) -> Vec<Track> {
     let mut merged = Vec::with_capacity(current.len().max(snap.len()));
     for st in snap {
@@ -657,7 +659,13 @@ pub fn merge_clips(mut current: Vec<Track>, snap: Vec<Track>) -> Vec<Track> {
             None => merged.push(st),
         }
     }
-    merged.extend(current);
+    for mut t in current {
+        if t.is_audio() {
+            continue;
+        }
+        t.clips.clear();
+        merged.push(t);
+    }
     merged
 }
 
@@ -1115,5 +1123,25 @@ mod tests {
             "Auto"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Annuler un import : la piste audio créée par l'import disparaît ; une piste
+    /// d'enregistrement créée depuis reste, sans prise.
+    #[test]
+    fn undo_removes_imported_audio_track() {
+        let mut p = Project::new("U".into(), std::env::temp_dir().join("tp-undo-imp"), 48000);
+        p.add_track(Some("Voix".into()), Some(0));
+        let snap = p.tracks.clone();
+        let rec = p.add_track(Some("Basse".into()), Some(1));
+        let audio = p.add_audio_track("Musique".into(), true);
+        let id = p.alloc_id();
+        p.track_mut(audio)
+            .unwrap()
+            .clips
+            .push(audio_clip(id, "m.wav"));
+        let merged = merge_clips(p.tracks.clone(), snap);
+        assert!(merged.iter().all(|t| t.id != audio));
+        let basse = merged.iter().find(|t| t.id == rec).unwrap();
+        assert!(basse.clips.is_empty() && basse.input == Some(1));
     }
 }
