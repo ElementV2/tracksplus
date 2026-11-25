@@ -1083,6 +1083,13 @@ pub struct App {
     awaiting: u8,
     /// Reconnexion à annoncer dès que tout tourne.
     announce: bool,
+    /// Flux ouverts vus au dernier passage, et flux qui ont battu au moins une fois depuis
+    /// leur ouverture (`watch_streams`). Un flux ouvert qui n'a jamais démarré (Dante
+    /// Virtual Soundcard sans horloge sur le réseau) n'est pas « perdu » : on l'attend.
+    open_seen: u8,
+    started: u8,
+    /// Flux ouverts qui attendent leur premier bloc depuis plus de `STREAM_STALL`.
+    not_started: u8,
     /// Dernière réouverture : instant et délai d'attente d'alors (flux reperdu juste après :
     /// les essais restent espacés).
     last_reopen: Option<(f64, f64)>,
@@ -1332,6 +1339,9 @@ impl App {
             stuck_jobs: Vec::new(),
             stalled: 0,
             awaiting: 0,
+            open_seen: 0,
+            started: 0,
+            not_started: 0,
             announce: false,
             last_reopen: None,
             take_split: false,
@@ -2967,6 +2977,25 @@ impl App {
         let sh = &self.engine.shared;
         let beats = std::array::from_fn(|s| sh.heartbeat[s].load(Ordering::Relaxed));
         let (stalled, beating) = watchdog(&mut self.hb, beats, open, now, jumped, rec);
+        // Flux ouverts depuis le dernier passage : pas encore démarrés.
+        self.started &= !(open & !self.open_seen);
+        self.open_seen = open;
+        self.started = (self.started | beating) & open;
+        // Jamais démarré depuis son ouverture : le pilote ne tourne pas encore (Dante
+        // Virtual Soundcard sans horloge Dante sur le réseau). Rien n'est perdu ni rouvert
+        // (rouvrir n'y changerait rien) : il démarrera de lui-même, on le dit une fois.
+        let never = stalled & !self.started;
+        let stalled = stalled & self.started;
+        let waiting = never | (self.not_started & open & !self.started);
+        if waiting != 0 && self.not_started == 0 {
+            let msg = self.not_started_message(waiting);
+            self.device_notice(msg);
+        } else if waiting == 0 && self.not_started != 0 && open != 0 {
+            self.device_note.clear();
+            self.notify("Carte son prête", false);
+        }
+        self.not_started = waiting;
+        let sh = &self.engine.shared;
         // (Un flux fermé n'est plus « seulement muet » : il est rouvert ou absent.)
         self.stalled &= open;
         let before = sh.device_lost.fetch_or(stalled, Ordering::AcqRel);
@@ -2978,6 +3007,24 @@ impl App {
             self.announce = true;
         }
         self.awaiting &= !beating;
+    }
+
+    /// Message pour des flux ouverts qui n'ont jamais démarré (`watch_streams`).
+    fn not_started_message(&self, slots: u8) -> String {
+        let st = &self.engine.status;
+        let dante = [&st.input, &st.output, &st.pad_output, &st.monitor_output]
+            .into_iter()
+            .flatten()
+            .find(|n| n.to_lowercase().contains("dante"));
+        match dante {
+            Some(name) => format!(
+                "« {name} » ne reçoit pas d'horloge Dante : allumez un appareil Dante sur le réseau (console, stagebox) ou Dante Via sur un autre ordinateur. Le son démarrera tout seul."
+            ),
+            None => format!(
+                "Carte son ouverte mais silencieuse ({}) : le pilote n'envoie aucun son pour l'instant.",
+                self.engine.slots_label(slots)
+            ),
+        }
     }
 
     /// Pendant une prise. Entrée muette sans erreur du pilote (horloge Dante perdue
@@ -3398,6 +3445,7 @@ impl App {
         self.engine = e;
         let now = self.now;
         self.hb = [(0, now); audio::SLOTS];
+        self.open_seen = 0;
         self.stalled = 0;
         self.reconnect_done(audio::LOST_ALL, delay, rate);
     }
@@ -3414,6 +3462,7 @@ impl App {
         let need = lost | self.engine.missing();
         let asio = self.prefs.host.as_deref() == Some("ASIO");
         let opened = touched & self.engine.open_mask();
+        self.open_seen &= !touched;
         if opened != 0 {
             self.awaiting |= opened;
             self.announce = true;
@@ -4781,6 +4830,8 @@ impl App {
         self.awaiting = 0;
         self.announce = false;
         self.last_reopen = None;
+        self.open_seen = 0;
+        self.not_started = 0;
         self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
