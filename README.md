@@ -148,12 +148,18 @@ Chaque option a une bulle d'aide avec un exemple.
 ### Transport et sortie
 
 - Sur l'onglet Soundboard, la barre du haut affiche le transport des pads à la place de
-  celui du multipiste : **Stop** (arrêt immédiat de tous les pads, Échap), voyant vert quand
+  celui du multipiste : **Stop** (panique en deux temps, Échap : un premier appui éteint
+  tous les pads en fondu d'une seconde, un second appui pendant le fondu les coupe net),
+  voyant vert quand
   un pad joue, temps restant du dernier pad à finir, nombre de pads en lecture, pastille
   **REC** pendant une prise multipiste (clic : retour au multipiste).
 - Les pads jouent à 0 dB sur la sortie Soundboard (Réglages → Carte son), chacun avec son
   gain. Vumètre stéréo des pads.
 - Le soundboard est enregistré automatiquement dans la session.
+- **Mode spectacle** (cadenas de la barre du soundboard) : les pads restent jouables, mais
+  rien ne peut être supprimé, déplacé, remplacé ou réglé par erreur. Pas de mot de passe.
+- **Anti-rebond** : un second appui sur le même pad à moins de 150 ms (rebond d'un bouton
+  MIDI, double-clic) est ignoré.
 
 ### Contrôleur MIDI
 
@@ -240,11 +246,20 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
 
 ## Fiabilité en live
 
+- **Copie de sécurité** (menu Session) : chaque prise est écrite en même temps sur un second
+  disque, avec un double de la session ouvrable tel quel. Un second disque lent, plein ou
+  débranché ne gêne jamais l'enregistrement principal.
+- **Fichiers BWF** : chaque prise porte son heure d'enregistrement (TimeReference) et le nom
+  de sa piste ; Pro Tools, Nuendo ou Reaper peuvent la poser à son heure réelle.
+- **Carte son perdue** (DVS relancé, câble USB) : reconnexion automatique dès que la prise
+  est arrêtée.
+- **Disque qui revient** (clé rebranchée, place libérée) : la piste reprend toute seule,
+  calée sur les autres.
 - **Aucune prise perdue** : fichiers lisibles même après un crash ou une coupure de courant.
   Au redémarrage, la session est rouverte, les fichiers réparés et les prises replacées sur
   la timeline.
-- **Disque en retard** : du silence remplace les trames manquantes, la piste reste calée.
-  Alerte immédiate.
+- **Disque en retard** : 4 à 15 s de réserve par piste ; au-delà, du silence remplace les
+  trames manquantes, la piste reste calée. Alerte immédiate, et dès 30 min de place restante.
 - **Prises longues** : au-delà de 2 Go, la prise continue sans coupure dans `nom_p2.wav`,
   `nom_p3.wav`…, posés bout à bout.
 - **Pas d'arrêt accidentel** : pendant une prise, Espace, R et le bouton Rec demandent un
@@ -263,6 +278,40 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
 - Un export annulé ne laisse pas de fichier incomplet.
 - Mises à jour vérifiées (empreinte SHA-256) avant installation, après une sauvegarde.
 - Une seule instance : relancer TracksPlus ramène la fenêtre déjà ouverte.
+
+## Préparer l'ordinateur avant un spectacle
+
+Réglages recommandés par Audinate, Steinberg et Allen & Heath pour l'enregistrement
+multipiste ; TracksPlus ne peut pas les faire à votre place.
+
+**Windows**
+- Mode d'alimentation **Performances élevées** (ou « Performances optimales »), veille et
+  écran de veille sur **Jamais**.
+- Options d'alimentation avancées : **suspension sélective USB désactivée** ; dans le
+  gestionnaire de périphériques, décocher « Autoriser l'ordinateur à éteindre ce
+  périphérique » pour la carte réseau Dante et les interfaces USB.
+- Exclure le dossier des sessions de l'analyse en temps réel de l'antivirus ; pas de mise à
+  jour Windows pendant le spectacle (une mise à jour peut réactiver les économies d'énergie :
+  revérifier après chaque mise à jour).
+- Pilote **ASIO** de préférence (sinon WASAPI : TracksPlus passe alors son thread audio en
+  priorité « Pro Audio »).
+
+**Dante Virtual Soundcard**
+- Carte réseau **intégrée** en Gigabit (éviter les adaptateurs USB), réseau Gigabit de bout
+  en bout, une horloge maître matérielle sur le réseau.
+- Latence DVS : **10 ms** sur un ordinateur portable ou peu puissant (4 ms seulement sur une
+  machine très stable), buffer ASIO 128 à 256.
+- Ne jamais changer la fréquence ou la latence de DVS pendant que TracksPlus enregistre.
+
+**macOS**
+- Économiseur d'énergie : pas de suspension, disques non mis en veille ; Bluetooth et
+  synchronisations cloud coupés pendant le spectacle.
+
+**Avant les portes**
+- Une prise test de 2 minutes sur toutes les pistes, réécoutée ; vérifier qu'aucun
+  « décrochage » n'est compté en bas de l'écran.
+- Copie de sécurité activée sur un second disque, place libre vérifiée sur les deux disques.
+- Soundboard en **mode spectacle** (cadenas).
 
 ## Développement
 
