@@ -20,6 +20,7 @@ mod recovery;
 mod render;
 mod sampler;
 mod sessions;
+mod shutdown;
 mod soundboard;
 mod ui;
 mod update;
@@ -112,48 +113,81 @@ fn crash_log_allowed(
     true
 }
 
+/// Erreurs récemment notées (filtre de `crash_log_allowed`).
+static CRASH_RECENT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Ajoute une entrée datée à crash.log (dossier de configuration).
+fn append_crash_log(text: &str) {
+    let Some(dir) = dirs::config_dir().map(|d| d.join("TracksPlus")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("crash.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > CRASH_LOG_MAX) {
+        let _ = std::fs::rename(&path, dir.join("crash.old.log"));
+    }
+    let line = format!(
+        "[{}] {text}\n\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Note une erreur interne qui n'est pas une panique (carte graphique…) dans crash.log.
+/// `key` identifie l'erreur : une même erreur n'est notée qu'une fois par seconde.
+pub fn log_error(key: &str, text: &str) {
+    let allowed = match CRASH_RECENT.lock() {
+        Ok(mut l) => crash_log_allowed(&mut l, key, std::time::Instant::now()),
+        Err(_) => false,
+    };
+    if allowed {
+        append_crash_log(text);
+    }
+}
+
 /// Écrit les erreurs internes dans un journal (dossier de configuration) pour diagnostic.
 fn install_crash_log() {
     let default = std::panic::take_hook();
-    let last = std::sync::Mutex::new(std::collections::HashMap::new());
     std::panic::set_hook(Box::new(move |info| {
         let key = format!(
             "{}|{}",
             info.location().map(|l| l.to_string()).unwrap_or_default(),
             info.payload_as_str().unwrap_or("")
         );
-        let allowed = match last.lock() {
+        let allowed = match CRASH_RECENT.lock() {
             Ok(mut l) => crash_log_allowed(&mut l, &key, std::time::Instant::now()),
             Err(_) => false,
         };
-        if allowed && let Some(dir) = dirs::config_dir().map(|d| d.join("TracksPlus")) {
-            let _ = std::fs::create_dir_all(&dir);
-            let path = dir.join("crash.log");
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > CRASH_LOG_MAX) {
-                let _ = std::fs::rename(&path, dir.join("crash.old.log"));
-            }
+        if allowed {
             let bt = std::backtrace::Backtrace::force_capture();
-            let line = format!(
-                "[{}] {info}\n{bt}\n\n",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-            );
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
+            append_crash_log(&format!("{info}\n{bt}"));
         }
         default(info);
     }));
 }
 
+/// Délais d'attente des prises encore en écriture à la fin du processus : court après une
+/// fermeture normale (tout est déjà fini, sauf disque bloqué), plus long après une erreur
+/// (les prises passent avant la relance).
+const END_WRITERS_NORMAL: std::time::Duration = std::time::Duration::from_secs(2);
+const END_WRITERS_CRASH: std::time::Duration = std::time::Duration::from_secs(10);
+/// Copies de sécurité après une erreur : déjà terminées avec les prises (leurs threads
+/// d'écriture sont attendus ci-dessus) ; un second disque mort ne retarde pas la relance.
+const END_BACKUPS_CRASH: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn main() -> eframe::Result {
     install_crash_log();
     // Gardé jusqu'à la fermeture de l'application.
-    let _instance = single_instance();
+    let instance = single_instance();
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("TracksPlus")
         .with_inner_size([1440.0, 880.0])
@@ -169,11 +203,42 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
-        "TracksPlus",
-        options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    )
+    let started = std::time::Instant::now();
+    // Une erreur fatale hors des garde-fous de l'interface (rendu, winit, eframe) remonte
+    // jusqu'ici : l'application a déjà été détruite, ce qui a arrêté et finalisé les prises
+    // (voir `Drop for App`). On la rattrape pour finir proprement et relancer.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "TracksPlus",
+            options,
+            Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        )
+    }));
+    // Prise encore en écriture (fermeture interrompue, disque lent) : ses tampons sont
+    // écrits et ses fichiers fermés avant que le processus disparaisse.
+    let (writers, backups) = if res.is_ok() {
+        (END_WRITERS_NORMAL, END_WRITERS_NORMAL)
+    } else {
+        (END_WRITERS_CRASH, END_BACKUPS_CRASH)
+    };
+    recorder::emergency_finish(writers);
+    recorder::wait_backups(backups);
+    match res {
+        Ok(r) => r,
+        Err(_) => {
+            // En plein spectacle, l'application revient d'elle-même dans sa session (les
+            // prises interrompues sont réintégrées au démarrage).
+            let end = shutdown::EndContext::now(started.elapsed());
+            if end.should_relaunch() {
+                // Verrou d'instance unique libéré avant : sinon la relance se croirait en double.
+                drop(instance);
+                if let Err(e) = shutdown::relaunch(&end) {
+                    log_error("relaunch", &format!("Relance automatique impossible : {e}"));
+                }
+            }
+            std::process::exit(101);
+        }
+    }
 }
 
 #[cfg(test)]

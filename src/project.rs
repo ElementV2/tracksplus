@@ -437,6 +437,15 @@ impl Project {
         rx
     }
 
+    /// Sauvegarde préparée maintenant, écrite plus tard (fin de session Windows) : l'état
+    /// et son rang sont figés tout de suite ; si une sauvegarde plus récente a été écrite
+    /// entre-temps, l'écriture est abandonnée. Ne touche pas à `dirty`.
+    pub fn deferred_save(&self) -> impl FnOnce() -> Result<()> + Send + 'static {
+        let seq = next_save_seq();
+        let snapshot = self.clone();
+        move || snapshot.write_file(seq)
+    }
+
     /// Écriture atomique du fichier de session (fichier temporaire synchronisé puis
     /// renommage), une à la fois, et seulement si rien de plus récent n'a été écrit.
     fn write_file(&self, seq: u64) -> Result<()> {
@@ -1075,6 +1084,30 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(left.len(), 1, "aucun fichier temporaire laissé");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Sauvegarde préparée pour la fin de session : écrite si rien de plus récent ne l'a
+    /// été, abandonnée sinon (jamais d'ancien état par-dessus).
+    #[test]
+    fn deferred_save_never_overwrites_a_newer_save() {
+        let dir = std::env::temp_dir().join(format!("tp-differe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("D".into(), dir.clone(), 48000);
+        p.add_track(Some("Ancienne".into()), None);
+        let old = p.deferred_save();
+        p.tracks[0].name = "Nouvelle".into();
+        p.save().unwrap();
+        old().unwrap();
+        let file = p.file_path();
+        let read = || Project::load(&file).unwrap().tracks[0].name.clone();
+        assert_eq!(read(), "Nouvelle", "ancien état abandonné");
+        p.tracks[0].name = "Dernière".into();
+        p.dirty = true;
+        let later = p.deferred_save();
+        assert!(p.dirty, "la session reste à sauvegarder");
+        later().unwrap();
+        assert_eq!(read(), "Dernière");
         std::fs::remove_dir_all(dir).ok();
     }
 
