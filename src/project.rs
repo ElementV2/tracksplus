@@ -111,7 +111,8 @@ pub enum TrackKind {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Track {
     pub id: u64,
-    #[serde(default)]
+    /// Valeur inconnue (version plus récente) : piste d'enregistrement, session protégée.
+    #[serde(default, deserialize_with = "lenient")]
     pub kind: TrackKind,
     #[serde(default)]
     pub name: String,
@@ -138,6 +139,9 @@ pub struct Track {
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
     #[serde(default)]
     pub clips: Vec<Clip>,
+    /// Champs inconnus (écrits par une version plus récente) : réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Track {
@@ -179,16 +183,23 @@ pub struct Marker {
     pub pos: u64,
     #[serde(default)]
     pub name: String,
+    /// Champs inconnus, réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Project {
+    /// Version du format du fichier (toujours écrite à `FORMAT_VERSION`) : un fichier d'une
+    /// version plus récente de l'application s'ouvre en lecture seule.
+    #[serde(default, serialize_with = "write_format_version")]
+    pub format_version: u32,
     /// Nom (remplacé au chargement par celui du fichier).
     #[serde(default)]
     pub name: String,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub rec_format: RecFormat,
     #[serde(default)]
     pub tracks: Vec<Track>,
@@ -203,6 +214,31 @@ pub struct Project {
     /// Modifié depuis la dernière sauvegarde.
     #[serde(skip)]
     pub dirty: bool,
+    /// Champs inconnus (version plus récente) : réécrits tels quels.
+    #[serde(flatten)]
+    pub extra: Extra,
+    /// Session à ne pas écraser (fichier d'une version plus récente…) : la raison, donnée
+    /// quand une sauvegarde est refusée. « Enregistrer sous » reste possible.
+    #[serde(skip)]
+    pub read_only: Option<String>,
+    /// Le fichier de session est le nôtre (lu ou écrit par cette session) : une session
+    /// neuve n'écrase jamais un fichier du même nom déjà présent sur le disque.
+    #[serde(skip)]
+    owns_file: bool,
+    /// Moment de l'état enregistré (millisecondes depuis 1970, horloge de l'ordinateur) :
+    /// départage les versions de secours à l'ouverture d'un fichier abîmé (voir `open`).
+    #[serde(default)]
+    pub saved_at: i64,
+    /// Moment de l'état copié, s'il a été figé avant la sauvegarde (double de la session
+    /// écrit plus tard par un thread : il garde l'heure de son contenu, pas celle de son
+    /// écriture).
+    #[serde(skip)]
+    pub state_at: Option<i64>,
+    /// Champs inconnus des prises (version plus récente), par identifiant de prise :
+    /// réécrits tels quels (voir `parse_project`, `to_json`). Rangés à part pour que les
+    /// prises restent de simples structures.
+    #[serde(skip)]
+    clip_extra: std::collections::HashMap<u64, Extra>,
 }
 
 /// Fréquence par défaut (fichier sans fréquence ou fréquence nulle).
@@ -223,15 +259,25 @@ impl Project {
             next_id: 1,
             dir,
             dirty: false,
+            format_version: FORMAT_VERSION,
+            extra: Extra::new(),
+            read_only: None,
+            owns_file: false,
+            saved_at: 0,
+            state_at: None,
+            clip_extra: Default::default(),
         }
     }
 
-    /// Nouvelle session horodatée dans le dossier par défaut.
+    /// Nouvelle session horodatée dans le dossier par défaut, dans un dossier qui n'existe
+    /// pas encore (« … (2) », « … (3) »… sinon) : jamais celui d'une session existante.
     pub fn untitled(sample_rate: u32) -> Self {
-        let name = chrono::Local::now()
+        let base = chrono::Local::now()
             .format("Session %Y-%m-%d %Hh%M")
             .to_string();
-        let dir = default_sessions_root().join(&name);
+        let root = default_sessions_root();
+        let name = free_dir_name(&root, &base);
+        let dir = root.join(&name);
         Self::new(name, dir, sample_rate)
     }
 
@@ -262,6 +308,7 @@ impl Project {
             monitor: false,
             color: None,
             clips: Vec::new(),
+            extra: Extra::new(),
         });
         self.dirty = true;
         id
@@ -297,6 +344,7 @@ impl Project {
             id,
             pos,
             name: format!("Repère {n}"),
+            extra: Extra::new(),
         });
         self.markers.sort_by_key(|m| m.pos);
         self.dirty = true;
@@ -329,6 +377,10 @@ impl Project {
         right.clamp_fades();
         // Juste après la moitié gauche : l'ordre de superposition est conservé.
         t.clips.insert(i + 1, right);
+        // Champs inconnus (version plus récente) : valables pour les deux moitiés.
+        if let Some(e) = self.clip_extra.get(&clip_id).cloned() {
+            self.clip_extra.insert(new_id, e);
+        }
         self.next_id += 1;
         self.dirty = true;
         Some(new_id)
@@ -416,69 +468,202 @@ impl Project {
             .with_context(|| format!("Impossible de créer {}", self.audio_dir().display()))
     }
 
+    /// Sauvegarde, attendue `SAVE_WAIT` au plus : un disque bloqué (NAS, disque USB en
+    /// veille) ne fige jamais l'interface. Après ce délai, l'écriture continue en arrière-plan
+    /// et la session reste « à sauvegarder ».
     pub fn save(&mut self) -> Result<()> {
-        let seq = next_save_seq();
-        self.write_file(seq)?;
-        self.dirty = false;
-        Ok(())
+        self.save_waiting(false)
+    }
+
+    /// Comme `save`, en gardant à coup sûr la version précédente du fichier parmi les copies
+    /// `.bak` (fin de prise : l'état d'avant la prise reste récupérable).
+    pub fn save_checkpoint(&mut self) -> Result<()> {
+        self.save_waiting(true)
+    }
+
+    fn save_waiting(&mut self, checkpoint: bool) -> Result<()> {
+        let rx = self.start_write(checkpoint)?;
+        let res = match rx.recv_timeout(SAVE_WAIT) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "disque trop lent : sauvegarde toujours en cours après {} s",
+                SAVE_WAIT.as_secs()
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow::anyhow!("sauvegarde interrompue (erreur interne)"))
+            }
+        };
+        if res.is_err() {
+            self.dirty = true;
+        }
+        res
     }
 
     /// Sauvegarde dans un thread (sauvegarde automatique : un disque lent ne fige pas
     /// l'interface). L'état est figé maintenant ; si une sauvegarde plus récente a déjà été
     /// écrite entre-temps, celle-ci est abandonnée (jamais d'ancien état par-dessus).
     pub fn save_in_background(&mut self) -> std::sync::mpsc::Receiver<Result<()>> {
+        match self.start_write(false) {
+            Ok(rx) => rx,
+            Err(e) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(Err(e));
+                rx
+            }
+        }
+    }
+
+    /// Lance l'écriture du fichier de session dans un thread : refusée tout de suite pour
+    /// une session en lecture seule, ou pour une session neuve dont le fichier existe déjà
+    /// (ce serait celui d'une autre session).
+    fn start_write(&mut self, checkpoint: bool) -> Result<std::sync::mpsc::Receiver<Result<()>>> {
+        if let Some(why) = self.save_refused() {
+            bail!("{why}");
+        }
+        self.owns_file = true;
         let seq = next_save_seq();
-        let snapshot = self.clone();
+        let mut snapshot = self.clone();
+        snapshot.saved_at = self.state_at.take().unwrap_or_else(now_ms);
         self.dirty = false;
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(snapshot.write_file(seq));
-        });
-        rx
+        let job_tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("tracksplus-save".into())
+            .spawn(move || {
+                let _ = job_tx.send(snapshot.write_file(seq, checkpoint));
+            });
+        if spawned.is_err() {
+            // Pas de thread disponible : écriture directe.
+            let _ = tx.send(self.write_file(seq, checkpoint));
+        }
+        Ok(rx)
+    }
+
+    /// Raison pour laquelle toute sauvegarde de la session serait refusée (et le resterait) :
+    /// session en lecture seule, ou session neuve dont le fichier existe déjà (ce serait
+    /// celui d'une autre session). Une prise est alors refusée : elle ne serait écrite nulle
+    /// part dans la session.
+    pub fn save_refused(&self) -> Option<String> {
+        if let Some(why) = &self.read_only {
+            return Some(why.clone());
+        }
+        if !self.owns_file && self.file_path().try_exists().unwrap_or(true) {
+            return Some(format!(
+                "un fichier de session « {} » existe déjà dans {} : il n'est pas remplacé",
+                self.name,
+                self.dir.display()
+            ));
+        }
+        None
+    }
+
+    /// Fige l'heure de l'état actuel : la prochaine sauvegarde de cette copie (double de la
+    /// session, écrit plus tard) la note comme moment de son contenu.
+    pub fn mark_state_time(&mut self) {
+        self.state_at = Some(now_ms());
+    }
+
+    /// Texte JSON du fichier de session, champs inconnus des prises compris.
+    fn to_json(&self) -> serde_json::Result<String> {
+        if self.clip_extra.is_empty() {
+            return serde_json::to_string_pretty(self);
+        }
+        let mut v = serde_json::to_value(self)?;
+        let clips = v
+            .get_mut("tracks")
+            .and_then(|t| t.as_array_mut())
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get_mut("clips").and_then(|c| c.as_array_mut()))
+            .flatten();
+        for c in clips {
+            let Some(obj) = c.as_object_mut() else {
+                continue;
+            };
+            let Some(extra) = obj
+                .get("id")
+                .and_then(|i| i.as_u64())
+                .and_then(|id| self.clip_extra.get(&id))
+            else {
+                continue;
+            };
+            for (k, val) in extra {
+                // Un champ connu n'est jamais remplacé par un champ mis de côté.
+                obj.entry(k.clone()).or_insert_with(|| val.clone());
+            }
+        }
+        serde_json::to_string_pretty(&v)
     }
 
     /// Sauvegarde préparée maintenant, écrite plus tard (fin de session Windows) : l'état
     /// et son rang sont figés tout de suite ; si une sauvegarde plus récente a été écrite
     /// entre-temps, l'écriture est abandonnée. Ne touche pas à `dirty`.
     pub fn deferred_save(&self) -> impl FnOnce() -> Result<()> + Send + 'static {
+        let refused = self.save_refused();
         let seq = next_save_seq();
-        let snapshot = self.clone();
-        move || snapshot.write_file(seq)
+        let mut snapshot = self.clone();
+        snapshot.saved_at = self.state_at.unwrap_or_else(now_ms);
+        move || match refused {
+            // Session en lecture seule ou fichier d'une autre session : jamais écrasé.
+            Some(why) => Err(anyhow::anyhow!(why)),
+            // Point de reprise : la version remplacée rejoint les copies `.bak`.
+            None => snapshot.write_file(seq, true),
+        }
     }
 
     /// Écriture atomique du fichier de session (fichier temporaire synchronisé puis
-    /// renommage), une à la fois, et seulement si rien de plus récent n'a été écrit.
-    fn write_file(&self, seq: u64) -> Result<()> {
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-        // Un verrou par fichier : la sauvegarde du double de la session sur un second disque
-        // lent ou débranché ne bloque jamais celle de la session elle-même.
-        static LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<u64>>>>> = Mutex::new(None);
+    /// renommage), une à la fois, et seulement si rien de plus récent n'a été écrit. La
+    /// version remplacée rejoint les copies `.bak` (toutes les 5 min, ou `checkpoint`).
+    fn write_file(&self, seq: u64, checkpoint: bool) -> Result<()> {
+        use std::sync::TryLockError;
         let path = self.file_path();
-        let lock = {
-            let mut m = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-            m.get_or_insert_with(HashMap::new)
-                .entry(path.clone())
-                .or_default()
-                .clone()
+        let lock = file_lock(&path);
+        // Attente bornée : une écriture précédente bloquée sur un disque figé ne retient
+        // pas celle-ci indéfiniment.
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        let mut last = loop {
+            match lock.try_lock() {
+                Ok(g) => break g,
+                Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!("disque occupé : la sauvegarde précédente n'est pas terminée");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
         };
-        let mut last = lock.lock().unwrap_or_else(|e| e.into_inner());
         if *last > seq {
             return Ok(());
         }
         self.ensure_dirs()?;
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("tmp");
-        write_synced(&tmp, json.as_bytes())?;
-        std::fs::rename(&tmp, &path)?;
+        let json = self.to_json()?;
+        rotate_backups(&path, checkpoint);
+        write_atomic(&path, json.as_bytes())?;
         *last = seq;
         Ok(())
     }
 
+    /// Lecture d'un fichier de session, sans rien modifier sur le disque (écran d'accueil,
+    /// tests). Voir `open` pour l'ouverture par l'utilisateur.
     pub fn load(path: &Path) -> Result<Self> {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("Lecture de {}", path.display()))?;
-        let mut p: Project = serde_json::from_str(&json).context("Fichier de session invalide")?;
+        let json = read_retrying(path).with_context(|| format!("Lecture de {}", path.display()))?;
+        Self::from_json(&json, path)
+    }
+
+    /// Session lue depuis le texte `json`, rangée à l'emplacement `path`.
+    fn from_json(json: &str, path: &Path) -> Result<Self> {
+        let (mut p, unknown) = match parse_project(json) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(v) = newer_format(json) {
+                    bail!(
+                        "Session enregistrée par une version plus récente de TracksPlus (format {v}) : mettez l'application à jour pour l'ouvrir"
+                    );
+                }
+                return Err(anyhow::Error::new(e).context("Fichier de session invalide"));
+            }
+        };
         p.dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         p.name = path
             .file_stem()
@@ -486,7 +671,87 @@ impl Project {
             .unwrap_or(p.name);
         p.validate();
         p.dirty = false;
+        p.owns_file = true;
+        if p.format_version > FORMAT_VERSION || unknown {
+            p.read_only = Some(
+                "session enregistrée par une version plus récente de TracksPlus : elle n'est pas \
+                 modifiée ici (mettez l'application à jour, ou utilisez « Enregistrer sous » pour \
+                 en faire une copie)"
+                    .into(),
+            );
+        }
         Ok(p)
+    }
+
+    /// Ouverture d'une session par l'utilisateur. Si le fichier est abîmé (illisible), la
+    /// version de secours la plus récente qui se lit est reprise, parmi les copies `.bak` et
+    /// `fallbacks` (par exemple le double du second disque et ses copies) : la plus récente
+    /// d'après l'heure de son contenu (`saved_at`), puis la date du fichier. Le fichier abîmé
+    /// est d'abord copié de côté sous un autre nom, puis remplacé d'un coup par la version
+    /// reprise : il y a toujours un fichier de session à sa place (accueil, récupération au
+    /// lancement). Renvoie aussi le message à afficher.
+    pub fn open(path: &Path, fallbacks: &[PathBuf]) -> Result<(Self, Option<String>)> {
+        // Lecture impossible (fichier verrouillé, disque absent) : pas de repli, le fichier
+        // est peut-être intact.
+        let json = read_retrying(path).with_context(|| format!("Lecture de {}", path.display()))?;
+        clean_stale_temps(path);
+        let err = match Self::from_json(&json, path) {
+            Ok(p) => return Ok((p, None)),
+            Err(e) => e,
+        };
+        if newer_format(&json).is_some() {
+            return Err(err);
+        }
+        let candidates = backup_paths(path)
+            .into_iter()
+            .chain(fallbacks.iter().cloned());
+        let Some(best) = newest_readable(path, candidates) else {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            return Err(err.context(format!(
+                "« {name} » illisible, et aucune version précédente lisible"
+            )));
+        };
+        let Candidate {
+            path: from,
+            text,
+            project: mut p,
+        } = best;
+        let from = from.display();
+        let read_only_msg = || {
+            format!(
+                "Fichier de session illisible : version précédente ouverte en lecture seule \
+                 ({from})"
+            )
+        };
+        if p.read_only.is_some() {
+            // Version de secours d'un format plus récent : rien n'est touché sur le disque.
+            return Ok((p, Some(read_only_msg())));
+        }
+        let aside = match copy_aside(path, "illisible") {
+            Ok(a) => a,
+            Err(e) => {
+                p.read_only = Some(format!(
+                    "le fichier de session abîmé n'a pas pu être mis de côté ({e}) : utilisez \
+                     « Enregistrer sous »"
+                ));
+                return Ok((p, Some(read_only_msg())));
+            }
+        };
+        let aside = aside.file_name().unwrap_or_default().to_string_lossy();
+        // Remplacement d'un coup : à sa place, le fichier abîmé (déjà copié de côté) ou la
+        // version reprise, jamais aucun des deux.
+        let restored = write_atomic(path, text.as_bytes());
+        // Fichier en place resté abîmé : la prochaine sauvegarde le remplacera.
+        p.dirty = restored.is_err();
+        let mut msg = format!(
+            "Fichier de session illisible : version précédente reprise ({from}). Le fichier \
+             abîmé est conservé sous « {aside} » ; les prises plus récentes restent dans le \
+             dossier Audio."
+        );
+        if let Err(e) = restored {
+            msg += &format!(" Elle n'a pas encore pu être réécrite ({e:#}).");
+        }
+        Ok((p, Some(msg)))
     }
 
     /// Corrige un fichier incohérent (ancien, partiel ou modifié à la main) : fréquence
@@ -549,10 +814,16 @@ impl Project {
             next += 1;
             next - 1
         };
+        // Les champs inconnus des prises suivent leur prise.
+        let mut old_extra = std::mem::take(&mut self.clip_extra);
         for t in &mut self.tracks {
             t.id = alloc();
             for c in &mut t.clips {
+                let old = c.id;
                 c.id = alloc();
+                if let Some(e) = old_extra.remove(&old) {
+                    self.clip_extra.insert(c.id, e);
+                }
             }
         }
         for m in &mut self.markers {
@@ -579,6 +850,11 @@ impl Project {
                 next.name,
                 next.dir.display()
             );
+        }
+        if target != self.file_path() {
+            // Copie ailleurs : le fichier protégé (version plus récente) reste intact, la
+            // copie est une session à part entière, modifiable.
+            next.read_only = None;
         }
         next.ensure_dirs()?;
         let old_audio = self.audio_dir();
@@ -653,7 +929,13 @@ impl Project {
             let f = format!("{base}_{n:03}.wav");
             let low = f.to_lowercase();
             let p2 = format!("{base}_{n:03}_p2.wav").to_lowercase();
-            if !existing.contains(&low) && !existing.contains(&p2) && !taken.contains(&low) {
+            // `taken` est en minuscules ; un nom laissé dans sa casse d'origine est reconnu
+            // quand même.
+            if !existing.contains(&low)
+                && !existing.contains(&p2)
+                && !taken.contains(&low)
+                && !taken.contains(&f)
+            {
                 return f;
             }
         }
@@ -699,17 +981,30 @@ pub fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// Écriture atomique : fichier temporaire voisin forcé sur le disque, puis renommé. Une
-/// coupure en pleine écriture laisse l'ancien fichier intact, jamais un fichier tronqué.
+/// Nom temporaire unique voisin de `path` (`nom.ext.<pid>-<n>.<suffixe>`) : deux écritures
+/// simultanées (session « Soundboard » et `soundboard.json`, double de la session, autre
+/// instance) n'utilisent jamais le même fichier temporaire.
+fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}-{n}.{suffix}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Écriture atomique : fichier temporaire voisin (nom unique) forcé sur le disque, puis
+/// renommé (avec nouveaux essais, voir `replace_file`). Une coupure en pleine écriture laisse
+/// l'ancien fichier intact, jamais un fichier tronqué ; aucun temporaire n'est laissé.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(d).with_context(|| format!("Création de {}", d.display()))?;
     }
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    let tmp = path.with_file_name(name);
-    write_synced(&tmp, bytes).with_context(|| format!("Écriture de {}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    let tmp = temp_sibling(path, "tmp");
+    if let Err(e) = write_synced(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("Écriture de {}", tmp.display()));
+    }
+    if let Err(e) = replace_file(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("Écriture de {}", path.display()));
     }
@@ -718,9 +1013,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Copie `src` vers `dst` via un fichier temporaire forcé sur le disque, puis renommé.
 pub fn copy_synced(src: &Path, dst: &Path) -> Result<()> {
-    let mut name = dst.file_name().unwrap_or_default().to_os_string();
-    name.push(".copie");
-    let tmp = dst.with_file_name(name);
+    let tmp = temp_sibling(dst, "copie");
     let res = (|| -> Result<()> {
         std::fs::copy(src, &tmp).with_context(|| format!("Copie de {}", src.display()))?;
         // Accès en écriture : exigé par Windows pour forcer l'écriture sur le disque.
@@ -728,13 +1021,451 @@ pub fn copy_synced(src: &Path, dst: &Path) -> Result<()> {
             .write(true)
             .open(&tmp)?
             .sync_all()?;
-        std::fs::rename(&tmp, dst)?;
+        replace_file(&tmp, dst)?;
         Ok(())
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Erreur passagère sous Windows : fichier ouvert un instant par l'antivirus, OneDrive ou
+/// l'indexation (accès refusé, violation de partage ou de verrou).
+fn transient(e: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+    let windows = cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33));
+    windows || e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Refait `op` après une erreur passagère : 8 essais, pauses de 20, 40, 80… ms (300 ms au
+/// plus), environ 1,5 s en tout.
+fn retrying<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut pause = 20;
+    for _ in 0..7 {
+        match op() {
+            Err(e) if transient(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+                pause = (pause * 2).min(300);
+            }
+            r => return r,
+        }
+    }
+    op()
+}
+
+/// Lecture d'un fichier texte, avec nouveaux essais sur erreur passagère.
+pub fn read_retrying(path: &Path) -> std::io::Result<String> {
+    retrying(|| std::fs::read_to_string(path))
+}
+
+/// Remplace `dst` par `src` (renommage), avec nouveaux essais sur erreur passagère. Sous
+/// Windows, le renommage est écrit sur le disque avant de rendre la main (une coupure juste
+/// après ne le défait pas).
+pub fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    retrying(|| move_file(src, dst, true))
+}
+
+/// Renomme `src` en `dst` sans jamais remplacer un fichier existant (erreur
+/// `AlreadyExists`).
+pub fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    retrying(|| move_file(src, dst, false))
+}
+
+#[cfg(windows)]
+fn move_file(src: &Path, dst: &Path, replace: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    // Chemin absolu, en forme longue (`\\?\`) au-delà de la limite classique de 260
+    // caractères.
+    fn wide(p: &Path) -> std::io::Result<Vec<u16>> {
+        let abs = std::path::absolute(p)?;
+        let raw: Vec<u16> = abs.as_os_str().encode_wide().collect();
+        let starts = |pre: &str| raw.starts_with(&pre.encode_utf16().collect::<Vec<_>>());
+        let mut v: Vec<u16> = if raw.len() < 240 || starts(r"\\?\") {
+            raw.clone()
+        } else if starts(r"\\") {
+            r"\\?\UNC"
+                .encode_utf16()
+                .chain(raw[1..].iter().copied())
+                .collect()
+        } else {
+            r"\\?\".encode_utf16().chain(raw.iter().copied()).collect()
+        };
+        v.push(0);
+        Ok(v)
+    }
+    let (s, d) = (wide(src)?, wide(dst)?);
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    // SAFETY : deux chaînes UTF-16 terminées par zéro, vivantes pendant l'appel.
+    if unsafe { MoveFileExW(s.as_ptr(), d.as_ptr(), flags) } != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if replace && e.kind() != std::io::ErrorKind::NotFound {
+        // Cible ouverte par un autre programme (antivirus, synchronisation) avec partage de
+        // suppression : le renommage de la bibliothèque standard (sémantique POSIX) la
+        // remplace quand même.
+        return std::fs::rename(src, dst);
+    }
+    Err(e)
+}
+
+#[cfg(not(windows))]
+fn move_file(src: &Path, dst: &Path, replace: bool) -> std::io::Result<()> {
+    if replace {
+        std::fs::rename(src, dst)?;
+    } else {
+        // Un lien dur échoue de lui-même si la cible existe (pas de course entre test et
+        // renommage) ; système de fichiers sans liens durs : test puis renommage.
+        match std::fs::hard_link(src, dst) {
+            Ok(()) => std::fs::remove_file(src)?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => {
+                if dst.try_exists()? {
+                    return Err(std::io::ErrorKind::AlreadyExists.into());
+                }
+                std::fs::rename(src, dst)?;
+            }
+        }
+    }
+    // Renommage écrit sur le disque (entrée du dossier).
+    if let Some(d) = dst.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let _ = std::fs::File::open(d).and_then(|f| f.sync_all());
+    }
+    Ok(())
+}
+
+/// Met un fichier de côté sans rien écraser : `nom.ext.<motif>-AAAAMMJJ-HHMMSS` (ou
+/// `nom.<motif>-AAAAMMJJ-HHMMSS.ext` avec `keep_ext`), suivi de `-2`, `-3`… si ce nom est
+/// pris. Renvoie le nouveau chemin.
+pub fn set_aside(path: &Path, tag: &str, keep_ext: bool) -> std::io::Result<PathBuf> {
+    place_aside(path, tag, keep_ext, |dst| rename_no_replace(path, dst))
+}
+
+/// Comme `set_aside`, mais en copiant : le fichier reste en place (copie forcée sur le
+/// disque, jamais par-dessus un fichier existant).
+pub fn copy_aside(path: &Path, tag: &str) -> std::io::Result<PathBuf> {
+    place_aside(path, tag, false, |dst| {
+        let tmp = temp_sibling(dst, "copie");
+        let res = (|| {
+            retrying(|| std::fs::copy(path, &tmp))?;
+            // Accès en écriture : exigé par Windows pour forcer l'écriture sur le disque.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)?
+                .sync_all()?;
+            rename_no_replace(&tmp, dst)
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    })
+}
+
+/// Premier nom libre de mise de côté (voir `set_aside`) sur lequel `place` réussit.
+fn place_aside(
+    path: &Path,
+    tag: &str,
+    keep_ext: bool,
+    mut place: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    let date = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let file = path.file_name().unwrap_or_default().to_string_lossy();
+    let (stem, ext) = match (keep_ext, file.rsplit_once('.')) {
+        (true, Some((s, e))) => (s.to_string(), format!(".{e}")),
+        _ => (file.to_string(), String::new()),
+    };
+    let mut last = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for n in 1..100 {
+        let extra = if n > 1 {
+            format!("-{n}")
+        } else {
+            String::new()
+        };
+        let dst = path.with_file_name(format!("{stem}.{tag}-{date}{extra}{ext}"));
+        match place(&dst) {
+            Ok(()) => return Ok(dst),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// Version de secours lisible (voir `newest_readable`).
+struct Candidate {
+    path: PathBuf,
+    text: String,
+    project: Project,
+}
+
+/// Parmi `candidates`, la version lisible la plus récente, rangée à l'emplacement `path` :
+/// d'après l'heure de son contenu (`saved_at`), puis la date de modification du fichier
+/// (fichiers d'une version qui ne notait pas l'heure). Après une prise, la copie `.bak1`
+/// est plus ancienne que le double du second disque ; plus tard, ce peut être l'inverse.
+fn newest_readable(path: &Path, candidates: impl Iterator<Item = PathBuf>) -> Option<Candidate> {
+    let mut best: Option<((i64, std::time::SystemTime), Candidate)> = None;
+    for cand in candidates {
+        let Ok(text) = read_retrying(&cand) else {
+            continue;
+        };
+        let Ok(project) = Project::from_json(&text, path) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&cand)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let key = (project.saved_at, mtime);
+        if best.as_ref().is_none_or(|(k, _)| key > *k) {
+            best = Some((
+                key,
+                Candidate {
+                    path: cand,
+                    text,
+                    project,
+                },
+            ));
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
+/// Nombre de versions précédentes gardées (`.bak1` la plus récente … `.bak3`).
+pub const BACKUPS: usize = 3;
+/// Une nouvelle version précédente au plus toutes les 5 min (hors fins de prise).
+const BACKUP_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+/// Attente d'une sauvegarde par l'interface (voir `Project::save`).
+pub const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Attente de la fin d'une écriture précédente du même fichier.
+const LOCK_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(300)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// Copies des versions précédentes d'un fichier de session, la plus récente en premier.
+pub fn backup_paths(path: &Path) -> Vec<PathBuf> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    (1..=BACKUPS)
+        .map(|i| path.with_file_name(format!("{name}.bak{i}")))
+        .collect()
+}
+
+/// Avant de remplacer `path` : sa version actuelle rejoint les copies `.bak` (rotation),
+/// si la dernière copie a plus de 5 min ou si `force`. Un fichier en place devenu illisible
+/// n'est jamais remplacé en silence : il est mis de côté. Au mieux : un échec ici
+/// n'empêche jamais la sauvegarde.
+fn rotate_backups(path: &Path, force: bool) {
+    let baks = backup_paths(path);
+    let recent = std::fs::metadata(&baks[0])
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < BACKUP_EVERY);
+    if recent && !force {
+        return;
+    }
+    let Ok(current) = retrying(|| std::fs::read(path)) else {
+        return;
+    };
+    if serde_json::from_slice::<serde::de::IgnoredAny>(&current).is_err() {
+        let _ = set_aside(path, "illisible", false);
+        return;
+    }
+    for i in (1..BACKUPS).rev() {
+        let _ = replace_file(&baks[i - 1], &baks[i]);
+    }
+    let _ = write_atomic(&baks[0], &current);
+}
+
+/// Fichiers temporaires de `path` laissés par une écriture interrompue (crash, coupure)
+/// depuis plus de 10 min : supprimés.
+pub fn clean_stale_temps(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let temp = n.starts_with(&prefix) && (n.ends_with(".tmp") || n.ends_with(".copie"));
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(600));
+        if temp && old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Premier nom libre dans `root` : `base`, puis `base (2)`, `base (3)`…
+fn free_dir_name(root: &Path, base: &str) -> String {
+    (1..1000)
+        .map(|n| {
+            if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base} ({n})")
+            }
+        })
+        .find(|name| !root.join(name).try_exists().unwrap_or(true))
+        .unwrap_or_else(|| format!("{base} ({})", std::process::id()))
+}
+
+// ------------------------------------------------------------- format des fichiers
+
+/// Version du format des fichiers de session et de soundboard. Une version précédente de
+/// l'application ouvre en lecture seule un fichier d'un format plus récent, au lieu de le
+/// réécrire en perdant des données.
+///
+/// Un champ ajouté (session, piste, prise, repère, soundboard, page, pad) n'impose pas de
+/// l'augmenter : les champs inconnus sont relus et réécrits tels quels (`Extra`, et
+/// `clip_extra` pour les prises). Une nouvelle valeur d'un champ existant est protégée par
+/// `lenient`. À augmenter quand un fichier ne serait plus correct sans ce que la version
+/// précédente ignore (nouveau sens d'un champ existant, nouvel objet hors de ces structures,
+/// champ du journal des prises…).
+pub const FORMAT_VERSION: u32 = 1;
+
+/// Champs inconnus d'un objet (version plus récente), réécrits tels quels.
+pub type Extra = serde_json::Map<String, serde_json::Value>;
+
+/// Écrit toujours la version de format de cette application.
+pub fn write_format_version<S: serde::Serializer>(_: &u32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u32(FORMAT_VERSION)
+}
+
+thread_local! {
+    /// Une valeur inconnue a été remplacée par sa valeur par défaut pendant la lecture en
+    /// cours (voir `lenient`, `parse_json`).
+    static UNKNOWN_VALUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Champ tolérant : une valeur inconnue (nouvelle variante d'une version plus récente…)
+/// prend la valeur par défaut au lieu de rendre tout le fichier illisible, et le fichier
+/// est signalé (`parse_json`) pour ne pas être réécrit sans elle.
+pub fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_else(|_| {
+        UNKNOWN_VALUE.with(|u| u.set(true));
+        T::default()
+    }))
+}
+
+/// Nombre tolérant : `null` (NaN écrit par serde_json) ou valeur illisible → 0.
+pub fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_f64().filter(|x| x.is_finite()).unwrap_or(0.0))
+}
+
+/// Comme `lenient_f64`, en `f32` (hors limites → 0).
+pub fn lenient_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let x = lenient_f64(d)? as f32;
+    Ok(if x.is_finite() { x } else { 0.0 })
+}
+
+/// Lecture JSON : la valeur, et `true` si des valeurs inconnues y ont été remplacées par
+/// défaut (fichier d'une version plus récente : à ne pas réécrire).
+pub fn parse_json<T: serde::de::DeserializeOwned>(s: &str) -> serde_json::Result<(T, bool)> {
+    UNKNOWN_VALUE.with(|u| u.set(false));
+    let r = serde_json::from_str(s);
+    let unknown = UNKNOWN_VALUE.with(|u| u.replace(false));
+    r.map(|v| (v, unknown))
+}
+
+/// Comme `parse_json`, depuis une valeur JSON déjà lue.
+pub fn parse_value<T: serde::de::DeserializeOwned>(
+    v: &serde_json::Value,
+) -> serde_json::Result<(T, bool)> {
+    UNKNOWN_VALUE.with(|u| u.set(false));
+    let r = T::deserialize(v);
+    let unknown = UNKNOWN_VALUE.with(|u| u.replace(false));
+    r.map(|v| (v, unknown))
+}
+
+/// Champs connus d'une prise (`Clip`) : les autres sont gardés à part (`clip_extra`).
+const CLIP_FIELDS: &[&str] = &[
+    "id", "file", "start", "offset", "len", "src_len", "fade_in", "fade_out",
+];
+
+/// Lecture d'un fichier de session (voir `parse_json`), en gardant les champs inconnus des
+/// prises, par identifiant de prise (avant toute correction de `validate`).
+fn parse_project(json: &str) -> serde_json::Result<(Project, bool)> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    let (mut p, unknown) = parse_value::<Project>(&v)?;
+    let raw_tracks = v
+        .get("tracks")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for (t, raw) in p.tracks.iter().zip(raw_tracks) {
+        let raw_clips = raw
+            .get("clips")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (c, rc) in t.clips.iter().zip(raw_clips) {
+            let Some(obj) = rc.as_object() else {
+                continue;
+            };
+            let extra: Extra = obj
+                .iter()
+                .filter(|(k, _)| !CLIP_FIELDS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !extra.is_empty() {
+                p.clip_extra.insert(c.id, extra);
+            }
+        }
+    }
+    Ok((p, unknown))
+}
+
+/// Heure actuelle en millisecondes depuis 1970 (voir `Project::saved_at`).
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Version de format d'un fichier JSON si elle est plus récente que celle-ci.
+pub fn newer_format(json: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(default)]
+        format_version: serde_json::Value,
+    }
+    let h: Head = serde_json::from_str(json).ok()?;
+    h.format_version
+        .as_u64()
+        .filter(|&v| v > FORMAT_VERSION as u64)
+}
+
+/// Verrou d'écriture d'un fichier de session (avec le numéro de la dernière sauvegarde
+/// écrite). Un verrou par fichier : la sauvegarde du double de la session sur un second
+/// disque lent ou débranché ne bloque jamais celle de la session elle-même.
+fn file_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<u64>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    static LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<u64>>>>> = Mutex::new(None);
+    let mut m = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    m.get_or_insert_with(HashMap::new)
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// Numéro d'ordre des sauvegardes (voir `Project::write_file`).
@@ -1156,7 +1887,7 @@ mod tests {
         let old = p.clone();
         p.tracks[0].name = "Récente".into();
         p.save().unwrap();
-        old.write_file(old_seq).unwrap();
+        old.write_file(old_seq, false).unwrap();
         assert_eq!(
             Project::load(&p.file_path()).unwrap().tracks[0].name,
             "Récente"
@@ -1169,6 +1900,427 @@ mod tests {
             Project::load(&p.file_path()).unwrap().tracks[0].name,
             "Auto"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Fichier de session abîmé : la version précédente (`.bak1`) est reprise, le fichier
+    /// abîmé est mis de côté (jamais écrasé), et la sauvegarde suivante le remplace.
+    #[test]
+    fn corrupt_session_falls_back_to_previous_version() {
+        let dir = fresh_dir("bak");
+        let mut p = Project::new("Concert".into(), dir.clone(), 48000);
+        p.add_track(Some("Voix".into()), Some(0));
+        p.save().unwrap();
+        // Deuxième version : la première rejoint les copies (première copie : immédiate).
+        p.tracks[0].name = "Voix lead".into();
+        p.save().unwrap();
+        let path = p.file_path();
+        let baks = backup_paths(&path);
+        assert!(baks[0].is_file(), "copie de la version précédente");
+        // Rotation : au plus 3 copies, la plus récente en .bak1.
+        for i in 0..5 {
+            p.tracks[0].name = format!("V{i}");
+            p.save_checkpoint().unwrap();
+        }
+        assert!(baks.iter().all(|b| b.is_file()));
+        assert!(!path.with_file_name("Concert.tracksplus.bak4").exists());
+        let b1 = Project::load(&baks[0]).unwrap();
+        assert_eq!(b1.tracks[0].name, "V3");
+
+        // Fichier abîmé : la lecture simple échoue, l'ouverture reprend .bak1.
+        std::fs::write(&path, b"{\"tracks\": [ tronqu").unwrap();
+        assert!(Project::load(&path).is_err());
+        let (q, msg) = Project::open(&path, &[]).unwrap();
+        assert!(msg.unwrap().contains("illisible"));
+        assert_eq!(q.tracks[0].name, "V3");
+        assert!(!q.dirty && q.read_only.is_none());
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("Concert.tracksplus.illisible-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "fichier abîmé conservé");
+        assert_eq!(
+            std::fs::read(dir.join(&aside[0])).unwrap(),
+            b"{\"tracks\": [ tronqu"
+        );
+        // Toujours un fichier de session à sa place : la version reprise, déjà réécrite.
+        assert_eq!(Project::load(&path).unwrap().tracks[0].name, "V3");
+        let mut q = q;
+        q.dirty = true;
+        q.save().unwrap();
+        assert_eq!(Project::load(&path).unwrap().tracks[0].name, "V3");
+
+        // Plus aucune version lisible : erreur, rien n'est touché.
+        std::fs::write(&path, b"abime").unwrap();
+        for b in &baks {
+            std::fs::write(b, b"abime aussi").unwrap();
+        }
+        let e = Project::open(&path, &[]).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("aucune version précédente"),
+            "{e:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"abime");
+        // Repli fourni par l'appelant (double du second disque).
+        let mut double = p.clone();
+        double.dir = dir.join("double");
+        double.tracks[0].name = "Double".into();
+        double.save().unwrap();
+        let (r, _) = Project::open(&path, &[double.file_path()]).unwrap();
+        assert_eq!(
+            (r.tracks[0].name.as_str(), r.dir.as_path()),
+            ("Double", dir.as_path())
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fichier abîmé juste après une prise : la copie `.bak1` (état d'avant la prise) est
+    /// plus ancienne que le double du second disque (état d'après) : c'est le double qui
+    /// est repris. Plus tard, une copie `.bak1` plus récente que le double l'emporte.
+    #[test]
+    fn corrupt_session_takes_newest_backup() {
+        let dir = fresh_dir("newest");
+        let mut p = Project::new("N".into(), dir.clone(), 48000);
+        p.add_track(Some("Avant la prise".into()), Some(0));
+        p.save().unwrap();
+        // Fin de prise : rotation (.bak1 = avant la prise), puis double à jour.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.tracks[0].name = "Après la prise".into();
+        p.save_checkpoint().unwrap();
+        let mut double = p.clone();
+        double.dir = dir.join("double");
+        double.mark_state_time();
+        double.save().unwrap();
+        let path = p.file_path();
+        let bak1 = backup_paths(&path)[0].clone();
+        assert_eq!(
+            Project::load(&bak1).unwrap().tracks[0].name,
+            "Avant la prise"
+        );
+        std::fs::write(&path, b"abime").unwrap();
+        let (r, msg) = Project::open(&path, &[double.file_path()]).unwrap();
+        assert_eq!(r.tracks[0].name, "Après la prise");
+        assert!(msg.unwrap().contains("double"));
+
+        // L'inverse : des sauvegardes plus récentes que le double (.bak1 plus récente).
+        let mut p = r;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.tracks[0].name = "Plus tard".into();
+        p.dirty = true;
+        p.save_checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.tracks[0].name = "Encore plus tard".into();
+        p.save_checkpoint().unwrap();
+        std::fs::write(&path, b"abime").unwrap();
+        let (r, _) = Project::open(&path, &[double.file_path()]).unwrap();
+        assert_eq!(r.tracks[0].name, "Plus tard");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Version de secours d'un format plus récent : ouverte en lecture seule, et rien n'est
+    /// touché sur le disque (le fichier abîmé reste en place, rien n'est mis de côté).
+    #[test]
+    fn read_only_backup_leaves_disk_untouched() {
+        let dir = fresh_dir("robak");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("R.tracksplus");
+        std::fs::write(&path, b"abime").unwrap();
+        std::fs::write(
+            &backup_paths(&path)[0],
+            r#"{"format_version":99,"tracks":[]}"#,
+        )
+        .unwrap();
+        let (p, msg) = Project::open(&path, &[]).unwrap();
+        assert!(p.read_only.is_some() && msg.unwrap().contains("lecture seule"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"abime");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert!(p.save_refused().is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Session qui ne peut pas être enregistrée (lecture seule, fichier d'une autre
+    /// session) : signalé avant une prise, qui ne serait notée nulle part.
+    #[test]
+    fn save_refused_reports_permanent_refusals() {
+        let dir = fresh_dir("refused");
+        let mut p = Project::new("S".into(), dir.clone(), 48000);
+        assert!(
+            p.save_refused().is_none(),
+            "session neuve, pas encore écrite"
+        );
+        p.save().unwrap();
+        assert!(p.save_refused().is_none());
+        let other = Project::new("S".into(), dir.clone(), 48000);
+        assert!(other.save_refused().unwrap().contains("existe déjà"));
+        let mut q = Project::load(&p.file_path()).unwrap();
+        assert!(q.save_refused().is_none());
+        q.read_only = Some("protégée".into());
+        assert_eq!(q.save_refused().as_deref(), Some("protégée"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Champs inconnus d'une prise (gain, couleur… d'une version plus récente) : conservés
+    /// à la réécriture, après une coupe et une renumérotation ; jamais à la place d'un champ
+    /// connu.
+    #[test]
+    fn unknown_clip_fields_survive() {
+        // La liste des champs connus suit la structure.
+        let c = audio_clip(1, "a.wav");
+        let v = serde_json::to_value(&c).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut known = CLIP_FIELDS.to_vec();
+        keys.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(keys, known);
+
+        let dir = fresh_dir("clipx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("C.tracksplus");
+        std::fs::write(
+            &path,
+            r#"{"format_version":1,"sample_rate":48000,"next_id":10,"tracks":[{"id":1,
+            "name":"A","clips":[{"id":2,"file":"a.wav","start":0,"len":10000,"gain_db":-3.5,
+            "couleur":{"r":1},"len_x":1},{"id":3,"file":"b.wav","start":20000,"len":500}]}]}"#,
+        )
+        .unwrap();
+        let mut p = Project::load(&path).unwrap();
+        assert!(p.read_only.is_none());
+        let right = p.split_clip(1, 2, 4000).unwrap();
+        p.dirty = true;
+        p.save().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let clips = v["tracks"][0]["clips"].as_array().unwrap();
+        let by_id = |id: u64| clips.iter().find(|c| c["id"] == id).unwrap();
+        assert_eq!(by_id(2)["gain_db"], -3.5);
+        assert_eq!(by_id(2)["couleur"]["r"], 1);
+        assert_eq!(by_id(2)["len"], 4000);
+        assert_eq!(by_id(right)["gain_db"], -3.5);
+        assert_eq!(by_id(right)["start"], 4000);
+        assert!(by_id(3).get("gain_db").is_none());
+
+        // Identifiants en double : renumérotés, les champs inconnus suivent leur prise.
+        std::fs::write(
+            &path,
+            r#"{"tracks":[{"id":1,"clips":[{"id":1,"file":"a.wav","len":100,"x":"a"},
+            {"id":7,"file":"b.wav","len":100,"x":"b"}]}]}"#,
+        )
+        .unwrap();
+        let mut p = Project::load(&path).unwrap();
+        p.dirty = true;
+        p.save().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let clips = &v["tracks"][0]["clips"];
+        assert_eq!(clips[0]["file"], "a.wav");
+        assert_eq!(clips[0]["x"], "a");
+        assert_eq!(clips[1]["file"], "b.wav");
+        assert_eq!(clips[1]["x"], "b");
+        assert_ne!(clips[0]["id"], v["tracks"][0]["id"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fichier d'une version plus récente : numéro de format, champs et valeurs inconnus.
+    /// Il s'ouvre, mais n'est jamais réécrit ; « Enregistrer sous » ailleurs reste possible.
+    #[test]
+    fn newer_format_is_read_only_and_unknown_fields_survive() {
+        let dir = fresh_dir("newer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Futur.tracksplus");
+        // Champs inconnus seuls (ajout compatible, même format) : conservés à la réécriture.
+        let json = r##"{"format_version":1,"sample_rate":48000,"bientot":{"x":1},
+            "tracks":[{"id":1,"name":"A","clips":[],"couleur_rvb":"#ff0000"}],
+            "markers":[{"id":2,"pos":5,"name":"M","note":"n"}]}"##;
+        std::fs::write(&path, json).unwrap();
+        let mut p = Project::load(&path).unwrap();
+        assert!(p.read_only.is_none());
+        p.dirty = true;
+        p.save().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["format_version"], FORMAT_VERSION);
+        assert_eq!(v["bientot"]["x"], 1);
+        assert_eq!(v["tracks"][0]["couleur_rvb"], "#ff0000");
+        assert_eq!(v["markers"][0]["note"], "n");
+
+        // Numéro de format plus récent : lecture seule.
+        let newer = json.replace(r#""format_version":1"#, r#""format_version":99"#);
+        std::fs::write(&path, &newer).unwrap();
+        let mut p = Project::load(&path).unwrap();
+        assert!(p.read_only.is_some());
+        let e = p.save().unwrap_err();
+        assert!(format!("{e:#}").contains("plus récente"), "{e:#}");
+        assert!(p.save_in_background().recv().unwrap().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            newer,
+            "jamais réécrit"
+        );
+        // Copie ailleurs : modifiable.
+        let mut q = p.clone();
+        q.save_as(dir.join("Copie"), "Copie".into()).unwrap();
+        assert!(q.read_only.is_none());
+        assert!(Project::load(&q.file_path()).unwrap().read_only.is_none());
+
+        // Variante inconnue (nouvelle sorte de piste) : session lisible, mais protégée.
+        let variant = json.replace(r#""name":"A""#, r#""name":"A","kind":"Video""#);
+        std::fs::write(&path, &variant).unwrap();
+        let p = Project::load(&path).unwrap();
+        assert_eq!(p.tracks[0].kind, TrackKind::Record);
+        assert!(p.read_only.is_some());
+        // Format plus récent qui ne se lit plus du tout : message clair, pas de repli.
+        std::fs::write(&path, r#"{"format_version":7,"tracks":"autre chose"}"#).unwrap();
+        let e = Project::open(&path, &[]).unwrap_err();
+        assert!(format!("{e:#}").contains("plus récente"), "{e:#}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Session neuve : jamais écrite par-dessus un fichier de session existant (même nom,
+    /// même dossier) ; le nom horodaté choisit un dossier libre.
+    #[test]
+    fn fresh_session_never_overwrites_existing_file() {
+        let dir = fresh_dir("fresh");
+        let mut old = Project::new("S".into(), dir.clone(), 48000);
+        old.add_track(Some("Ancienne".into()), Some(0));
+        old.save().unwrap();
+        let mut neuf = Project::new("S".into(), dir.clone(), 48000);
+        neuf.dirty = true;
+        assert!(neuf.save().is_err());
+        assert!(neuf.dirty);
+        assert_eq!(
+            Project::load(&old.file_path()).unwrap().tracks[0].name,
+            "Ancienne"
+        );
+        // Une fois la session écrite, elle se réécrit normalement.
+        old.tracks[0].name = "Modifiée".into();
+        old.save().unwrap();
+        assert_eq!(
+            free_dir_name(dir.parent().unwrap(), "inexistant-tp"),
+            "inexistant-tp"
+        );
+        let base = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            free_dir_name(dir.parent().unwrap(), &base),
+            format!("{base} (2)")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Une écriture précédente bloquée (disque figé) ne retient pas la suivante
+    /// indéfiniment : refus après un délai borné, session toujours « à sauvegarder ».
+    #[test]
+    fn blocked_previous_write_does_not_block_forever() {
+        let dir = fresh_dir("lock");
+        let mut p = Project::new("L".into(), dir.clone(), 48000);
+        p.save().unwrap();
+        let lock = file_lock(&p.file_path());
+        let held = lock.lock().unwrap();
+        p.dirty = true;
+        let t = std::time::Instant::now();
+        let e = p.save().unwrap_err();
+        assert!(t.elapsed() < std::time::Duration::from_secs(3));
+        assert!(format!("{e:#}").contains("disque occupé"), "{e:#}");
+        assert!(p.dirty);
+        drop(held);
+        p.save().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Session nommée « Soundboard » : son fichier temporaire et celui de `soundboard.json`
+    /// ne se confondent jamais (Windows ignore la casse), même en écritures simultanées.
+    #[test]
+    fn concurrent_atomic_writes_use_distinct_temp_files() {
+        let dir = fresh_dir("tmpnames");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("Soundboard.tracksplus");
+        let b = dir.join("soundboard.json");
+        let ta = temp_sibling(&a, "tmp");
+        let tb = temp_sibling(&b, "tmp");
+        assert_ne!(
+            ta.to_string_lossy().to_lowercase(),
+            tb.to_string_lossy().to_lowercase()
+        );
+        assert_ne!(temp_sibling(&a, "tmp"), ta);
+        let (a2, b2) = (a.clone(), b.clone());
+        let h = std::thread::spawn(move || {
+            for i in 0..50 {
+                write_atomic(&a2, format!("{{\"session\":{i}}}").as_bytes()).unwrap();
+            }
+        });
+        for i in 0..50 {
+            write_atomic(&b2, format!("{{\"board\":{i}}}").as_bytes()).unwrap();
+        }
+        h.join().unwrap();
+        assert!(std::fs::read_to_string(&a).unwrap().contains("session"));
+        assert!(std::fs::read_to_string(&b).unwrap().contains("board"));
+        let left = std::fs::read_dir(&dir).unwrap().flatten().count();
+        assert_eq!(left, 2, "aucun fichier temporaire laissé");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Renommage sans remplacement, et mise de côté sous un nom libre.
+    #[test]
+    fn rename_never_replaces_and_set_aside_keeps_everything() {
+        let dir = fresh_dir("noreplace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        std::fs::write(&a, b"A").unwrap();
+        std::fs::write(&b, b"B").unwrap();
+        let e = rename_no_replace(&a, &b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&b).unwrap(), b"B");
+        rename_no_replace(&a, &dir.join("c.wav")).unwrap();
+        assert!(!a.exists());
+        // Deux mises de côté dans la même seconde : deux noms différents.
+        let f = dir.join("soundboard.json");
+        std::fs::write(&f, b"1").unwrap();
+        let s1 = set_aside(&f, "illisible", true).unwrap();
+        std::fs::write(&f, b"2").unwrap();
+        let s2 = set_aside(&f, "illisible", true).unwrap();
+        assert_ne!(s1, s2);
+        assert!(s1.to_string_lossy().ends_with(".json"));
+        assert!(
+            s1.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("soundboard.illisible-")
+        );
+        assert_eq!(std::fs::read(&s1).unwrap(), b"1");
+        assert_eq!(std::fs::read(&s2).unwrap(), b"2");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Import de plusieurs fichiers de même nom de base (« Intro.wav » et « Intro.mp3 »,
+    /// ponctuation remplacée) : chaque fichier a son propre nom de destination.
+    #[test]
+    fn import_targets_never_share_a_file() {
+        let dir = fresh_dir("import-names");
+        let p = Project::new("I".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let mut taken = HashSet::new();
+        let mut names = Vec::new();
+        for stem in [
+            "Intro", "Intro", "intro", "Take (1)", "Take [1]", "!!!", "???",
+        ] {
+            let f = p.new_take_file_avoiding(stem, &taken);
+            taken.insert(f.to_lowercase());
+            names.push(f.to_lowercase());
+        }
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        // Même si l'appelant oubliait les minuscules, le nom exact est reconnu.
+        let mut raw = HashSet::new();
+        let a = p.new_take_file_avoiding("Intro", &raw);
+        raw.insert(a.clone());
+        assert_ne!(p.new_take_file_avoiding("Intro", &raw), a);
         std::fs::remove_dir_all(dir).ok();
     }
 

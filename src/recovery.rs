@@ -37,12 +37,12 @@ pub fn journal_path(dir: &Path) -> PathBuf {
     dir.join(JOURNAL)
 }
 
+/// Écriture atomique (temporaire au nom unique, renommage réessayé sous Windows).
 pub fn write_journal(dir: &Path, j: &Journal) -> Result<()> {
-    let p = journal_path(dir);
-    let tmp = p.with_extension("tmp");
-    crate::project::write_synced(&tmp, serde_json::to_string_pretty(j)?.as_bytes())?;
-    std::fs::rename(tmp, p)?;
-    Ok(())
+    crate::project::write_atomic(
+        &journal_path(dir),
+        serde_json::to_string_pretty(j)?.as_bytes(),
+    )
 }
 
 pub fn remove_journal(dir: &Path) {

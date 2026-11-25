@@ -310,6 +310,35 @@ fn backup_board(mut board: Board, from: &Path, to: &Path) {
     let _ = board.save_session(to);
 }
 
+/// Dossier du double de la session `dir` / `name` dans la copie de sécurité `root` (voir
+/// `App::backup_session_dir`).
+fn backup_session_dir_for(root: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
+    // Comparaison sans accès disque (le second disque peut être en veille) ; casse et
+    // séparateurs ignorés comme sous Windows.
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase()
+    };
+    let (r, d) = (norm(root), norm(dir));
+    let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
+    if inside(&d, &r) || inside(&r, &d) {
+        return None;
+    }
+    // Session ouverte sur le disque de la copie (Windows : comparaison des lecteurs,
+    // sans accès disque) : pas de copie sur le même disque.
+    #[cfg(windows)]
+    if same_volume(root, dir) {
+        return None;
+    }
+    // FNV-1a : code stable d'une version à l'autre de l'application.
+    let code = d.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    });
+    Some(root.join(format!("{} ({:08x})", project::sanitize(name), code as u32)))
+}
+
 /// Mesure de la place libre : disque de la session, et second disque de la copie de
 /// sécurité (`None` = pas de copie, `Some(Err)` = second disque introuvable).
 pub struct DiskSpace {
@@ -422,6 +451,9 @@ pub struct App {
     pub leave_anyway_at: f64,
     /// Dossier de la copie de sécurité des prises (second disque), réglage de l'ordinateur.
     pub backup_root: Option<PathBuf>,
+    /// Réglage de la copie de sécurité illisible au lancement : la copie est peut-être
+    /// désactivée à tort (rappelé à chaque départ de prise).
+    pub backup_prefs_error: Option<String>,
     /// Problèmes de la copie de sécurité pendant la dernière prise (affichés à la fin).
     pub backup_warn: Vec<String>,
     /// Thread qui tient à jour le double de la session sur le second disque.
@@ -549,6 +581,13 @@ impl App {
             Ok(e) => (e, None),
             Err(e) => (Engine::offline(), Some(format!("{e:#}"))),
         };
+        let (backup_root, backup_prefs_error) = match crate::sessions::load_backup_root() {
+            Ok(d) => (d, None),
+            Err(e) => (None, Some(e)),
+        };
+        // Après la lecture du réglage de la copie (qui peut encore se trouver dans ce
+        // fichier) : réglages de l'accueil abîmés mis de côté, à signaler.
+        let prefs_notice = crate::sessions::check_startup_prefs();
         let mut project = Project::untitled(engine.status.sample_rate);
         let n = engine.status.in_channels.clamp(1, 2);
         for i in 0..n {
@@ -625,7 +664,8 @@ impl App {
             disk_stalled: false,
             save_error_at: f64::NEG_INFINITY,
             leave_anyway_at: f64::NEG_INFINITY,
-            backup_root: crate::sessions::StartupPrefs::load().backup_dir,
+            backup_root,
+            backup_prefs_error,
             backup_warn: Vec::new(),
             backup_jobs: None,
             backup_thread: None,
@@ -694,11 +734,9 @@ impl App {
         if let Some(path) = reopen {
             // Protégé : une session illisible ne doit pas empêcher l'application de démarrer
             // (sinon elle planterait à chaque lancement, le journal étant toujours là).
-            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                app.load_session(&path);
-            }))
-            .is_ok();
-            if !ok {
+            let res =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.load_session(&path)));
+            if res.is_err() {
                 app.notify(
                     format!(
                         "Récupération de « {} » impossible : ouvrez-la à la main",
@@ -707,17 +745,34 @@ impl App {
                     true,
                 );
             }
+            if !matches!(res, Ok(true)) {
+                // Session non ouverte : l'accueil, jamais la session neuve du lancement (elle
+                // ne doit rien écrire à la place de celle qui n'a pas pu s'ouvrir).
+                app.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&cc.egui_ctx));
+                app.start_screen = true;
+            }
         } else {
             // Écran d'accueil : aucune session tant que l'utilisateur n'a pas choisi de
             // reprendre, créer, ouvrir ou choisir une session.
             app.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&cc.egui_ctx));
             app.start_screen = true;
         }
+        // Un seul message s'affiche à la fois : les avertissements du lancement sont réunis.
+        let mut launch_warnings: Vec<String> = Vec::new();
         if relaunched {
             // Après l'ouverture de la session (qui pose son propre message) : l'alerte reste
             // affichée jusqu'au clic et reprend le message de l'ouverture, rien n'est perdu.
             let opened = app.toast.take().map(|t| t.text);
-            app.notify(relaunch_message(take_interrupted, opened.as_deref()), true);
+            launch_warnings.push(relaunch_message(take_interrupted, opened.as_deref()));
+        }
+        launch_warnings.extend(
+            app.backup_prefs_error
+                .iter()
+                .map(|e| format!("Copie de sécurité : réglage illisible ({e}), copie inactive"))
+                .chain(prefs_notice),
+        );
+        if !launch_warnings.is_empty() {
+            app.notify(launch_warnings.join(" · "), true);
         }
         if let Some(e) = err {
             let mut d = SettingsDialog::new(&app.prefs);
@@ -874,6 +929,19 @@ impl App {
             );
             return;
         }
+        // Session qui ne peut pas être enregistrée (lecture seule, fichier d'une autre
+        // session) : la prise ne serait notée nulle part dans la session, et son journal de
+        // secours serait remplacé par celui de la prise suivante. Refus avant tout (la
+        // lecture en cours continue).
+        if let Some(why) = self.project.save_refused() {
+            self.notify(
+                format!(
+                    "Prise impossible : la session ne peut pas être enregistrée ({why}). Faites d'abord « Enregistrer sous »."
+                ),
+                true,
+            );
+            return;
+        }
         if !self.is_stopped() {
             if matches!(self.transport, Transport::Playing { .. }) {
                 self.stop();
@@ -1018,6 +1086,13 @@ impl App {
                 "Copie de sécurité inactive pour cette session : elle est sur le même disque que la copie",
                 false,
             );
+        } else if self.backup_root.is_none()
+            && let Some(e) = &self.backup_prefs_error
+        {
+            let msg = format!(
+                "Copie de sécurité inactive : son réglage n'a pas pu être lu ({e}). Choisissez de nouveau le second disque."
+            );
+            self.notify(msg, true);
         }
         let recorder = match Recorder::start_with_backup(
             specs,
@@ -1305,7 +1380,8 @@ impl App {
         self.redo.clear();
         self.playhead = start + max_len;
         self.project.dirty = true;
-        let save = self.project.save();
+        // L'état d'avant la prise rejoint les versions précédentes (`.bak`).
+        let save = self.project.save_checkpoint();
         if save.is_ok() {
             // Les prises sont référencées dans la session : le journal n'est plus utile.
             recovery::remove_journal(&self.project.dir);
@@ -1608,16 +1684,23 @@ impl App {
     }
 
     fn set_backup_root(&mut self, d: Option<PathBuf>) {
-        let mut prefs = crate::sessions::StartupPrefs::load();
-        prefs.backup_dir = d.clone();
-        prefs.save();
-        self.notify(
-            match &d {
-                Some(d) => format!("Copie de sécurité activée : {}", d.display()),
-                None => "Copie de sécurité désactivée".to_string(),
-            },
-            false,
-        );
+        match crate::sessions::save_backup_root(d.as_deref()) {
+            Ok(()) => {
+                self.backup_prefs_error = None;
+                self.notify(
+                    match &d {
+                        Some(d) => format!("Copie de sécurité activée : {}", d.display()),
+                        None => "Copie de sécurité désactivée".to_string(),
+                    },
+                    false,
+                );
+            }
+            // Réglage appliqué pour cette fois, mais il ne sera pas retrouvé au lancement.
+            Err(e) => self.notify(
+                format!("Copie de sécurité : réglage non enregistré ({e:#}), à refaire au prochain lancement"),
+                true,
+            ),
+        }
         self.backup_root = d;
         // Nouvelle mesure du second disque au prochain passage (dans les 2 s).
         self.backup_free = None;
@@ -1629,35 +1712,11 @@ impl App {
     /// `None` si la session est elle-même sur le disque de secours (copie ouverte après
     /// une panne du disque principal) : jamais deux écritures dans le même dossier.
     pub fn backup_session_dir(&self) -> Option<PathBuf> {
-        let root = self.backup_root.as_ref()?;
-        // Comparaison sans accès disque (le second disque peut être en veille) ; casse et
-        // séparateurs ignorés comme sous Windows.
-        let norm = |p: &Path| {
-            p.to_string_lossy()
-                .replace('\\', "/")
-                .trim_end_matches('/')
-                .to_lowercase()
-        };
-        let (r, d) = (norm(root), norm(&self.project.dir));
-        let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
-        if inside(&d, &r) || inside(&r, &d) {
-            return None;
-        }
-        // Session ouverte sur le disque de la copie (Windows : comparaison des lecteurs,
-        // sans accès disque) : pas de copie sur le même disque.
-        #[cfg(windows)]
-        if same_volume(root, &self.project.dir) {
-            return None;
-        }
-        // FNV-1a : code stable d'une version à l'autre de l'application.
-        let code = d.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
-        });
-        Some(root.join(format!(
-            "{} ({:08x})",
-            project::sanitize(&self.project.name),
-            code as u32
-        )))
+        backup_session_dir_for(
+            self.backup_root.as_deref()?,
+            &self.project.dir,
+            &self.project.name,
+        )
     }
 
     /// Met à jour le double de la session sur le second disque : fichier de session, et
@@ -1688,8 +1747,12 @@ impl App {
             self.backup_thread = h;
             tx
         });
+        // Heure de l'état copié : le double garde celle de son contenu, même écrit plus tard
+        // (second disque lent), pour départager les versions de secours (`Project::open`).
+        let mut project = self.project.clone();
+        project.mark_state_time();
         let _ = tx.send(BackupJob {
-            project: self.project.clone(),
+            project,
             dir,
             journal,
             done,
@@ -2032,9 +2095,12 @@ impl App {
     }
 
     /// La session mérite d'être sauvegardée : elle contient de l'audio, ou elle existe
-    /// déjà sur le disque (préparation des pistes et entrées avant un concert).
+    /// déjà sur le disque (préparation des pistes et entrées avant un concert). Jamais une
+    /// session en lecture seule (fichier d'une version plus récente) : la sauvegarde
+    /// automatique ne la réécrit pas, et ne répète pas son refus toutes les 30 s.
     fn worth_saving(&self) -> bool {
-        self.project.has_audio() || self.project.file_path().exists()
+        self.project.read_only.is_none()
+            && (self.project.has_audio() || self.project.file_path().exists())
     }
 
     pub fn autosave(&mut self) {
@@ -2069,6 +2135,29 @@ impl App {
                 format!("Réglages du soundboard non sauvegardés : {e:#}"),
                 true,
             );
+        }
+        // Fichier de soundboard protégé (illisible, ou d'une version plus récente) : rien
+        // n'est écrit tant que le soundboard n'a pas vraiment changé ; à la première vraie
+        // modification, l'ancien fichier est mis de côté sous un autre nom, jamais écrasé.
+        if self.board.guard.is_some() {
+            if !self.board.changed_since_guard() {
+                return true;
+            }
+            match self.board.release_guard(&self.project.dir) {
+                Ok(Some(aside)) => self.notify(
+                    format!(
+                        "Soundboard modifié : l'ancien fichier est conservé sous « {} » (importable)",
+                        aside.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    true,
+                ),
+                Ok(None) => {}
+                Err(e) => {
+                    self.notify(format!("Soundboard non sauvegardé : {e:#}"), true);
+                    self.board_changed = Some(self.now + 29.0);
+                    return false;
+                }
+            }
         }
         if !self.board.has_pads() && !self.project.file_path().exists() {
             return true;
@@ -2132,6 +2221,14 @@ impl App {
             self.project.dirty = true;
             ok = false;
             self.notify(format!("Sauvegarde de la session impossible : {e:#}"), true);
+        } else if self.project.dirty
+            && let Some(why) = &self.project.read_only
+        {
+            // Session en lecture seule modifiée : ses modifications seraient perdues sans
+            // prévenir.
+            let msg = format!("Modifications non enregistrées : {why}");
+            ok = false;
+            self.notify(msg, true);
         }
         ok &= self.save_board_now();
         if ok {
@@ -2160,18 +2257,22 @@ impl App {
     }
 
     /// Soundboard de la session qui vient d'être ouverte ou créée (les réglages du
-    /// contrôleur restent ceux de l'ordinateur).
-    fn load_session_board(&mut self) {
+    /// contrôleur restent ceux de l'ordinateur). Renvoie l'avertissement à afficher.
+    fn load_session_board(&mut self) -> Option<String> {
         self.engine.pad(PadCmd::StopAll);
         let fresh = !self
             .project
             .dir
             .join(crate::soundboard::BOARD_FILE)
             .exists();
+        let mut warnings = Vec::new();
+        // Fichier illisible : soundboard vide affiché, mais le fichier est protégé (jamais
+        // écrasé par ce soundboard vide, ni à la fermeture ni sur le second disque).
+        let mut unreadable = None;
         let mut b = match Board::load_session(&self.project.dir) {
             Ok(b) => b,
             Err(e) => {
-                self.notify(format!("Soundboard de la session illisible : {e:#}"), true);
+                unreadable = Some(format!("soundboard de la session illisible ({e:#})"));
                 Board::default()
             }
         };
@@ -2179,20 +2280,30 @@ impl App {
         let network = b.network_pads.clone();
         if !network.is_empty() {
             self.park_network_pads(&network);
-            self.notify(
-                format!(
-                    "{} son(s) du soundboard sur un partage réseau non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
-                    network.len()
-                ),
-                true,
-            );
+            warnings.push(format!(
+                "{} son(s) du soundboard sur un partage réseau non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
+                network.len()
+            ));
         }
         if fresh {
             // Nouvelle session : même taille de grille que jusqu'ici.
             b.cols = self.board.cols;
             b.rows = self.board.rows;
         }
+        if let Some(why) = unreadable {
+            b.protect(why);
+        }
+        if let Some(g) = &b.guard {
+            warnings.insert(
+                0,
+                format!(
+                    "Attention, {} : le fichier est gardé tel quel, et mis de côté sous un autre nom si vous modifiez le soundboard",
+                    g.reason
+                ),
+            );
+        }
         self.set_board(b);
+        (!warnings.is_empty()).then(|| warnings.join(" · "))
     }
 
     /// Remplace le soundboard affiché (sons à charger, MIDI, sortie).
@@ -2280,6 +2391,9 @@ impl App {
             }
         };
         b.take_devices(&self.board);
+        // Fichier de la session protégé : il reste protégé, donc mis de côté (pas écrasé)
+        // par l'enregistrement du soundboard importé.
+        b.guard = self.board.guard.take();
         let network = b.network_pads.clone();
         self.park_network_pads(&network);
         self.set_board(b);
@@ -2321,48 +2435,92 @@ impl App {
         self.open_session_browser();
     }
 
-    /// Charge une session (et récupère les prises d'un enregistrement interrompu).
-    pub fn load_session(&mut self, path: &Path) {
-        match Project::load(path) {
-            Ok(mut p) => {
-                let recovered = recovery::recover(&mut p);
-                self.start_screen = false;
-                self.project = p;
-                self.load_session_board();
-                self.reset_view_for_session();
-                self.load_peaks();
-                recovery::remember_session(&self.project);
-                match recovered {
-                    Ok(n) if n > 0 => {
-                        self.zoom_to_fit();
-                        self.notify(
-                            format!("Enregistrement interrompu récupéré : {n} prise(s) restaurée(s) dans « {} »", self.project.name),
-                            false,
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        self.notify(format!("Récupération incomplète : {e:#}"), true);
-                        return;
-                    }
-                    _ => {}
-                }
+    /// Versions de secours d'une session, en dernier recours si son fichier est abîmé : son
+    /// double sur le second disque (et les versions précédentes de ce double).
+    fn session_fallbacks(&self, path: &Path) -> Vec<PathBuf> {
+        let (Some(root), Some(dir), Some(name)) = (
+            self.backup_root.as_deref(),
+            path.parent(),
+            path.file_stem().map(|s| s.to_string_lossy().into_owned()),
+        ) else {
+            return Vec::new();
+        };
+        let Some(double) = backup_session_dir_for(root, dir, &name) else {
+            return Vec::new();
+        };
+        let file = double.join(format!("{name}.{PROJECT_EXT}"));
+        let mut v = vec![file.clone()];
+        v.extend(project::backup_paths(&file));
+        v
+    }
+
+    /// Charge une session (et récupère les prises d'un enregistrement interrompu). Un
+    /// fichier abîmé est remplacé par sa version précédente (voir `Project::open`). Renvoie
+    /// `true` si la session est ouverte.
+    pub fn load_session(&mut self, path: &Path) -> bool {
+        let fallbacks = self.session_fallbacks(path);
+        let (mut p, restored) = match Project::open(path, &fallbacks) {
+            Ok(r) => r,
+            Err(e) => {
+                self.notify(format!("{e:#}"), true);
+                return false;
+            }
+        };
+        let recovered = recovery::recover(&mut p);
+        self.start_screen = false;
+        self.project = p;
+        let board_warning = self.load_session_board();
+        self.reset_view_for_session();
+        self.load_peaks();
+        recovery::remember_session(&self.project);
+        // Avertissements (tous gardés : un seul message s'affiche à la fois).
+        let mut warnings: Vec<String> = Vec::new();
+        if let Some(m) = restored {
+            // Version précédente reprise : réécrite tout de suite à la place du fichier abîmé.
+            if self.project.dirty
+                && let Err(e) = self.project.save()
+            {
+                warnings.push(format!("Sauvegarde de la session impossible : {e:#}"));
+            }
+            warnings.insert(0, m);
+        }
+        if let Some(why) = &self.project.read_only {
+            warnings.push(format!("Lecture seule : {why}"));
+        }
+        let mut info = None;
+        match recovered {
+            Ok(n) if n > 0 => {
+                self.zoom_to_fit();
+                info = Some(format!(
+                    "Enregistrement interrompu récupéré : {n} prise(s) restaurée(s) dans « {} »",
+                    self.project.name
+                ));
+            }
+            Err(e) => warnings.push(format!("Récupération incomplète : {e:#}")),
+            _ => {
                 if self.project.has_audio()
                     && self.project.sample_rate != self.engine.status.sample_rate
                 {
-                    let msg = format!(
+                    warnings.push(format!(
                         "Session en {} kHz, carte en {} kHz : réglez la carte sur {} kHz.",
                         fmt_khz(self.project.sample_rate),
                         fmt_khz(self.engine.status.sample_rate),
                         fmt_khz(self.project.sample_rate)
-                    );
-                    self.notify(msg, true);
-                } else {
-                    self.notify(format!("« {} » ouverte", self.project.name), false);
+                    ));
                 }
             }
-            Err(e) => self.notify(format!("{e:#}"), true),
         }
+        warnings.extend(board_warning);
+        if !warnings.is_empty() {
+            if let Some(i) = info {
+                warnings.insert(0, i);
+            }
+            self.notify(warnings.join(" · "), true);
+        } else {
+            let msg = info.unwrap_or_else(|| format!("« {} » ouverte", self.project.name));
+            self.notify(msg, false);
+        }
+        true
     }
 
     pub fn save(&mut self) {
@@ -2472,13 +2630,19 @@ impl App {
                     self.cache.request(&p, None);
                 }
                 self.sb.midi_dirty = true;
+                // Nouveau dossier : aucun fichier protégé à y garder, le soundboard (même
+                // celui d'un fichier illisible ou plus récent) y est enregistré normalement.
+                self.board.guard = None;
                 self.board_changed = Some(self.now);
                 self.save_board_now();
                 recovery::remember_session(&self.project);
-                self.notify(
-                    format!("Session enregistrée · {}", self.project.dir.display()),
-                    false,
-                );
+                // (Les avertissements ci-dessus restent affichés.)
+                if lost.is_empty() && missing.is_empty() {
+                    self.notify(
+                        format!("Session enregistrée · {}", self.project.dir.display()),
+                        false,
+                    );
+                }
             }
             Err(e) => self.notify(e, true),
         }
@@ -2542,11 +2706,14 @@ impl App {
         }
         self.start_screen = false;
         self.project = p;
-        self.load_session_board();
+        let board_warning = self.load_session_board();
         self.peaks.clear();
         self.reset_view_for_session();
         recovery::remember_session(&self.project);
-        self.notify(format!("Nouvelle session « {} »", self.project.name), false);
+        match board_warning {
+            Some(w) => self.notify(w, true),
+            None => self.notify(format!("Nouvelle session « {} »", self.project.name), false),
+        }
     }
 
     /// Ouvre « Nouvelles pistes », prérempli : dernier type utilisé, première entrée
@@ -2988,8 +3155,13 @@ impl App {
             "TracksPlus".to_string()
         } else {
             format!(
-                "{}{} — TracksPlus",
+                "{}{}{} — TracksPlus",
                 self.project.name,
+                if self.project.read_only.is_some() {
+                    " (lecture seule)"
+                } else {
+                    ""
+                },
                 if self.project.dirty { " •" } else { "" }
             )
         };
@@ -3872,7 +4044,9 @@ impl App {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Import".into());
                 let file = self.project.new_take_file_avoiding(&stem, &taken);
-                taken.insert(file.clone());
+                // En minuscules, comme `new_take_file_avoiding` le compare (Windows ne
+                // distingue pas « Intro_001.wav » et « intro_001.wav »).
+                taken.insert(file.to_lowercase());
                 (p, file)
             })
             .collect();
@@ -4782,6 +4956,9 @@ impl eframe::App for App {
             self.complete_journal();
             self.poll_finishing(None);
             self.poll_save_as();
+            if let Some(m) = crate::sessions::take_prefs_notice() {
+                self.notify(m, true);
+            }
             self.poll_play_errors();
             self.watch_device();
             self.poll_import();
