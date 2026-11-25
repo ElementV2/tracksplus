@@ -412,6 +412,8 @@ pub struct App {
     pub reconnect: Option<(f64, f64)>,
     /// La prise en cours a été arrêtée parce que la carte son a disparu.
     pub lost_during_take: bool,
+    /// Sauvegarde automatique en cours (thread).
+    pub autosave_job: Option<std::sync::mpsc::Receiver<anyhow::Result<()>>>,
     /// Réouverture de la carte en cours dans un thread.
     pub reconnect_job: Option<std::sync::mpsc::Receiver<anyhow::Result<Engine>>>,
     /// Mesure de l'espace disque libre en cours (thread).
@@ -606,6 +608,7 @@ impl App {
             backup_thread: None,
             reconnect: None,
             lost_during_take: false,
+            autosave_job: None,
             reconnect_job: None,
             disk_job: None,
             rec_latency: 0,
@@ -4749,8 +4752,20 @@ impl App {
             && self.worth_saving()
         {
             self.last_autosave = self.now;
-            if let Err(e) = self.project.save() {
-                self.save_failed(e);
+            if self.autosave_job.is_none() {
+                self.autosave_job = Some(self.project.save_in_background());
+            }
+        }
+        if let Some(rx) = &self.autosave_job {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.autosave_job = None;
+                    if let Err(e) = r {
+                        self.save_failed(e);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.autosave_job = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
 

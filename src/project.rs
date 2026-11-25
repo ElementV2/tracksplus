@@ -417,13 +417,42 @@ impl Project {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        let seq = next_save_seq();
+        self.write_file(seq)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Sauvegarde dans un thread (sauvegarde automatique : un disque lent ne fige pas
+    /// l'interface). L'état est figé maintenant ; si une sauvegarde plus récente a déjà été
+    /// écrite entre-temps, celle-ci est abandonnée (jamais d'ancien état par-dessus).
+    pub fn save_in_background(&mut self) -> std::sync::mpsc::Receiver<Result<()>> {
+        let seq = next_save_seq();
+        let snapshot = self.clone();
+        self.dirty = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(snapshot.write_file(seq));
+        });
+        rx
+    }
+
+    /// Écriture atomique du fichier de session (fichier temporaire synchronisé puis
+    /// renommage), une à la fois, et seulement si rien de plus récent n'a été écrit.
+    fn write_file(&self, seq: u64) -> Result<()> {
+        static WRITTEN: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+        let path = self.file_path();
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if written.iter().any(|(p, s)| *p == path && *s > seq) {
+            return Ok(());
+        }
         self.ensure_dirs()?;
         let json = serde_json::to_string_pretty(self)?;
-        let path = self.file_path();
         let tmp = path.with_extension("tmp");
         write_synced(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, &path)?;
-        self.dirty = false;
+        written.retain(|(p, _)| *p != path);
+        written.push((path, seq));
         Ok(())
     }
 
@@ -676,6 +705,12 @@ pub fn copy_synced(src: &Path, dst: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Numéro d'ordre des sauvegardes (voir `Project::write_file`).
+fn next_save_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Ramène un nom de fichier de prise à un simple nom, sans dossier ni lecteur :
@@ -1052,5 +1087,33 @@ mod tests {
             p.clip_path(&p.tracks[0].clips[0]),
             p.audio_dir().join("evil.wav")
         );
+    }
+
+    /// Sauvegarde automatique en arrière-plan : un état plus ancien n'écrase jamais un
+    /// état plus récent, même s'il est écrit après.
+    #[test]
+    fn older_save_never_overwrites_newer() {
+        let dir = std::env::temp_dir().join(format!("tp-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("Q".into(), dir.clone(), 48000);
+        p.add_track(Some("Ancienne".into()), None);
+        let old_seq = next_save_seq();
+        let old = p.clone();
+        p.tracks[0].name = "Récente".into();
+        p.save().unwrap();
+        old.write_file(old_seq).unwrap();
+        assert_eq!(
+            Project::load(&p.file_path()).unwrap().tracks[0].name,
+            "Récente"
+        );
+        // Sauvegarde en arrière-plan normale : bien écrite.
+        p.tracks[0].name = "Auto".into();
+        p.save_in_background().recv().unwrap().unwrap();
+        assert!(!p.dirty);
+        assert_eq!(
+            Project::load(&p.file_path()).unwrap().tracks[0].name,
+            "Auto"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
