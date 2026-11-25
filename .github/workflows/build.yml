@@ -24,11 +24,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Le script de asio-sys sait télécharger le SDK Steinberg, mais sa décompression
       # PowerShell (Expand-Archive) plante sur les runners actuels. On le fournit nous-mêmes
-      # via CPAL_ASIO_DIR, ce qui court-circuite ce téléchargement.
+      # via CPAL_ASIO_DIR, ce qui court-circuite ce téléchargement. Version épinglée et
+      # vérifiée par son empreinte (mêmes valeurs que scripts/package-windows.ps1) : ses
+      # sources sont compilées dans l'exécutable distribué.
       - name: SDK ASIO
         shell: bash
         run: |
-          curl -fsSL --retry 3 -o asio_sdk.zip https://www.steinberg.net/asiosdk
+          curl -fsSL --retry 3 --proto '=https' -o asio_sdk.zip https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip
+          echo "d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca  asio_sdk.zip" | sha256sum -c -
           unzip -q -o asio_sdk.zip -d asio_sdk
           header=$(find "$PWD/asio_sdk" -name asiodrivers.h | head -n 1)
           test -n "$header" || { echo "asiodrivers.h introuvable dans le SDK"; exit 1; }

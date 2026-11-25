@@ -28,6 +28,35 @@ pub struct SampleData {
 
 pub const SAMPLE_PEAK: usize = 256;
 
+/// Places de la poubelle des sons (des pointeurs seulement : 64 Ko réservés une fois).
+/// Assez pour des heures de pads même si personne ne la vidait.
+pub const SAMPLE_GARBAGE: usize = 4096;
+
+/// Vide la poubelle des sons rendus par le thread audio sur un thread à part, sans
+/// dépendre de l'interface : un sélecteur de fichiers la bloque parfois de longues
+/// minutes, pendant que le contrôleur MIDI continue de lancer des pads. Une poubelle pleine
+/// ferait oublier les sons (`mem::forget` : mémoire jamais rendue).
+///
+/// Sondage toutes les 20 ms plutôt qu'une attente : aucun récepteur endormi que le
+/// `try_send` du callback audio devrait réveiller (appel système). Le thread s'arrête de
+/// lui-même quand le moteur est fermé (plus aucun émetteur).
+pub fn spawn_janitor(rx: Receiver<Arc<SampleData>>) {
+    let _ = std::thread::Builder::new()
+        .name("tracksplus-gc".into())
+        .spawn(move || janitor_loop(&rx, std::time::Duration::from_millis(20)));
+}
+
+fn janitor_loop<T>(rx: &Receiver<T>, every: std::time::Duration) {
+    use crossbeam_channel::TryRecvError;
+    loop {
+        match rx.try_recv() {
+            Ok(x) => drop(x),
+            Err(TryRecvError::Empty) => std::thread::sleep(every),
+            Err(TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PadMode {
     /// Un appui lance le son, un nouvel appui l'arrête.
@@ -158,6 +187,8 @@ impl Sampler {
     }
 
     fn dispose(&self, s: Arc<SampleData>) {
+        // Libérer ici serait une désallocation dans le thread audio. Poubelle pleine (vidée
+        // en continu par `spawn_janitor` : pratiquement jamais) : oublié, en dernier recours.
         if let Err(e) = self.garbage.try_send(s) {
             std::mem::forget(e.into_inner());
         }
@@ -365,6 +396,26 @@ mod tests {
             data: vec![0.5; frames * 2],
             peaks: Vec::new(),
         })
+    }
+
+    /// Poubelle vidée sans l'interface : les sons rendus sont libérés (plus aucune autre
+    /// référence), et le thread s'arrête avec le moteur.
+    #[test]
+    fn janitor_frees_sounds_without_the_ui() {
+        let (gtx, grx) = bounded(SAMPLE_GARBAGE);
+        let s = sample(16);
+        for _ in 0..100 {
+            gtx.try_send(s.clone()).unwrap();
+        }
+        let t = std::thread::spawn(move || janitor_loop(&grx, std::time::Duration::from_millis(1)));
+        let t0 = std::time::Instant::now();
+        while Arc::strong_count(&s) > 1 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Moteur fermé (plus d'émetteur) : le thread se termine.
+        drop(gtx);
+        t.join().unwrap();
     }
 
     fn params(mode: PadMode, frames: usize) -> PadParams {

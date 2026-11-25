@@ -4,11 +4,11 @@
 use crate::sampler::{MAX_PAGES, PADS_PER_PAGE, PadMode, PadParams, SAMPLE_PEAK, SampleData};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use rubato::{FftFixedIn, Resampler};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const AUDIO_EXTENSIONS: [&str; 10] = [
     "wav", "wave", "aif", "aiff", "mp3", "m4a", "aac", "flac", "ogg", "caf",
@@ -284,23 +284,30 @@ impl Board {
             return Ok(Board::default());
         }
         let mut b = Self::load(&path)?;
-        let mut network = Vec::new();
-        for page in &mut b.pages {
+        b.resolve_paths(dir);
+        Ok(b)
+    }
+
+    /// Chemins des sons d'un soundboard lu dans un fichier du dossier `dir` (session reçue,
+    /// soundboard importé) : les chemins relatifs deviennent absolus. Les sons qu'un fichier
+    /// venu d'ailleurs ne doit pas faire ouvrir tout seul sont mis de côté (`network_pads`,
+    /// jamais ouverts ni copiés) :
+    /// - sur un partage réseau : ouvrir `\\serveur\…` envoie l'identifiant Windows (chiffré)
+    ///   à ce serveur ;
+    /// - relatifs mais hors du dossier (`..\..\.ssh\…`) : « Enregistrer sous » copierait
+    ///   n'importe quel fichier de l'ordinateur dans la session.
+    pub fn resolve_paths(&mut self, dir: &Path) {
+        let mut parked = Vec::new();
+        for page in &mut self.pages {
             for pad in page.pads.iter_mut().flatten() {
-                if !is_network_path(&pad.path) {
-                    if pad.path.is_relative() {
-                        pad.path = dir.join(&pad.path);
-                    }
-                } else {
-                    // Sécurité : ouvrir un fichier sur \\serveur\… envoie l'identifiant
-                    // Windows (chiffré) à ce serveur. Une session reçue d'ailleurs ne doit pas
-                    // pouvoir le déclencher toute seule : le son est marqué indisponible.
-                    network.push(pad.path.clone());
+                if is_network_path(&pad.path) || escapes_dir(&pad.path) {
+                    parked.push(pad.path.clone());
+                } else if pad.path.is_relative() {
+                    pad.path = dir.join(&pad.path);
                 }
             }
         }
-        b.network_pads = network;
-        Ok(b)
+        self.network_pads = parked;
     }
 
     /// Enregistre le soundboard dans la session `dir`, avec des chemins relatifs pour les
@@ -328,8 +335,10 @@ impl Board {
                     pad.path = p.clone();
                     continue;
                 }
-                // Son réseau imposé par un fichier de session : jamais lu automatiquement.
-                if self.network_pads.contains(&pad.path) {
+                // Son réseau ou hors de la session imposé par un fichier : jamais lu
+                // automatiquement. Et seuls des sons sont copiés : un pad qui désigne un
+                // autre fichier (clé, document) n'est pas recopié dans la session.
+                if self.network_pads.contains(&pad.path) || !is_audio_file(&pad.path) {
                     missing.push(pad.path.clone());
                     continue;
                 }
@@ -428,10 +437,87 @@ pub enum LoadState {
 /// saturer le processeur (ni la mémoire) en plein spectacle.
 const DECODE_WORKERS: usize = 2;
 
+/// Les sons sont chargés en mémoire : au-delà de 30 min, on refuse plutôt que de risquer
+/// de saturer la mémoire de la machine en plein spectacle.
+const MAX_SECONDS: u64 = 30 * 60;
+
+/// Taille maximale d'un son décodé (stéréo f32 à la fréquence de la carte) : 30 min à
+/// 192 kHz y tiennent ; au-delà (fréquence de session extrême), le pad est refusé.
+pub const MAX_PAD_BYTES: u64 = 3 << 30;
+
+/// Sons à l'ancienne fréquence gardés après un changement de fréquence de la carte : une
+/// reconnexion qui revient aussitôt à la fréquence d'avant ne redécode rien.
+const STASH_KEEP: std::time::Duration = std::time::Duration::from_secs(120);
+
+const MEMORY_FULL: &str =
+    "Mémoire réservée aux sons pleine : retirez des pads ou raccourcissez des sons";
+
+/// Mémoire occupée par un son décodé de `frames` trames (données et forme d'onde).
+fn sample_bytes(frames: u64) -> u64 {
+    frames.saturating_mul(8) + (frames / SAMPLE_PEAK as u64 + 1) * 8
+}
+
+/// Mémoire réservée aux sons des pads, partagée avec les threads de décodage : un son
+/// n'est réservé (puis alloué) que s'il y tient. Sans cette limite, un soundboard trop
+/// gros finirait par faire échouer une allocation ordinaire (interface, enregistreur), ce
+/// qui arrête l'application.
+pub struct Budget {
+    limit: u64,
+    /// Sons prêts (ceux du cache, comptés par l'interface).
+    committed: AtomicU64,
+    /// Sons en cours de décodage, déjà réservés.
+    inflight: AtomicU64,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            committed: AtomicU64::new(0),
+            inflight: AtomicU64::new(0),
+        }
+    }
+
+    /// Par défaut : 40 % de la mémoire de l'ordinateur (au moins 1 Go).
+    fn default_limit() -> u64 {
+        crate::isolate::physical_memory()
+            .map_or(4 << 30, |m| m / 5 * 2)
+            .max(1 << 30)
+    }
+
+    fn try_acquire(&self, bytes: u64) -> bool {
+        let committed = self.committed.load(Ordering::Relaxed);
+        self.inflight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                (committed.saturating_add(cur).saturating_add(bytes) <= self.limit)
+                    .then_some(cur + bytes)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: u64) {
+        let _ = self
+            .inflight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(bytes))
+            });
+    }
+}
+
 /// Demande de décodage : chemin, fréquence cible, génération, fenêtre à rafraîchir.
 type DecodeJob = (PathBuf, u32, u64, Option<eframe::egui::Context>);
-/// Résultat : chemin, génération, son décodé ou erreur.
-type DecodeResult = (PathBuf, u64, Result<SampleData, String>);
+
+/// Résultat d'un décodage.
+struct Decoded {
+    path: PathBuf,
+    generation: u64,
+    result: Result<SampleData, String>,
+    /// Mémoire réservée pour ce son (rendue quand il entre dans le cache, ou est oublié).
+    reserved: u64,
+    /// Refusé faute de place dans la mémoire réservée aux sons.
+    full: bool,
+}
+
 /// Génération attendue par chemin (une demande remplacée ou retirée est ignorée).
 type Pending = Arc<parking_lot::Mutex<HashMap<PathBuf, u64>>>;
 
@@ -439,16 +525,29 @@ type Pending = Arc<parking_lot::Mutex<HashMap<PathBuf, u64>>>;
 pub struct SampleCache {
     pub map: HashMap<PathBuf, LoadState>,
     sample_rate: u32,
-    tx: Sender<DecodeResult>,
-    rx: Receiver<DecodeResult>,
+    tx: Sender<Decoded>,
+    rx: Receiver<Decoded>,
     /// File des décodages, démarrée à la première demande.
     jobs: Option<Sender<DecodeJob>>,
     pending: Pending,
     next_gen: u64,
+    budget: Arc<Budget>,
+    /// Sons mis de côté par sécurité (partage réseau, chemin hors de la session) : jamais
+    /// rouverts automatiquement, même après un changement de fréquence.
+    parked: HashSet<PathBuf>,
+    /// Sons à la fréquence précédente (voir `STASH_KEEP`).
+    stash: Option<(u32, HashMap<PathBuf, Arc<SampleData>>, std::time::Instant)>,
+    /// Nombre d'entrées lors du dernier décompte de la mémoire.
+    counted_len: usize,
+    scratch: Vec<usize>,
 }
 
 impl SampleCache {
     pub fn new(sample_rate: u32) -> Self {
+        Self::with_budget(sample_rate, Budget::default_limit())
+    }
+
+    fn with_budget(sample_rate: u32, limit: u64) -> Self {
         let (tx, rx) = unbounded();
         Self {
             map: HashMap::new(),
@@ -458,28 +557,97 @@ impl SampleCache {
             jobs: None,
             pending: Default::default(),
             next_gen: 0,
+            budget: Arc::new(Budget::new(limit)),
+            parked: HashSet::new(),
+            stash: None,
+            counted_len: 0,
+            scratch: Vec::new(),
         }
     }
 
+    /// Fréquence à laquelle les sons sont décodés (celle de la carte).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Met un son de côté sans jamais l'ouvrir (sécurité, voir `Board::resolve_paths`).
+    pub fn park(&mut self, path: &Path) {
+        let why = if is_network_path(path) {
+            "Son sur un partage réseau, hors de la session : remplacez-le (clic droit) pour le copier dans la session"
+        } else {
+            "Chemin du son hors de la session (fichier reçu d'ailleurs) : remplacez-le (clic droit) pour le copier dans la session"
+        };
+        self.pending.lock().remove(path);
+        self.parked.insert(path.to_path_buf());
+        self.map
+            .insert(path.to_path_buf(), LoadState::Failed(why.into()));
+    }
+
     pub fn set_sample_rate(&mut self, sr: u32) {
-        if sr != self.sample_rate {
-            self.sample_rate = sr;
-            // Sons réseau mis de côté par sécurité : restent indisponibles (jamais rouverts
-            // par un simple changement de fréquence).
-            let parked: Vec<_> = self
-                .map
-                .iter()
-                .filter(|(p, st)| is_network_path(p) && matches!(st, LoadState::Failed(_)))
-                .map(|(p, st)| (p.clone(), st_clone(st)))
-                .collect();
-            let paths: Vec<_> = self.map.keys().cloned().collect();
-            self.map.clear();
-            self.pending.lock().clear();
-            self.map.extend(parked);
-            for p in paths {
-                self.request(&p, None);
+        if sr == self.sample_rate {
+            return;
+        }
+        let old_rate = std::mem::replace(&mut self.sample_rate, sr);
+        let paths: Vec<PathBuf> = self.map.keys().cloned().collect();
+        let mut old: HashMap<PathBuf, Arc<SampleData>> = HashMap::new();
+        let mut parked = Vec::new();
+        for (p, st) in self.map.drain() {
+            match st {
+                // Sons mis de côté par sécurité : restent indisponibles (jamais rouverts
+                // par un simple changement de fréquence).
+                st if self.parked.contains(&p) => parked.push((p, st)),
+                LoadState::Ready(s) => {
+                    old.insert(p, s);
+                }
+                _ => {}
             }
         }
+        self.pending.lock().clear();
+        self.map.extend(parked);
+        // Retour à la fréquence d'avant (reconnexion) : sons repris sans décodage.
+        let stash = self.stash.take().filter(|(rate, _, _)| *rate == sr);
+        for p in paths {
+            if self.map.contains_key(&p) {
+                continue;
+            }
+            match stash.as_ref().and_then(|(_, m, _)| m.get(&p)) {
+                Some(s) => {
+                    self.map.insert(p, LoadState::Ready(s.clone()));
+                }
+                None => self.request(&p, None),
+            }
+        }
+        // Les sons à l'ancienne fréquence restent un moment de côté, si la mémoire le
+        // permet (au plus la moitié de la mémoire réservée aux sons).
+        let bytes: u64 = old.values().map(|s| Self::bytes_of(s)).sum();
+        if !old.is_empty() && bytes.saturating_mul(2) <= self.budget.limit {
+            self.stash = Some((old_rate, old, std::time::Instant::now()));
+        }
+        self.recount();
+    }
+
+    fn bytes_of(s: &SampleData) -> u64 {
+        (s.data.capacity() as u64) * 4 + (s.peaks.capacity() as u64) * 8
+    }
+
+    /// Recompte la mémoire des sons prêts (un même son sous deux chemins compte une fois).
+    fn recount(&mut self) {
+        self.scratch.clear();
+        let mut total = 0u64;
+        let ready = self.map.values().filter_map(|st| match st {
+            LoadState::Ready(s) => Some(s),
+            _ => None,
+        });
+        let stashed = self.stash.iter().flat_map(|(_, m, _)| m.values());
+        for s in ready.chain(stashed) {
+            let ptr = Arc::as_ptr(s) as usize;
+            if !self.scratch.contains(&ptr) {
+                self.scratch.push(ptr);
+                total += Self::bytes_of(s);
+            }
+        }
+        self.budget.committed.store(total, Ordering::Relaxed);
+        self.counted_len = self.map.len();
     }
 
     /// Threads de décodage (au plus `DECODE_WORKERS`), arrêtés avec le cache.
@@ -490,16 +658,26 @@ impl SampleCache {
                 let jrx = jrx.clone();
                 let tx = self.tx.clone();
                 let pending = self.pending.clone();
+                let budget = self.budget.clone();
                 let _ = std::thread::Builder::new()
                     .name(format!("tracksplus-decode-{i}"))
                     .spawn(move || {
-                        for (p, sr, generation, ctx) in jrx {
+                        for (path, sr, generation, ctx) in jrx {
                             // Demande remplacée ou retirée entre-temps : rien à décoder.
-                            if pending.lock().get(&p) != Some(&generation) {
+                            if pending.lock().get(&path) != Some(&generation) {
                                 continue;
                             }
-                            let r = decode_guarded(&p, sr);
-                            let _ = tx.send((p, generation, r));
+                            let (result, reserved, full) = decode_job(&path, sr, &budget);
+                            let d = Decoded {
+                                path,
+                                generation,
+                                result,
+                                reserved,
+                                full,
+                            };
+                            if let Err(e) = tx.send(d) {
+                                budget.release(e.into_inner().reserved);
+                            }
                             if let Some(c) = ctx {
                                 c.request_repaint();
                             }
@@ -546,8 +724,12 @@ impl SampleCache {
     }
 
     pub fn reload(&mut self, path: &Path) {
+        if self.parked.contains(path) {
+            return;
+        }
         self.map.remove(path);
         self.request(path, None);
+        self.recount();
     }
 
     /// Oublie les sons qui ne sont plus utilisés par aucun pad. Les sons en cours de
@@ -555,26 +737,64 @@ impl SampleCache {
     pub fn retain(&mut self, keep: &std::collections::HashSet<PathBuf>) {
         self.map.retain(|p, _| keep.contains(p));
         self.pending.lock().retain(|p, _| keep.contains(p));
+        self.parked.retain(|p| keep.contains(p));
+        if let Some((_, m, _)) = &mut self.stash {
+            m.retain(|p, _| keep.contains(p));
+        }
+        self.recount();
     }
 
     pub fn poll(&mut self) -> bool {
         let mut any = false;
-        while let Ok((p, generation, r)) = self.rx.try_recv() {
-            {
+        let mut retry = Vec::new();
+        while let Ok(d) = self.rx.try_recv() {
+            let current = {
                 let mut pending = self.pending.lock();
-                if pending.get(&p) != Some(&generation) {
-                    continue;
+                let ok = pending.get(&d.path) == Some(&d.generation);
+                if ok {
+                    pending.remove(&d.path);
                 }
-                pending.remove(&p);
+                ok
+            };
+            if !current {
+                self.budget.release(d.reserved);
+                continue;
             }
             any = true;
+            // Mémoire pleine alors que des sons à l'ancienne fréquence sont gardés de
+            // côté : ils passent après les sons utiles.
+            if d.full && self.stash.is_some() {
+                self.stash = None;
+                self.map.remove(&d.path);
+                retry.push(d.path);
+                continue;
+            }
             self.map.insert(
-                p,
-                match r {
+                d.path,
+                match d.result {
                     Ok(s) => LoadState::Ready(Arc::new(s)),
                     Err(e) => LoadState::Failed(e),
                 },
             );
+            // Compté dans les sons prêts avant d'être rendu par la réservation.
+            self.recount();
+            self.budget.release(d.reserved);
+        }
+        if !retry.is_empty() {
+            self.recount();
+            for p in retry {
+                self.request(&p, None);
+            }
+        }
+        if self
+            .stash
+            .as_ref()
+            .is_some_and(|(_, _, at)| at.elapsed() > STASH_KEEP)
+        {
+            self.stash = None;
+            self.recount();
+        } else if self.map.len() != self.counted_len {
+            self.recount();
         }
         any
     }
@@ -587,139 +807,71 @@ impl SampleCache {
     }
 }
 
+/// Première lettre en capitale (messages affichés sur un pad).
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// Décode un son pour un pad : dans un processus fils quand c'est possible (un fichier
+/// piégé n'arrête que lui), sinon ici. La mémoire réservée aux sons est vérifiée avant
+/// d'allouer le son. Rend (résultat, mémoire réservée, refus faute de place).
+fn decode_job(path: &Path, sr: u32, budget: &Budget) -> (Result<SampleData, String>, u64, bool) {
+    let reserved = std::cell::Cell::new(0u64);
+    let full = std::cell::Cell::new(false);
+    let accept = |frames: u64| -> Result<(), String> {
+        if frames.saturating_mul(8) > MAX_PAD_BYTES {
+            return Err("son trop long à cette fréquence de session".into());
+        }
+        let b = sample_bytes(frames);
+        if !budget.try_acquire(b) {
+            full.set(true);
+            return Err(MEMORY_FULL.into());
+        }
+        reserved.set(b);
+        Ok(())
+    };
+    // Mémoire du processus fils : le son décodé et sa marge de croissance.
+    let need = MAX_PAD_BYTES + MAX_PAD_BYTES / 4 + (512 << 20);
+    let r = match crate::isolate::decode_pad(path, sr, need, &accept) {
+        Some(r) => r.and_then(|data| build_sample(data, sr).map_err(|e| format!("{e:#}"))),
+        None => decode_guarded(path, sr).and_then(|s| accept(s.frames as u64).map(|_| s)),
+    };
+    if r.is_err() && reserved.get() > 0 {
+        budget.release(reserved.get());
+        reserved.set(0);
+    }
+    (r.map_err(|e| capitalize(&e)), reserved.get(), full.get())
+}
+
 /// Décodage protégé : un décodeur qui plante sur un fichier abîmé donne une erreur
 /// (le pad l'affiche) au lieu de laisser le pad « en chargement » pour toujours.
 fn decode_guarded(path: &Path, sr: u32) -> Result<SampleData, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_sample(path, sr))) {
         Ok(r) => r.map_err(|e| format!("{e:#}")),
-        Err(_) => Err("Fichier illisible".into()),
+        Err(_) => Err("fichier illisible".into()),
     }
 }
 
 /// Décode un fichier audio en stéréo f32 à la fréquence `target_sr`.
 pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
-    use symphonia::core::errors::Error as SymError;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
+    let data = decode_stereo(path, target_sr, &|_| {})?;
+    build_sample(data, target_sr)
+}
 
-    let file =
-        std::fs::File::open(path).with_context(|| format!("Ouverture de {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| anyhow!("Format non reconnu : {e}"))?;
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| anyhow!("Aucune piste audio"))?;
-    let track_id = track.id;
-    let src_sr = track.codec_params.sample_rate.unwrap_or(target_sr);
-    // En-tête invraisemblable (fichier abîmé ou piégé) : on refuse plutôt que de réserver
-    // des gigaoctets d'après une fréquence fantaisiste.
-    if !(1_000..=768_000).contains(&src_sr) {
-        return Err(anyhow!(
-            "Fréquence d'échantillonnage invalide : {src_sr} Hz"
-        ));
-    }
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| anyhow!("Codec non supporté : {e}"))?;
-
-    // Les sons sont chargés en mémoire : au-delà de 30 min, on refuse plutôt que de
-    // risquer de saturer la mémoire de la machine en plein spectacle.
-    const MAX_SECONDS: u64 = 30 * 60;
-    let n_frames = track.codec_params.n_frames;
-    if let Some(n) = n_frames
-        && n / src_sr.max(1) as u64 > MAX_SECONDS
-    {
-        return Err(anyhow!(
-            "Son trop long ({} min) : 30 min maximum pour un pad",
-            n / src_sr.max(1) as u64 / 60
-        ));
-    }
-    let max_frames = MAX_SECONDS as usize * src_sr.max(1) as usize;
-    // Directement en stéréo entrelacé (format final) : pas de tampons intermédiaires
-    // quand la fréquence est déjà la bonne.
-    let mut data: Vec<f32> = Vec::new();
-    // Réservations faillibles : un manque de mémoire devient une erreur affichée sur le
-    // pad, jamais un arrêt brutal de l'application.
-    let oom = |_| anyhow!("Mémoire insuffisante pour charger ce son");
-    if let Some(n) = n_frames {
-        data.try_reserve_exact((n as usize).min(max_frames) * 2)
-            .map_err(oom)?;
-    }
-    let mut buf: Option<SampleBuffer<f32>> = None;
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(SymError::ResetRequired) => break,
-            Err(e) => return Err(anyhow!("Lecture : {e}")),
-        };
-        if packet.track_id() != track_id {
-            continue;
-        }
-        let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(SymError::DecodeError(_)) => continue,
-            Err(e) => return Err(anyhow!("Décodage : {e}")),
-        };
-        let spec = *decoded.spec();
-        let ch = spec.channels.count().max(1);
-        let b = buf.get_or_insert_with(|| SampleBuffer::new(decoded.capacity() as u64, spec));
-        if b.capacity() < decoded.capacity() * ch {
-            *b = SampleBuffer::new(decoded.capacity() as u64, spec);
-        }
-        b.copy_interleaved_ref(decoded);
-        if data.len() / 2 > max_frames {
-            return Err(anyhow!("Son trop long : 30 min maximum pour un pad"));
-        }
-        data.try_reserve(b.samples().len() / ch * 2).map_err(oom)?;
-        // NaN / infini (fichier abîmé) : silence. Sans cela, un seul pad abîmé rendrait
-        // tout le mixage de sortie NaN — donc muet — pendant qu'il joue.
-        let clean = |x: f32| {
-            if x.is_finite() {
-                x.clamp(-16.0, 16.0)
-            } else {
-                0.0
-            }
-        };
-        for frame in b.samples().chunks(ch) {
-            data.push(clean(frame[0]));
-            data.push(clean(if ch > 1 { frame[1] } else { frame[0] }));
-        }
-    }
-    // Décodeur et tampons libérés avant le rééchantillonnage.
-    drop(buf);
-    drop(decoder);
-    drop(format);
-    if data.is_empty() {
-        return Err(anyhow!("Fichier vide"));
-    }
-
-    if src_sr != target_sr {
-        // L'original est libéré dès que la version rééchantillonnée est prête.
-        data = resample_stereo(&data, src_sr, target_sr)?;
-    }
-    // Le son reste en mémoire tout le spectacle : pas de place perdue.
-    data.shrink_to_fit();
+/// Son prêt à jouer : données stéréo entrelacées et forme d'onde.
+fn build_sample(data: Vec<f32>, sample_rate: u32) -> Result<SampleData> {
     let frames = data.len() / 2;
-    let mut peaks = Vec::with_capacity(frames / SAMPLE_PEAK + 1);
+    if frames == 0 {
+        return Err(anyhow!("fichier vide"));
+    }
+    let mut peaks = Vec::new();
+    peaks
+        .try_reserve_exact(frames / SAMPLE_PEAK + 1)
+        .map_err(|_| anyhow!("mémoire insuffisante pour charger ce son"))?;
     for block in data.chunks(SAMPLE_PEAK * 2) {
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for &[l, r] in block.as_chunks::<2>().0 {
@@ -731,78 +883,201 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
         peaks.push([lo.min(m), hi.max(m)]);
     }
     Ok(SampleData {
-        sample_rate: target_sr,
+        sample_rate,
         frames,
         data,
         peaks,
     })
 }
 
-/// Rééchantillonne un son stéréo entrelacé (traité par blocs : seuls de petits tampons
-/// par canal sont alloués en plus de l'entrée et de la sortie).
-fn resample_stereo(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
-    const CHUNK: usize = 4096;
-    let frames = input.len() / 2;
-    let mut rs = FftFixedIn::<f32>::new(from as usize, to as usize, CHUNK, 2, 2)?;
-    let expected = (frames as u64 * to as u64).div_ceil(from as u64) as usize;
-    let mut skip = rs.output_delay();
-    let mut out = Vec::with_capacity((expected + CHUNK) * 2);
-    fn push(b: Vec<Vec<f32>>, skip: &mut usize, out: &mut Vec<f32>) {
-        let n = b[0].len();
-        let s = (*skip).min(n);
-        *skip -= s;
-        for (l, r) in b[0][s..].iter().zip(&b[1][s..]) {
-            out.push(*l);
-            out.push(*r);
-        }
+/// Décode `path` en stéréo entrelacé f32 à `target_sr` (rééchantillonné au fil du
+/// décodage : jamais l'original et la version convertie en mémoire en même temps). Toutes
+/// les réservations sont faillibles et bornées : un manque de mémoire ou un en-tête
+/// fantaisiste devient une erreur affichée sur le pad, jamais un arrêt de l'application.
+/// `tick(f)` reçoit l'avancement (0 à 1, quand la longueur est connue).
+pub fn decode_stereo(path: &Path, target_sr: u32, tick: &dyn Fn(f64)) -> Result<Vec<f32>> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::errors::Error as SymError;
+
+    if !crate::decode::VALID_SOURCE_RATES.contains(&target_sr) {
+        return Err(anyhow!("fréquence de la carte invalide ({target_sr} Hz)"));
     }
-    let (mut l, mut r) = (Vec::with_capacity(CHUNK), Vec::with_capacity(CHUNK));
-    let mut pos = 0;
-    while pos < frames {
-        let n = (frames - pos).min(CHUNK);
-        l.clear();
-        r.clear();
-        for f in input[pos * 2..(pos + n) * 2].as_chunks::<2>().0 {
-            l.push(f[0]);
-            r.push(f[1]);
+    let crate::decode::Opened {
+        mut format,
+        mut decoder,
+        track_id,
+        sample_rate,
+        n_frames,
+        mut trim,
+        file_len,
+        ..
+    } = crate::decode::open(path)?;
+    let src_sr = sample_rate.unwrap_or(target_sr);
+    if let Some(n) = n_frames
+        && n / src_sr as u64 > MAX_SECONDS
+    {
+        return Err(anyhow!(
+            "son trop long ({} min) : 30 min maximum pour un pad",
+            n / src_sr as u64 / 60
+        ));
+    }
+    let max_src = MAX_SECONDS * src_sr as u64;
+    let mut conv = crate::decode::Converter::new(2, src_sr, target_sr)?;
+    let max_out = conv.output_frames(max_src).min(MAX_PAD_BYTES / 8);
+    if let Some(n) = n_frames
+        && conv.output_frames(n) > max_out
+    {
+        return Err(anyhow!("son trop long à cette fréquence de session"));
+    }
+    let oom = |_| anyhow!("mémoire insuffisante pour charger ce son");
+    let mut data: Vec<f32> = Vec::new();
+    // Réservation d'après l'en-tête, bornée par la taille réelle du fichier (au plus 64
+    // trames par octet, bien au-delà de tout format réel) : un fichier de 100 octets qui
+    // annonce des heures ne fait rien réserver. Le reste grandit au besoin.
+    if let Some(n) = n_frames {
+        let n = n.min(max_src).min(file_len.saturating_mul(64));
+        let want = conv.output_frames(n).min(max_out) + crate::decode::CHUNK as u64;
+        data.try_reserve_exact(want as usize * 2).map_err(oom)?;
+    }
+    let mut sink = |block: &[f32]| -> Result<()> {
+        if (data.len() + block.len()) as u64 / 2 > max_out {
+            return Err(anyhow!("son trop long : 30 min maximum pour un pad"));
         }
-        let chunk = [&l[..], &r[..]];
-        let block = if n == CHUNK {
-            rs.process(&chunk, None)?
-        } else {
-            rs.process_partial(Some(&chunk), None)?
+        if data.capacity() - data.len() < block.len() {
+            // Croissance d'un quart au moins : peu de recopies, peu de place perdue.
+            let extra = block.len().max(data.capacity() / 4).max(1 << 16);
+            data.try_reserve_exact(extra).map_err(oom)?;
+        }
+        data.extend_from_slice(block);
+        Ok(())
+    };
+    let mut buf: Option<SampleBuffer<f32>> = None;
+    let mut stereo: Vec<f32> = Vec::new();
+    let mut read = 0u64;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymError::ResetRequired) => break,
+            Err(e) => return Err(anyhow!("lecture impossible ({e})")),
         };
-        push(block, &mut skip, &mut out);
-        pos += n;
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(SymError::DecodeError(_)) => continue,
+            Err(e) => return Err(anyhow!("décodage impossible ({e})")),
+        };
+        let spec = *decoded.spec();
+        let ch = spec.channels.count().max(1);
+        let b = buf.get_or_insert_with(|| SampleBuffer::new(decoded.capacity() as u64, spec));
+        if b.capacity() < decoded.capacity() * ch {
+            *b = SampleBuffer::new(decoded.capacity() as u64, spec);
+        }
+        b.copy_interleaved_ref(decoded);
+        let kept = trim.apply(b.samples(), ch);
+        read += (kept.len() / ch) as u64;
+        if read > max_src {
+            return Err(anyhow!("son trop long : 30 min maximum pour un pad"));
+        }
+        // NaN / infini (fichier abîmé) : silence. Sans cela, un seul pad abîmé rendrait
+        // tout le mixage de sortie NaN — donc muet — pendant qu'il joue.
+        let clean = |x: f32| {
+            if x.is_finite() {
+                x.clamp(-16.0, 16.0)
+            } else {
+                0.0
+            }
+        };
+        stereo.clear();
+        for frame in kept.chunks_exact(ch) {
+            stereo.push(clean(frame[0]));
+            stereo.push(clean(if ch > 1 { frame[1] } else { frame[0] }));
+        }
+        conv.push(&stereo, 2, &mut sink)?;
+        // Toujours appelé (longueur inconnue : 0) : c'est aussi le signe que le décodage
+        // avance (processus fils, voir `isolate`).
+        tick(n_frames.map_or(0.0, |n| read as f64 / n.max(1) as f64));
     }
-    let mut guard = 0;
-    while out.len() < expected * 2 && guard < 32 {
-        push(
-            rs.process_partial::<&[f32]>(None, None)?,
-            &mut skip,
-            &mut out,
-        );
-        guard += 1;
+    conv.finish(&mut sink)?;
+    if data.is_empty() {
+        return Err(anyhow!("fichier vide"));
     }
-    out.truncate(expected * 2);
-    Ok(out)
+    // Le son reste en mémoire tout le spectacle : une place perdue notable est rendue (par
+    // une copie faillible ; sans mémoire pour la faire, le son reste tel quel).
+    if data.capacity() - data.len() > data.len() / 16 + (1 << 16) {
+        let mut exact: Vec<f32> = Vec::new();
+        if exact.try_reserve_exact(data.len()).is_ok() {
+            exact.extend_from_slice(&data);
+            data = exact;
+        }
+    }
+    Ok(data)
 }
 
-fn st_clone(st: &LoadState) -> LoadState {
-    match st {
-        LoadState::Failed(e) => LoadState::Failed(e.clone()),
-        LoadState::Loading => LoadState::Loading,
-        LoadState::Ready(s) => LoadState::Ready(s.clone()),
-    }
-}
-
-/// Chemin sur un partage réseau (`\\serveur\partage\…` ou `//serveur/…`).
+/// Chemin sur un partage réseau ou un périphérique (pas un simple fichier local) :
+/// `\\serveur\partage\…`, `//serveur/…`, `\\?\UNC\…`, `\\?\GLOBALROOT\Device\Mup\…`,
+/// `\\.\…`, ou un lecteur réseau (`Z:\…` relié à un partage). Seuls les chemins sur un
+/// disque local (`C:\…`, `\\?\C:\…`) et les chemins relatifs sont considérés comme locaux.
 pub fn is_network_path(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    // `\\?\C:\…` : chemin local écrit sous forme longue (pas un partage).
-    let local_verbatim =
-        s.starts_with("\\\\?\\") && !s[4..].to_ascii_uppercase().starts_with("UNC");
-    (s.starts_with("\\\\") || s.starts_with("//")) && !local_verbatim
+    let b = s.as_bytes();
+    let sep = |c: u8| c == b'\\' || c == b'/';
+    if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
+        // `\\?\C:\…` : chemin local écrit sous forme longue ; tout le reste (UNC, Mup,
+        // GLOBALROOT, `\\.\`…) peut mener au réseau.
+        let verbatim_disk = b.len() >= 6
+            && &b[..4] == b"\\\\?\\"
+            && b[4].is_ascii_alphabetic()
+            && b[5] == b':'
+            && (b.len() == 6 || b[6] == b'\\');
+        return !verbatim_disk || drive_is_remote(b[4]);
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(px)) = p.components().next() {
+            return match px.kind() {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => drive_is_remote(d),
+                _ => true,
+            };
+        }
+    }
+    false
+}
+
+/// Lecteur relié à un partage réseau (`net use Z: \\serveur\partage`).
+#[cfg(windows)]
+fn drive_is_remote(letter: u8) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOTE: u32 = 4;
+    let root = [
+        letter.to_ascii_uppercase() as u16,
+        b':' as u16,
+        b'\\' as u16,
+        0,
+    ];
+    // SAFETY : chaîne UTF-16 terminée par un zéro, lue seulement pendant l'appel.
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+}
+
+#[cfg(not(windows))]
+fn drive_is_remote(_letter: u8) -> bool {
+    false
+}
+
+/// Chemin relatif qui sort du dossier où il est écrit (`..`, racine, lecteur) : écrit par
+/// quelqu'un d'autre que TracksPlus, qui n'enregistre que des chemins sous la session.
+fn escapes_dir(p: &Path) -> bool {
+    use std::path::Component;
+    p.is_relative()
+        && p.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
 }
 
 pub fn is_audio_file(p: &Path) -> bool {
@@ -1088,8 +1363,25 @@ mod tests {
         assert!(is_network_path(Path::new(r"\\attaquant\partage\a.wav")));
         assert!(is_network_path(Path::new("//serveur/partage/a.wav")));
         assert!(is_network_path(Path::new(r"\\?\UNC\serveur\p\a.wav")));
+        // Autres formes qui passent par le redirecteur réseau (MUP).
+        assert!(is_network_path(Path::new(
+            r"\\?\GLOBALROOT\Device\Mup\h\p\a.wav"
+        )));
+        assert!(is_network_path(Path::new(
+            r"\\?\GLOBALROOT\??\UNC\h\p\a.wav"
+        )));
+        assert!(is_network_path(Path::new(r"\\.\UNC\h\p\a.wav")));
+        assert!(is_network_path(Path::new(r"\\.\C:\Sons\a.wav")));
+        assert!(is_network_path(Path::new(r"/\serveur\p\a.wav")));
+        assert!(is_network_path(Path::new(r"\\?\Volume{0}\a.wav")));
         assert!(!is_network_path(Path::new(r"\\?\C:\Sons\a.wav")));
         assert!(!is_network_path(Path::new(r"C:\Sons\a.wav")));
+        assert!(!is_network_path(Path::new(r"Sons\a.wav")));
+        // Chemins relatifs qui sortent de la session : mis de côté eux aussi.
+        assert!(escapes_dir(Path::new(r"..\..\..\.ssh\id_ed25519")));
+        assert!(escapes_dir(Path::new("Sons/../../x.wav")));
+        assert!(!escapes_dir(Path::new("Sons/b.wav")));
+        assert!(!escapes_dir(Path::new(r"C:\Sons\a.wav")));
         let dir = std::env::temp_dir().join(format!("tp-unc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1103,5 +1395,157 @@ mod tests {
         let missing = l.adopt_sounds(&dir.join("copie"));
         assert!(missing.contains(&PathBuf::from(r"\\attaquant\p\a.wav")));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Session reçue dont un pad désigne un fichier hors de la session (`..`) ou un fichier
+    /// qui n'est pas un son : jamais copié dans la session par « Enregistrer sous ».
+    #[test]
+    fn pads_outside_the_session_are_never_copied() {
+        let base = std::env::temp_dir().join(format!("tp-exfil-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("Session");
+        std::fs::create_dir_all(dir.join("Sons")).unwrap();
+        let secret = base.join("secret");
+        std::fs::write(&secret, b"cle privee").unwrap();
+        let doc = base.join("notes.txt");
+        std::fs::write(&doc, b"document").unwrap();
+        let mut b = Board::default();
+        b.set(0, Some(Pad::new(PathBuf::from(r"..\secret"), 0)));
+        b.set(1, Some(Pad::new(doc.clone(), 0)));
+        b.save(&dir.join(BOARD_FILE)).unwrap();
+        let mut l = Board::load_session(&dir).unwrap();
+        assert_eq!(l.network_pads, vec![PathBuf::from(r"..\secret")]);
+        let target = base.join("Copie");
+        let missing = l.adopt_sounds(&target);
+        assert_eq!(missing.len(), 2);
+        assert!(!target.join("Sons").exists());
+        // Le cache ne l'ouvre jamais, même après un changement de fréquence.
+        let mut c = SampleCache::new(48000);
+        c.park(&PathBuf::from(r"..\secret"));
+        c.set_sample_rate(44100);
+        c.reload(&PathBuf::from(r"..\secret"));
+        assert!(matches!(
+            c.map.get(&PathBuf::from(r"..\secret")),
+            Some(LoadState::Failed(_))
+        ));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn write_tone(path: &Path, sr: u32, frames: usize) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: sr,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..frames {
+            let v = ((i as f32 * 0.01).sin() * 8000.0) as i16;
+            w.write_sample(v).unwrap();
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn wait_loaded(c: &mut SampleCache) {
+        let t0 = std::time::Instant::now();
+        loop {
+            c.poll();
+            if !c.map.values().any(|s| matches!(s, LoadState::Loading)) {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Mémoire réservée aux sons : au-delà, le pad affiche une erreur au lieu de décoder
+    /// (et d'allouer) un son de plus.
+    #[test]
+    fn memory_budget_refuses_extra_sounds() {
+        let dir = std::env::temp_dir().join(format!("tp-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_tone(&a, 48000, 48000);
+        write_tone(&b, 48000, 48000);
+        // Place pour un son d'une seconde (≈ 390 Ko), pas pour deux.
+        let mut c = SampleCache::with_budget(48000, 600_000);
+        c.request(&a, None);
+        wait_loaded(&mut c);
+        assert!(c.get(&a).is_some());
+        c.request(&b, None);
+        wait_loaded(&mut c);
+        match c.map.get(&b) {
+            Some(LoadState::Failed(e)) => assert!(e.contains("Mémoire"), "{e}"),
+            _ => panic!("second son accepté malgré la limite"),
+        }
+        // Le premier retiré : la place est rendue, le second se charge.
+        c.retain(&[b.clone()].into());
+        c.reload(&b);
+        wait_loaded(&mut c);
+        assert!(c.get(&b).is_some());
+        assert_eq!(c.budget.inflight.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reconnexion qui revient à la fréquence d'avant : sons repris sans redécodage.
+    #[test]
+    fn rate_flip_back_reuses_previous_sounds() {
+        let dir = std::env::temp_dir().join(format!("tp-flip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_tone(&a, 48000, 4800);
+        let mut c = SampleCache::new(48000);
+        c.request(&a, None);
+        wait_loaded(&mut c);
+        let before = c.get(&a).unwrap().clone();
+        c.set_sample_rate(44100);
+        wait_loaded(&mut c);
+        assert_eq!(c.get(&a).unwrap().sample_rate, 44100);
+        c.set_sample_rate(48000);
+        // Aucune attente : le son à 48 kHz est repris tel quel.
+        assert!(Arc::ptr_eq(c.get(&a).unwrap(), &before));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// MP3 encodé par LAME : délai d'encodeur et bourrage retirés (lecture « gapless »),
+    /// le son décodé a la longueur de l'original — un pad en boucle n'a pas de trou.
+    #[test]
+    fn mp3_is_decoded_gapless() {
+        use mp3lame_encoder::{Builder, FlushGap, InterleavedPcm};
+        let dir = std::env::temp_dir().join(format!("tp-gapless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frames = 44100 + 333;
+        let pcm: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let v = (i as f32 * 0.02).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        let mut b = Builder::new().unwrap();
+        b.set_num_channels(2).unwrap();
+        b.set_sample_rate(44100).unwrap();
+        b.set_to_write_vbr_tag(true).unwrap();
+        let mut enc = b.build().unwrap();
+        let mut out = Vec::with_capacity(frames * 5 / 4 + 7200);
+        enc.encode_to_vec(InterleavedPcm(&pcm), &mut out).unwrap();
+        out.reserve(7200);
+        enc.flush_to_vec::<FlushGap>(&mut out).unwrap();
+        // Trame LAME/Xing réécrite au début (délai et bourrage).
+        let mut tag = Vec::with_capacity(enc.lame_tag_size());
+        assert!(enc.lame_tag_encode_to_vec(&mut tag).is_some());
+        out[..tag.len()].copy_from_slice(&tag);
+        let p = dir.join("boucle.mp3");
+        std::fs::write(&p, &out).unwrap();
+        let s = load_sample(&p, 44100).unwrap();
+        assert!(
+            (s.frames as i64 - frames as i64).abs() <= 1,
+            "{} trames décodées pour {frames}",
+            s.frames
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

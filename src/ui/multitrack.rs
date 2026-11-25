@@ -129,6 +129,23 @@ fn wave_scale(v: i8) -> f32 {
     v as f32 / 127.0
 }
 
+/// Positions possibles du début d'une prise rognée par la gauche : jusqu'au début du
+/// fichier, et jamais plus courte que `MIN_CLIP`. Une prise déjà plus courte (clic importé,
+/// segment de quelques trames) peut seulement être rallongée : jamais `min > max`, qui
+/// ferait paniquer `clamp`.
+fn trim_left_range(c: &Clip) -> (i64, i64) {
+    let lo = (c.start as i64 - c.offset as i64).max(0);
+    let hi = (c.end() as i64 - MIN_CLIP as i64).max(c.start as i64);
+    (lo.min(hi), hi)
+}
+
+/// Positions possibles de la fin d'une prise rognée par la droite (même règle).
+fn trim_right_range(c: &Clip) -> (i64, i64) {
+    let hi = c.start as i64 + c.src_end().saturating_sub(c.offset).max(c.len) as i64;
+    let lo = (c.start as i64 + MIN_CLIP as i64).min(c.end() as i64);
+    (lo.min(hi), hi)
+}
+
 /// Couleur d'une piste : celle choisie, sinon selon sa position.
 pub fn track_color(track: &crate::project::Track, idx: usize) -> Color32 {
     track
@@ -1116,8 +1133,7 @@ impl App {
                     }
                 }
                 DragMode::TrimLeft => {
-                    let lo = (m.start as i64 - m.offset as i64).max(0);
-                    let hi = m.end() as i64 - MIN_CLIP as i64;
+                    let (lo, hi) = trim_left_range(&m);
                     let mut ns = (m.start as i64 + d).clamp(lo, hi);
                     if !points.is_empty() {
                         ns = (ns + self.snap_delta(&[ns], &points)).clamp(lo, hi);
@@ -1155,8 +1171,7 @@ impl App {
                     }
                 }
                 DragMode::TrimRight => {
-                    let lo = m.start as i64 + MIN_CLIP as i64;
-                    let hi = m.start as i64 + (m.src_end() - m.offset) as i64;
+                    let (lo, hi) = trim_right_range(&m);
                     let mut ne = (m.end() as i64 + d).clamp(lo, hi);
                     if !points.is_empty() {
                         ne = (ne + self.snap_delta(&[ne], &points)).clamp(lo, hi);
@@ -2898,6 +2913,54 @@ fn fmt_ruler(tt: f64, step: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::fmt_ruler;
+
+    /// Prise plus courte que `MIN_CLIP` (clic de 1 ms importé) : bornes du rognage
+    /// toujours dans l'ordre, aucune panique ; elle peut seulement être rallongée.
+    #[test]
+    fn short_clips_trim_without_panic() {
+        use super::{trim_left_range, trim_right_range};
+        use crate::project::{Clip, MIN_CLIP};
+        let c = Clip {
+            id: 1,
+            file: "clic.wav".into(),
+            start: 1000,
+            offset: 0,
+            len: 48,
+            src_len: 48,
+            fade_in: 0,
+            fade_out: 0,
+        };
+        let (lo, hi) = trim_left_range(&c);
+        assert!(lo <= hi);
+        assert_eq!((500i64).clamp(lo, hi), 1000);
+        let (lo, hi) = trim_right_range(&c);
+        assert!(lo <= hi);
+        assert_eq!((900i64).clamp(lo, hi), 1048);
+        // Rallongeable à gauche quand le fichier commence avant la prise.
+        let c2 = Clip {
+            offset: 20,
+            src_len: 200,
+            ..c.clone()
+        };
+        assert_eq!(trim_left_range(&c2), (980, 1000));
+        assert_eq!(trim_right_range(&c2).1, 1000 + 180);
+        // Prise normale : bornes habituelles.
+        let n = Clip {
+            len: 1000,
+            src_len: 1000,
+            ..c.clone()
+        };
+        assert_eq!(trim_left_range(&n), (1000, 2000 - MIN_CLIP as i64));
+        assert_eq!(trim_right_range(&n), (1000 + MIN_CLIP as i64, 2000));
+        // Fichier source abîmé (longueur inférieure au décalage) : pas de débordement.
+        let bad = Clip {
+            offset: 500,
+            src_len: 10,
+            ..n.clone()
+        };
+        let (lo, hi) = trim_right_range(&bad);
+        assert!(lo <= hi);
+    }
 
     /// Cache des formes d'onde : mêmes valeurs qu'un calcul direct, recalcul quand une
     /// prise en cours s'allonge, et troisième niveau de détail tenu à jour.

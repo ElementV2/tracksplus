@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod decode;
 mod encode;
 mod export;
 #[cfg(test)]
@@ -12,6 +13,7 @@ mod fuzz_tests;
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 mod import;
+mod isolate;
 mod midi;
 mod player;
 mod project;
@@ -151,6 +153,11 @@ fn install_crash_log() {
 }
 
 fn main() -> eframe::Result {
+    // Processus fils de décodage (voir `isolate`) : ni fenêtre, ni journal, ni verrou.
+    if let Some(code) = isolate::worker_main() {
+        std::process::exit(code);
+    }
+    isolate::enable();
     install_crash_log();
     // Gardé jusqu'à la fermeture de l'application.
     let _instance = single_instance();

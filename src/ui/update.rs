@@ -12,6 +12,11 @@ impl App {
     pub fn update_background(&mut self, ctx: &egui::Context) {
         if !self.update_checked && self.now > 3.0 {
             self.update_checked = true;
+            // Installeurs d'un lancement précédent : plus utiles (aucun téléchargement n'a
+            // pu commencer avant ce premier passage).
+            if !self.updater.busy() && !matches!(self.updater.state(), State::Ready { .. }) {
+                update::clean_downloads();
+            }
             if self.update_settings.auto_check {
                 self.updater.check(ctx);
             }
@@ -31,7 +36,7 @@ impl App {
         }
         // Installeur prêt après « Installer et redémarrer » : on le lance et on ferme.
         if self.update_install
-            && let State::Ready { file, .. } = self.updater.state()
+            && let State::Ready { file, release } = self.updater.state()
         {
             if !self.is_stopped()
                 || self.save_as_job.is_some()
@@ -52,7 +57,8 @@ impl App {
             ) {
                 return;
             }
-            match update::launch_installer(&file) {
+            // Empreinte revérifiée au lancement (le fichier a pu attendre des heures).
+            match update::launch_installer(&file, release.sha256.as_deref()) {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => self.updater.set(State::Failed(e)),
             }
