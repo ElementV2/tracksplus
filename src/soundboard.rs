@@ -169,6 +169,10 @@ pub struct Board {
     /// l'écran = le pad physique au même endroit), sinon MIDI learn pad par pad.
     #[serde(default)]
     pub layout: PadLayout,
+    /// Mode spectacle : pads jouables, édition verrouillée (suppression, déplacement,
+    /// remplacement, réglages, pages). Gardé avec la session.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -197,6 +201,7 @@ impl Default for Board {
             led_mode: crate::midi::LedMode::Auto,
             led_port: None,
             layout: PadLayout::Auto,
+            locked: false,
         }
     }
 }

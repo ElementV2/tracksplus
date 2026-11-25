@@ -250,6 +250,8 @@ pub struct SbState {
     pub renaming: Option<(u16, String)>,
     /// Dernier pad supprimé (emplacement, pad) : Ctrl+Z dans le soundboard le rétablit.
     pub deleted: Option<(u16, crate::soundboard::Pad)>,
+    /// Début de la panique en fondu (voir `stop_all_pads`).
+    pub panic_at: f64,
 }
 
 /// Secondes de tampon disque par piste : comme les enregistreurs pro (Ardour 10 s par
@@ -524,6 +526,7 @@ impl App {
             sb: SbState {
                 zoom: (0.0, 1.0),
                 midi_dirty: true,
+                panic_at: f64::NEG_INFINITY,
                 ..Default::default()
             },
             undo: Vec::new(),
@@ -2739,7 +2742,7 @@ impl App {
                 .color(t::TEXT_3),
         );
         // Sélecteur de fichier bloquant puis arrêt des pads : jamais pendant le spectacle.
-        let idle = self.is_stopped() && self.pads_status().0 == 0;
+        let idle = self.is_stopped() && self.pads_status().0 == 0 && !self.board.locked;
         if ui
             .add_enabled(idle, egui::Button::new("Importer un soundboard…"))
             .on_disabled_hover_text("Arrêtez la lecture, la prise et les pads d'abord")

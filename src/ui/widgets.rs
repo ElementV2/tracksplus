@@ -271,6 +271,8 @@ pub enum Icon {
     Redo,
     /// Plage barrée (effacer la plage de temps).
     ClearRange,
+    /// Cadenas (mode spectacle : édition verrouillée).
+    Lock,
 }
 
 pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
@@ -459,6 +461,25 @@ pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
             p.circle_stroke(r, ring, st);
             p.line_segment([l + vec2(0.15, -0.18) * s, c + vec2(0.45, -0.85) * s], st);
             p.line_segment([r + vec2(-0.15, -0.18) * s, c + vec2(-0.45, -0.85) * s], st);
+        }
+        Icon::Lock => {
+            // Anse en arc au-dessus d'un corps plein.
+            let r = 0.36 * s;
+            let top = c + vec2(0.0, -0.18 * s);
+            let pts: Vec<Pos2> = (0..=10)
+                .map(|k| {
+                    let a = std::f32::consts::PI * k as f32 / 10.0;
+                    top + vec2(-r * a.cos(), -r * a.sin())
+                })
+                .collect();
+            p.line_segment([pts[0], pts[0] + vec2(0.0, 0.2 * s)], st);
+            p.line_segment([pts[10], pts[10] + vec2(0.0, 0.2 * s)], st);
+            p.add(Shape::line(pts, st));
+            p.rect_filled(
+                Rect::from_min_max(c + vec2(-0.6, 0.0) * s, c + vec2(0.6, 0.85) * s),
+                1.0,
+                col,
+            );
         }
         Icon::Trash => {
             // Couvercle, poignée, bac et deux rainures.

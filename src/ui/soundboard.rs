@@ -71,6 +71,9 @@ fn copy_worker(src: PathBuf, dir: PathBuf, done: std::sync::mpsc::Sender<Result<
     }
 }
 
+/// Durée du fondu de la panique (premier appui sur Échap / « Tout arrêter »).
+const PANIC_FADE_S: f64 = 1.0;
+
 /// Copie d'un gros son vers le dossier « Sons » de la session, en cours.
 pub struct PendingCopy {
     src: PathBuf,
@@ -152,8 +155,18 @@ impl App {
         self.engine.pad(PadCmd::Release { slot });
     }
 
+    /// Panique en deux temps, comme QLab ou SCS : un premier appui éteint tous les pads
+    /// en fondu d'une seconde ; un second appui pendant ce fondu les coupe net.
     pub fn stop_all_pads(&mut self) {
-        self.engine.pad(PadCmd::StopAll);
+        let fading = self.now - self.sb.panic_at < PANIC_FADE_S + 0.5;
+        if fading {
+            self.engine.pad(PadCmd::StopAll);
+            self.sb.panic_at = f64::NEG_INFINITY;
+        } else {
+            let frames = (self.sr() as f64 * PANIC_FADE_S) as usize;
+            self.engine.pad(PadCmd::FadeAll { frames });
+            self.sb.panic_at = self.now;
+        }
     }
 
     /// Pads en lecture : nombre, temps restant (s) du dernier à finir hors boucles, et
@@ -694,6 +707,7 @@ impl App {
             if key == Key::Delete && pressed {
                 if let Some(slot) = self.sb.selected
                     && self.board.pad(slot).is_some()
+                    && !self.board.locked
                 {
                     self.delete_pad(slot);
                 }
@@ -914,6 +928,28 @@ impl App {
 
             ui.add_space(6.0);
 
+            // Mode spectacle (comme le « show mode » de QLab) : pads jouables, rien ne
+            // peut être supprimé, déplacé ou remplacé par erreur. Pas de mot de passe : un
+            // verrou impossible à ouvrir ne doit jamais bloquer un spectacle.
+            let locked = self.board.locked;
+            let style = if locked {
+                BtnStyle::Active(t::ACCENT)
+            } else {
+                BtnStyle::Ghost
+            };
+            let tip = if locked {
+                "Mode spectacle actif : édition verrouillée (pads toujours jouables). Clic : déverrouiller"
+            } else {
+                "Mode spectacle : verrouiller l'édition du soundboard (pads toujours jouables)"
+            };
+            if w::icon_button(ui, Icon::Lock, 24.0, style, true, tip).clicked() {
+                self.board.locked = !locked;
+                self.sb.drag_pad = None;
+                self.sb.renaming = None;
+                self.board_changed = Some(self.now);
+            }
+            ui.add_space(4.0);
+
             // Voyant d'activité MIDI.
             let active = self.now - self.sb.midi_seen < 0.15;
             let (dr, dresp) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
@@ -972,8 +1008,9 @@ impl App {
                     if r.secondary_clicked() {
                         self.sb.page = i;
                     }
-                    r.on_hover_text("Clic droit : renommer ou supprimer la page")
-                        .context_menu(|ui| {
+                    let r = r.on_hover_text("Clic droit : renommer ou supprimer la page");
+                    if !self.board.locked {
+                        r.context_menu(|ui| {
                             ui.set_width(200.0);
                             if ui
                                 .add(
@@ -991,12 +1028,14 @@ impl App {
                                 ui.close();
                             }
                         });
+                    }
                 }
             });
             if let Some(i) = remove_page {
                 self.sb.confirm_delete_page = Some(i);
             }
             if self.board.pages.len() < MAX_PAGES
+                && !self.board.locked
                 && w::icon_button(ui, Icon::Plus, 22.0, BtnStyle::Ghost, true, "Nouvelle page")
                     .clicked()
             {
@@ -1388,15 +1427,31 @@ impl App {
                     egui::CursorIcon::Grab
                 });
             }
-            if resp.drag_started() && !ctrl && self.sb.mouse_down.is_none() {
+            if resp.drag_started() && !ctrl && self.sb.mouse_down.is_none() && !self.board.locked {
                 self.sb.drag_pad = Some(slot);
             }
             let rename_id = ui.make_persistent_id(("pad_rename", slot));
-            if resp.double_clicked() && !blocked && !ctrl {
+            if resp.double_clicked() && !blocked && !ctrl && !self.board.locked {
                 self.sb.renaming = Some((slot, pad.name.clone()));
                 ui.memory_mut(|m| m.request_focus(rename_id));
             }
+            let locked = self.board.locked;
             resp.context_menu(|ui| {
+                if locked {
+                    if ui.button("Écouter").clicked() {
+                        self.audition_pad(slot);
+                        ui.close();
+                    }
+                    if ui.button("Arrêter").clicked() {
+                        self.engine.pad(PadCmd::Stop { slot });
+                        ui.close();
+                    }
+                    ui.label(
+                        egui::RichText::new("Mode spectacle : édition verrouillée")
+                            .color(t::TEXT_3),
+                    );
+                    return;
+                }
                 if ui.button("Renommer").clicked() {
                     self.sb.renaming = Some((slot, pad.name.clone()));
                     ui.memory_mut(|m| m.request_focus(rename_id));
@@ -1653,7 +1708,12 @@ impl App {
                 }
             }
         }
-        if !dropped.is_empty() && !blocked {
+        if !dropped.is_empty() && self.board.locked {
+            self.notify(
+                "Mode spectacle : déverrouillez le soundboard pour ajouter des sons",
+                true,
+            );
+        } else if !dropped.is_empty() && !blocked {
             let target = drop_slot.or_else(|| {
                 (0..cols * rows)
                     .map(|i| Board::slot(page, i))
@@ -1663,7 +1723,9 @@ impl App {
                 self.assign_files(s, dropped);
             }
         }
-        if let Some(s) = empty_clicked {
+        if let Some(s) = empty_clicked
+            && !self.board.locked
+        {
             self.open_browser(s, true);
         }
     }
@@ -1674,6 +1736,10 @@ impl App {
         let Some(slot) = self.sb.selected else {
             return;
         };
+        if self.board.locked {
+            // Réglages visibles mais figés pendant le spectacle.
+            ui.disable();
+        }
         let Some(mut pad) = self.board.pad(slot).cloned() else {
             return;
         };
@@ -1954,6 +2020,9 @@ impl App {
 
     /// Rétablit le dernier pad supprimé, à sa place si elle est toujours libre.
     pub fn restore_deleted_pad(&mut self) {
+        if self.board.locked {
+            return;
+        }
         let Some((slot, pad)) = self.sb.deleted.take() else {
             return;
         };

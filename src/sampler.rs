@@ -66,6 +66,10 @@ pub enum PadCmd {
     },
     /// Arrêt immédiat de toutes les voix (micro-fondu anti-clic de 10 ms).
     StopAll,
+    /// Panique « douce » : toutes les voix s'éteignent en fondu sur `frames` trames.
+    FadeAll {
+        frames: usize,
+    },
     SetOutput {
         left: usize,
     },
@@ -99,8 +103,18 @@ fn smooth(x: f32) -> f32 {
     s * s
 }
 
+/// Deux appuis sur le même pad à moins de 150 ms : rebond d'un bouton MIDI ou double-clic
+/// involontaire — le second est ignoré (sinon un pad « appui = lecture / appui = stop »
+/// s'arrêterait aussitôt lancé). Comme la protection « double GO » des logiciels de
+/// spectacle.
+const DEBOUNCE_MS: usize = 150;
+
 pub struct Sampler {
     voices: Vec<Voice>,
+    /// Trames jouées depuis le démarrage (horloge du soundboard).
+    clock: u64,
+    /// Horloge du dernier appui pris en compte, par pad (alloué une fois).
+    last_press: Vec<u64>,
     rx: Receiver<PadCmd>,
     garbage: Sender<Arc<SampleData>>,
     pub left: usize,
@@ -116,6 +130,8 @@ impl Sampler {
     ) -> Self {
         Self {
             voices: Vec::with_capacity(MAX_VOICES),
+            clock: 0,
+            last_press: vec![0; MAX_PADS],
             rx,
             garbage,
             left,
@@ -141,6 +157,16 @@ impl Sampler {
                 sample,
                 params,
             } => {
+                let debounce = (self.sample_rate * DEBOUNCE_MS / 1000) as u64;
+                if params.mode != PadMode::Gate
+                    && let Some(last) = self.last_press.get_mut(slot as usize)
+                {
+                    if *last != 0 && self.clock.saturating_sub(*last) < debounce {
+                        self.dispose(sample);
+                        return;
+                    }
+                    *last = self.clock.max(1);
+                }
                 let active = self
                     .voices
                     .iter()
@@ -203,6 +229,11 @@ impl Sampler {
                     v.release(quick);
                 }
             }
+            PadCmd::FadeAll { frames } => {
+                for v in &mut self.voices {
+                    v.release(frames.max(quick));
+                }
+            }
             PadCmd::SetOutput { left } => self.left = left,
         }
     }
@@ -212,6 +243,7 @@ impl Sampler {
         while let Ok(cmd) = self.rx.try_recv() {
             self.handle(cmd);
         }
+        self.clock += frames as u64;
         for v in &mut self.voices {
             let data = &v.sample.data;
             let p = v.p;
@@ -450,7 +482,10 @@ mod tests {
         })
         .unwrap();
         let mut out = vec![0.0; 2048];
-        s.render(&mut out, 1024, &pos);
+        // Second appui 200 ms plus tard (au-delà de l'anti-rebond).
+        for _ in 0..10 {
+            s.render(&mut out, 1024, &pos);
+        }
         tx.send(PadCmd::Press {
             slot: 0,
             sample: smp,
@@ -463,5 +498,58 @@ mod tests {
         }
         assert!(out.iter().all(|&x| x == 0.0));
         assert_eq!(pos[0].load(Ordering::Relaxed), 0);
+    }
+
+    /// Rebond d'un bouton (second appui 20 ms après) : ignoré, le son continue.
+    #[test]
+    fn bouncing_press_is_ignored() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        let smp = sample(48000);
+        let press = || PadCmd::Press {
+            slot: 0,
+            sample: smp.clone(),
+            params: params(PadMode::Toggle, 48000),
+        };
+        tx.send(press()).unwrap();
+        let mut out = vec![0.0; 2048];
+        s.render(&mut out, 1024, &pos);
+        tx.send(press()).unwrap();
+        for _ in 0..4 {
+            out.fill(0.0);
+            s.render(&mut out, 1024, &pos);
+        }
+        assert!(out.iter().any(|&x| x != 0.0), "le son joue toujours");
+    }
+
+    /// Panique douce : fondu progressif, silence au bout du temps demandé.
+    #[test]
+    fn fade_all_fades_then_silences() {
+        let (tx, rx) = bounded(16);
+        let (gtx, _grx) = bounded(16);
+        let mut s = Sampler::new(rx, gtx, 0, 48000);
+        let pos: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
+        tx.send(PadCmd::Press {
+            slot: 0,
+            sample: sample(96000),
+            params: params(PadMode::Toggle, 96000),
+        })
+        .unwrap();
+        let mut out = vec![0.0; 2048];
+        s.render(&mut out, 1024, &pos);
+        let level = |o: &[f32]| o.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let full = level(&out);
+        tx.send(PadCmd::FadeAll { frames: 4800 }).unwrap();
+        out.fill(0.0);
+        s.render(&mut out, 1024, &pos);
+        let mid = level(&out[1000..]);
+        assert!(mid < full && mid > 0.0, "fondu en cours : {mid} / {full}");
+        for _ in 0..6 {
+            out.fill(0.0);
+            s.render(&mut out, 1024, &pos);
+        }
+        assert!(out.iter().all(|&x| x == 0.0));
     }
 }
