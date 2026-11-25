@@ -256,7 +256,18 @@ pub fn installed() -> bool {
 /// Sans cela, l'installeur peut choisir l'autre mode (application lancée en administrateur,
 /// par exemple) et créer une deuxième installation au lieu de mettre à jour la première.
 fn install_mode(exe_dir: &Path, program_dirs: &[PathBuf]) -> &'static str {
-    if program_dirs.iter().any(|d| exe_dir.starts_with(d)) {
+    // Comparaison de chemins Windows insensible à la casse et au type de séparateur
+    // (« C:\program files » et « C:/Program Files/ » désignent le même dossier).
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
+        s.trim_end_matches('\\').to_string()
+    }
+    let exe = norm(exe_dir);
+    let inside = |d: &PathBuf| {
+        let d = norm(d);
+        !d.is_empty() && (exe == d || exe.starts_with(&format!("{d}\\")))
+    };
+    if program_dirs.iter().any(inside) {
         "/ALLUSERS"
     } else {
         "/CURRENTUSER"
@@ -473,6 +484,16 @@ mod tests {
                 Path::new(r"C:\Users\a\AppData\Local\Programs\TracksPlus"),
                 &pf
             ),
+            "/CURRENTUSER"
+        );
+        // Casse et séparateurs différents : même dossier.
+        assert_eq!(
+            install_mode(Path::new(r"c:/program files/TracksPlus"), &pf),
+            "/ALLUSERS"
+        );
+        // Préfixe trompeur : « Program Files Extra » n'est pas « Program Files ».
+        assert_eq!(
+            install_mode(Path::new(r"C:\Program Files Extra\TracksPlus"), &pf),
             "/CURRENTUSER"
         );
     }
