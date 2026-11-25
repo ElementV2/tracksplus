@@ -337,6 +337,8 @@ impl Shared {
             if self.counting.load(Ordering::Relaxed) {
                 self.xruns.fetch_add(1, Ordering::Relaxed);
             }
+        } else if err.kind() == cpal::ErrorKind::DeviceChanged {
+            // Périphérique par défaut changé : le flux continue, rien à signaler.
         } else {
             // Rien à allouer ni à verrouiller ici (ce rappel peut tourner sur le thread
             // audio) : juste le genre d'erreur, l'interface écrit le message.
@@ -897,6 +899,27 @@ impl Engine {
         while self.garbage_rx.try_recv().is_ok() {}
         while self.sample_garbage_rx.try_recv().is_ok() {}
         while self.in_garbage_rx.try_recv().is_ok() {}
+    }
+
+    /// Commande de pad qui ne doit jamais se perdre (échange de places : sinon les sons en
+    /// cours resteraient sur les anciennes cases) : réessayée un court instant.
+    pub fn pad_reliable(&self, mut cmd: PadCmd) {
+        let Some(tx) = &self.pad_tx else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match tx.try_send(cmd) {
+                Ok(()) => return,
+                Err(crossbeam_channel::TrySendError::Full(c))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    cmd = c;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     pub fn pad(&self, cmd: PadCmd) {

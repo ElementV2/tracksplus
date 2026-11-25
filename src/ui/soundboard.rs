@@ -138,7 +138,7 @@ impl App {
             return;
         }
         // Les sons en cours suivent leur pad (pas de coupure en plein spectacle).
-        self.engine.pad(PadCmd::Swap { a: src, b: dst });
+        self.engine.pad_reliable(PadCmd::Swap { a: src, b: dst });
         let a = self.board.pad(src).cloned();
         let b = self.board.pad(dst).cloned();
         self.board.set(dst, a);
@@ -1879,7 +1879,9 @@ impl App {
                     .font(t::regular(11.0))
                     .color(t::REC),
             );
-            if ua.button("Réessayer").clicked() {
+            // Son réseau mis de côté par sécurité : seul « Remplacer le son » le rétablit.
+            let parked = self.board.network_pads.contains(&pad.path);
+            if !parked && ua.button("Réessayer").clicked() {
                 let p = pad.path.clone();
                 self.cache.reload(&p);
             }

@@ -283,8 +283,12 @@ fn backup_board(mut board: Board, from: &Path, to: &Path) {
         let _ = std::fs::create_dir_all(&dst);
         for e in rd.flatten() {
             let (a, b) = (e.path(), dst.join(e.file_name()));
+            // Déjà copié et pas modifié depuis (taille et date).
             let same = match (std::fs::metadata(&a), std::fs::metadata(&b)) {
-                (Ok(ma), Ok(mb)) => ma.len() == mb.len(),
+                (Ok(ma), Ok(mb)) => {
+                    ma.len() == mb.len()
+                        && matches!((ma.modified(), mb.modified()), (Ok(x), Ok(y)) if x <= y)
+                }
                 _ => false,
             };
             if a.is_file() && !same {
@@ -294,7 +298,11 @@ fn backup_board(mut board: Board, from: &Path, to: &Path) {
     }
     for page in &mut board.pages {
         for pad in page.pads.iter_mut().flatten() {
-            if let Ok(rel) = pad.path.strip_prefix(from) {
+            // Vers la copie seulement si le son y est bien (sinon l'original, plutôt
+            // qu'un pad muet).
+            if let Ok(rel) = pad.path.strip_prefix(from)
+                && to.join(rel).is_file()
+            {
                 pad.path = to.join(rel);
             }
         }
@@ -314,9 +322,20 @@ pub struct DiskSpace {
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
     {
-        use std::path::Component;
+        use std::path::{Component, Prefix};
+        // Formes longues (`\\?\C:`, `\\?\UNC\…`) ramenées aux formes courtes.
         let vol = |p: &Path| match p.components().next() {
-            Some(Component::Prefix(x)) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
+            Some(Component::Prefix(x)) => Some(match x.kind() {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                    format!("disque:{}", (d as char).to_ascii_lowercase())
+                }
+                Prefix::UNC(h, sh) | Prefix::VerbatimUNC(h, sh) => format!(
+                    "partage:{}\\{}",
+                    h.to_string_lossy().to_lowercase(),
+                    sh.to_string_lossy().to_lowercase()
+                ),
+                _ => x.as_os_str().to_string_lossy().to_lowercase(),
+            }),
             _ => None,
         };
         let (va, vb) = (vol(a), vol(b));
@@ -413,9 +432,9 @@ pub struct App {
     /// La prise en cours a été arrêtée parce que la carte son a disparu.
     pub lost_during_take: bool,
     /// Sauvegarde automatique en cours (thread).
-    pub autosave_job: Option<std::sync::mpsc::Receiver<anyhow::Result<()>>>,
+    pub autosave_job: Option<(PathBuf, std::sync::mpsc::Receiver<anyhow::Result<()>>)>,
     /// Réouverture de la carte en cours dans un thread.
-    pub reconnect_job: Option<std::sync::mpsc::Receiver<anyhow::Result<Engine>>>,
+    pub reconnect_job: Option<(f64, std::sync::mpsc::Receiver<anyhow::Result<Engine>>)>,
     /// Mesure de l'espace disque libre en cours (thread).
     pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<DiskSpace>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
@@ -504,6 +523,8 @@ pub struct App {
 pub struct Snapshot {
     tracks: Vec<project::Track>,
     markers: Vec<project::Marker>,
+    /// Compteur d'identifiants à cet instant (voir `project::merge_clips`).
+    next_id: u64,
 }
 
 impl App {
@@ -1156,6 +1177,8 @@ impl App {
         finished: Option<Result<Vec<RecResult>, FinishError>>,
         released: bool,
     ) {
+        // Lu dès le début : jamais reporté sur une prise suivante, quelle que soit l'issue.
+        let lost_card = std::mem::take(&mut self.lost_during_take);
         let results = match finished {
             Some(Ok(r)) => r,
             Some(Err(FinishError::Timeout)) => {
@@ -1315,7 +1338,7 @@ impl App {
             );
         }
         // Prise arrêtée parce que la carte son a disparu : c'est ce qu'il faut retenir.
-        if std::mem::take(&mut self.lost_during_take) {
+        if lost_card {
             self.notify(
                 format!(
                     "Carte son perdue pendant la prise : enregistrement arrêté, prise sauvegardée ({}). Reconnexion automatique de la carte…",
@@ -1353,11 +1376,18 @@ impl App {
         // (DVS arrêté, câble, horloge Dante perdue : plus aucun échantillon depuis 3 s),
         // la prise est arrêtée et enregistrée telle quelle — rien n'est perdu de ce qui a
         // été capté, et on ne continue pas à « enregistrer » du vide.
+        if !self.is_recording() {
+            self.rec_watch = (0, self.now);
+        }
         if self.is_recording() {
             let sh = &self.engine.shared;
             let input_lost = sh.device_lost.load(Ordering::Acquire) & LOST_INPUT != 0;
             let frames = sh.rec_frames.load(Ordering::Relaxed);
-            let stalled = frames == self.rec_watch.0 && self.now - self.rec_watch.1 > 3.0;
+            // Suivi ici aussi (et pas seulement dans l'affichage) : fonctionne fenêtre réduite.
+            if frames != self.rec_watch.0 {
+                self.rec_watch = (frames, self.now);
+            }
+            let stalled = self.now - self.rec_watch.1 > 3.0;
             if input_lost || stalled {
                 // Flux muet sans erreur du pilote (horloge Dante) : on le traite comme perdu
                 // pour le rouvrir ensuite.
@@ -1391,7 +1421,8 @@ impl App {
             return;
         }
         // Ouverture en cours dans un thread (Windows WASAPI, Linux) : on attend son résultat.
-        if let Some(rx) = &self.reconnect_job {
+        if let Some((since, rx)) = &self.reconnect_job {
+            let since = *since;
             match rx.try_recv() {
                 Ok(opened) => {
                     self.reconnect_job = None;
@@ -1400,6 +1431,11 @@ impl App {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.reconnect_job = None;
                     self.finish_reconnect(Err(anyhow::anyhow!("ouverture interrompue")), delay);
+                }
+                // Pilote qui ne répond pas : on abandonne cet essai et on en refait un.
+                Err(std::sync::mpsc::TryRecvError::Empty) if self.now - since > 15.0 => {
+                    self.reconnect_job = None;
+                    self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0)));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -1422,7 +1458,7 @@ impl App {
                 })
                 .is_ok()
             {
-                self.reconnect_job = Some(rx);
+                self.reconnect_job = Some((self.now, rx));
                 return;
             }
         }
@@ -1811,6 +1847,7 @@ impl App {
         self.undo.push(Snapshot {
             tracks: self.project.tracks.clone(),
             markers: self.project.markers.clone(),
+            next_id: self.project.next_id,
         });
         if self.undo.len() > 200 {
             self.undo.remove(0);
@@ -1834,9 +1871,10 @@ impl App {
         let cur = Snapshot {
             tracks: self.project.tracks.clone(),
             markers: std::mem::replace(&mut self.project.markers, snap.markers),
+            next_id: self.project.next_id,
         };
         let current = std::mem::take(&mut self.project.tracks);
-        self.project.tracks = project::merge_clips(current, snap.tracks);
+        self.project.tracks = project::merge_clips(current, snap.tracks, snap.next_id);
         let ids: HashSet<u64> = self
             .project
             .tracks
@@ -1978,6 +2016,7 @@ impl App {
     }
 
     pub fn autosave(&mut self) {
+        self.settle_autosave();
         if self.project.dirty
             && self.worth_saving()
             && let Err(e) = self.project.save()
@@ -2039,8 +2078,24 @@ impl App {
         )
     }
 
+    /// Sauvegarde automatique en cours : on attend qu'elle soit écrite (10 s au plus) ; si
+    /// elle a échoué ou traîne, la session redevient « à sauvegarder » (sauvegarde normale
+    /// juste après, par l'appelant).
+    fn settle_autosave(&mut self) {
+        if let Some((dir, rx)) = self.autosave_job.take() {
+            let ok = matches!(
+                rx.recv_timeout(std::time::Duration::from_secs(10)),
+                Ok(Ok(()))
+            );
+            if !ok && dir == self.project.dir {
+                self.project.dirty = true;
+            }
+        }
+    }
+
     /// Comme `save_before_leaving`, avec le message à afficher en cas d'échec.
     pub fn save_before(&mut self, refused: &str) -> bool {
+        self.settle_autosave();
         let mut ok = true;
         if self.project.dirty
             && self.worth_saving()
@@ -2063,6 +2118,19 @@ impl App {
         false
     }
 
+    /// Sons sur un partage réseau imposés par un fichier : marqués indisponibles sans être
+    /// ouverts (sécurité, voir `Board::load_session`).
+    fn park_network_pads(&mut self, paths: &[PathBuf]) {
+        for p in paths {
+            self.cache.map.insert(
+                p.clone(),
+                crate::soundboard::LoadState::Failed(
+                    "Son sur un partage réseau, hors de la session : remplacez-le (clic droit) pour le copier dans la session".into(),
+                ),
+            );
+        }
+    }
+
     /// Soundboard de la session qui vient d'être ouverte ou créée (les réglages du
     /// contrôleur restent ceux de l'ordinateur).
     fn load_session_board(&mut self) {
@@ -2082,14 +2150,7 @@ impl App {
         b.take_devices(&self.board);
         let network = b.network_pads.clone();
         if !network.is_empty() {
-            for p in &network {
-                self.cache.map.insert(
-                    p.clone(),
-                    crate::soundboard::LoadState::Failed(
-                        "Son sur un partage réseau, hors de la session : remplacez-le (clic droit) pour le copier dans la session".into(),
-                    ),
-                );
-            }
+            self.park_network_pads(&network);
             self.notify(
                 format!(
                     "{} son(s) du soundboard sur un partage réseau non ouvert(s) par sécurité : remplacez-les pour les copier dans la session",
@@ -2152,7 +2213,10 @@ impl App {
         };
         for page in &mut b.pages {
             for pad in page.pads.iter_mut().flatten() {
-                if pad.path.is_relative() {
+                // Fichier reçu d'ailleurs : jamais de partage réseau ouvert tout seul.
+                if crate::soundboard::is_network_path(&pad.path) {
+                    b.network_pads.push(pad.path.clone());
+                } else if pad.path.is_relative() {
                     pad.path = dir.join(&pad.path);
                 }
             }
@@ -2188,6 +2252,8 @@ impl App {
             }
         };
         b.take_devices(&self.board);
+        let network = b.network_pads.clone();
+        self.park_network_pads(&network);
         self.set_board(b);
         self.board_changed = Some(self.now);
         self.save_board_now();
@@ -2505,8 +2571,12 @@ impl App {
         }
         self.stop();
         // Choix explicite de l'utilisateur : une reconnexion automatique en cours s'efface.
+        // Si elle est en train d'ouvrir la carte, on attend qu'elle ait fini (et on jette
+        // son résultat) : jamais deux ouvertures du même périphérique en même temps.
         self.reconnect = None;
-        self.reconnect_job = None;
+        if let Some((_, rx)) = self.reconnect_job.take() {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
         self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
@@ -4732,6 +4802,7 @@ impl eframe::App for App {
             let _ = job.join();
         }
         self.poll_finishing(true);
+        self.settle_autosave();
         // Copie en cours (« Enregistrer sous », import) : on la laisse se terminer.
         for rx in [
             self.save_as_job.take().map(|r| {
@@ -4792,18 +4863,28 @@ impl App {
         {
             self.last_autosave = self.now;
             if self.autosave_job.is_none() {
-                self.autosave_job = Some(self.project.save_in_background());
+                let rx = self.project.save_in_background();
+                self.autosave_job = Some((self.project.dir.clone(), rx));
             }
         }
-        if let Some(rx) = &self.autosave_job {
+        if let Some((dir, rx)) = &self.autosave_job {
+            let same = *dir == self.project.dir;
             match rx.try_recv() {
                 Ok(r) => {
                     self.autosave_job = None;
-                    if let Err(e) = r {
+                    // (Une session quittée entre-temps a été réglée par `settle_autosave`.)
+                    if let Err(e) = r
+                        && same
+                    {
                         self.save_failed(e);
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.autosave_job = None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.autosave_job = None;
+                    if same {
+                        self.project.dirty = true;
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -5273,6 +5354,10 @@ mod tests {
             assert!(!super::same_volume(
                 Path::new(r"C:\Musique"),
                 Path::new(r"E:\Secours")
+            ));
+            assert!(super::same_volume(
+                Path::new(r"\\?\C:\Musique"),
+                Path::new(r"c:\Secours")
             ));
         }
     }

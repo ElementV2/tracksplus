@@ -464,9 +464,18 @@ impl SampleCache {
     pub fn set_sample_rate(&mut self, sr: u32) {
         if sr != self.sample_rate {
             self.sample_rate = sr;
+            // Sons réseau mis de côté par sécurité : restent indisponibles (jamais rouverts
+            // par un simple changement de fréquence).
+            let parked: Vec<_> = self
+                .map
+                .iter()
+                .filter(|(p, st)| is_network_path(p) && matches!(st, LoadState::Failed(_)))
+                .map(|(p, st)| (p.clone(), st_clone(st)))
+                .collect();
             let paths: Vec<_> = self.map.keys().cloned().collect();
             self.map.clear();
             self.pending.lock().clear();
+            self.map.extend(parked);
             for p in paths {
                 self.request(&p, None);
             }
@@ -777,6 +786,14 @@ fn resample_stereo(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     }
     out.truncate(expected * 2);
     Ok(out)
+}
+
+fn st_clone(st: &LoadState) -> LoadState {
+    match st {
+        LoadState::Failed(e) => LoadState::Failed(e.clone()),
+        LoadState::Loading => LoadState::Loading,
+        LoadState::Ready(s) => LoadState::Ready(s.clone()),
+    }
 }
 
 /// Chemin sur un partage réseau (`\\serveur\partage\…` ou `//serveur/…`).

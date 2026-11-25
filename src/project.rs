@@ -440,10 +440,21 @@ impl Project {
     /// Écriture atomique du fichier de session (fichier temporaire synchronisé puis
     /// renommage), une à la fois, et seulement si rien de plus récent n'a été écrit.
     fn write_file(&self, seq: u64) -> Result<()> {
-        static WRITTEN: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        // Un verrou par fichier : la sauvegarde du double de la session sur un second disque
+        // lent ou débranché ne bloque jamais celle de la session elle-même.
+        static LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<u64>>>>> = Mutex::new(None);
         let path = self.file_path();
-        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        if written.iter().any(|(p, s)| *p == path && *s > seq) {
+        let lock = {
+            let mut m = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            m.get_or_insert_with(HashMap::new)
+                .entry(path.clone())
+                .or_default()
+                .clone()
+        };
+        let mut last = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *last > seq {
             return Ok(());
         }
         self.ensure_dirs()?;
@@ -451,8 +462,7 @@ impl Project {
         let tmp = path.with_extension("tmp");
         write_synced(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, &path)?;
-        written.retain(|(p, _)| *p != path);
-        written.push((path, seq));
+        *last = seq;
         Ok(())
     }
 
@@ -647,7 +657,10 @@ impl Project {
 /// supprimées depuis. Les pistes créées depuis reviennent à leur état d'alors : sans
 /// prise (une piste d'enregistrement reste, réglages compris) ; une piste audio (import,
 /// glisser-déposer) n'existait pas, elle disparaît — annuler un import l'annule vraiment.
-pub fn merge_clips(mut current: Vec<Track>, snap: Vec<Track>) -> Vec<Track> {
+/// `snap_next_id` : compteur d'identifiants au moment de l'instantané. Une piste absente
+/// de l'instantané mais plus ancienne que lui y avait été supprimée : elle disparaît
+/// (Rétablir une suppression la refait vraiment).
+pub fn merge_clips(mut current: Vec<Track>, snap: Vec<Track>, snap_next_id: u64) -> Vec<Track> {
     let mut merged = Vec::with_capacity(current.len().max(snap.len()));
     for st in snap {
         match current.iter().position(|t| t.id == st.id) {
@@ -660,7 +673,7 @@ pub fn merge_clips(mut current: Vec<Track>, snap: Vec<Track>) -> Vec<Track> {
         }
     }
     for mut t in current {
-        if t.is_audio() {
+        if t.is_audio() || t.id < snap_next_id {
             continue;
         }
         t.clips.clear();
@@ -932,8 +945,9 @@ mod tests {
         p.split_at(4000, None, None);
         p.track_mut(t).unwrap().armed = false;
         p.track_mut(t).unwrap().input = Some(5);
+        let snap_next = p.next_id;
         let t2 = p.add_track(Some("Nouvelle".into()), Some(1));
-        let merged = merge_clips(p.tracks.clone(), snap);
+        let merged = merge_clips(p.tracks.clone(), snap, snap_next);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].clips.len(), 1, "montage annulé");
         assert_eq!(merged[0].input, Some(5), "configuration conservée");
@@ -1132,6 +1146,7 @@ mod tests {
         let mut p = Project::new("U".into(), std::env::temp_dir().join("tp-undo-imp"), 48000);
         p.add_track(Some("Voix".into()), Some(0));
         let snap = p.tracks.clone();
+        let snap_next = p.next_id;
         let rec = p.add_track(Some("Basse".into()), Some(1));
         let audio = p.add_audio_track("Musique".into(), true);
         let id = p.alloc_id();
@@ -1139,8 +1154,12 @@ mod tests {
             .unwrap()
             .clips
             .push(audio_clip(id, "m.wav"));
-        let merged = merge_clips(p.tracks.clone(), snap);
+        let merged = merge_clips(p.tracks.clone(), snap, snap_next);
         assert!(merged.iter().all(|t| t.id != audio));
+        // Rétablir la suppression d'une piste : elle disparaît vraiment (pas une piste vide).
+        let deleted_state: Vec<Track> = merged.iter().filter(|t| t.id != rec).cloned().collect();
+        let redone = merge_clips(merged.clone(), deleted_state, p.next_id);
+        assert!(redone.iter().all(|t| t.id != rec));
         let basse = merged.iter().find(|t| t.id == rec).unwrap();
         assert!(basse.clips.is_empty() && basse.input == Some(1));
     }
