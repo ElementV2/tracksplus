@@ -158,8 +158,10 @@ Chaque option a une bulle d'aide avec un exemple.
 - Le soundboard est enregistré automatiquement dans la session.
 - **Mode spectacle** (cadenas de la barre du soundboard) : les pads restent jouables, mais
   rien ne peut être supprimé, déplacé, remplacé ou réglé par erreur. Pas de mot de passe.
-- **Anti-rebond** : un second appui sur le même pad à moins de 150 ms (rebond d'un bouton
-  MIDI, double-clic) est ignoré.
+- **Anti-rebond** : sur les pads « Lecture-Stop », un second appui à moins de 150 ms (rebond
+  d'un bouton MIDI, double-clic) est ignoré ; réglable dans Réglages → Soundboard (0 =
+  désactivé).
+- Déplacer un pad qui joue ne le coupe pas.
 
 ### Contrôleur MIDI
 
@@ -274,6 +276,8 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
   erreur ou saturation du disque, disque presque plein, erreur du pilote, sauvegarde
   impossible.
 - **Décrochages** du pilote comptés pendant la prise ou la lecture et rappelés à l'arrêt.
+- **Retour d'écoute** : entrée mono au centre à -3 dB (comme une console), limiteur de
+  sécurité à -1 dBFS sur le mix d'écoute uniquement (les prises ne sont jamais touchées).
 - **Prises recalées** : la latence de la carte est compensée en enregistrant sur des pistes
   existantes.
 - **Stop immédiat**, sauvegarde aussitôt ; sauvegarde automatique du montage toutes les 30 s.
