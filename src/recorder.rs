@@ -18,7 +18,7 @@ use std::io::BufWriter;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -116,6 +116,9 @@ pub struct Recorder {
     handle: Option<JoinHandle<Vec<RecResult>>>,
     /// Copie de sécurité sur un second disque (son propre thread et ses propres tampons).
     backup: Option<Box<Recorder>>,
+    /// Recensement du thread d'écriture (arrêt d'urgence).
+    #[cfg_attr(not(test), allow(dead_code))]
+    slot: Arc<WriterSlot>,
 }
 
 struct SegWriter {
@@ -401,41 +404,52 @@ pub fn wait_backups(timeout: Duration) {
     }
 }
 
-/// Arrêt d'urgence demandé (fin de session Windows, erreur fatale de l'interface) : voir
-/// `emergency_finish`. Définitif : le processus se termine juste après.
+/// Arrêt d'urgence de tout le processus (fin de session Windows, erreur fatale de
+/// l'interface) : voir `emergency_finish`. Définitif : le processus se termine juste après,
+/// et une prise qui démarrerait encore s'arrêterait aussitôt.
 static EMERGENCY: AtomicBool = AtomicBool::new(false);
-/// Threads d'écriture encore en vie (prises et copies de sécurité).
-static WRITERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Compte un thread d'écriture tant qu'il vit (même s'il s'arrête sur une erreur).
-struct WriterAlive;
+/// Un thread d'écriture (prise ou copie de sécurité), recensé tant qu'il vit : l'arrêt
+/// d'urgence peut lui être demandé à lui seul (tests) ou à tous (`emergency_finish`).
+#[derive(Default)]
+struct WriterSlot {
+    /// Arrêt d'urgence demandé à ce thread.
+    emergency: AtomicBool,
+    /// Thread terminé (fichiers fermés), même s'il s'est arrêté sur une erreur.
+    done: AtomicBool,
+}
+
+impl WriterSlot {
+    fn emergency_requested(&self) -> bool {
+        EMERGENCY.load(Ordering::Acquire) || self.emergency.load(Ordering::Acquire)
+    }
+}
+
+/// Threads d'écriture encore en vie.
+static WRITERS: parking_lot::Mutex<Vec<Arc<WriterSlot>>> = parking_lot::Mutex::new(Vec::new());
+
+/// Recense un thread d'écriture tant qu'il vit (retiré même s'il s'arrête sur une erreur).
+struct WriterAlive(Arc<WriterSlot>);
 
 impl WriterAlive {
     fn new() -> Self {
-        WRITERS.fetch_add(1, Ordering::AcqRel);
-        Self
+        let slot = Arc::new(WriterSlot::default());
+        WRITERS.lock().push(slot.clone());
+        Self(slot)
     }
 }
 
 impl Drop for WriterAlive {
     fn drop(&mut self) {
-        WRITERS.fetch_sub(1, Ordering::AcqRel);
+        WRITERS.lock().retain(|s| !Arc::ptr_eq(s, &self.0));
+        self.0.done.store(true, Ordering::Release);
     }
 }
 
-/// Arrêt d'urgence, sans passer par l'interface (qui n'est peut-être plus là) : chaque
-/// thread d'écriture écrit ce qui est déjà arrivé dans ses tampons, ferme ses fichiers
-/// (en-têtes WAV à jour) et s'arrête, sans attendre la fin de la prise. Le journal de
-/// récupération reste en place : les prises sont réintégrées au prochain lancement.
-/// Attend au plus `timeout` ; `true` si tous les threads ont terminé. Sans prise en cours,
-/// rend la main tout de suite. Ne s'annule pas : à n'appeler qu'à la fin du processus.
-pub fn emergency_finish(timeout: Duration) -> bool {
-    if WRITERS.load(Ordering::Acquire) == 0 {
-        return true;
-    }
-    EMERGENCY.store(true, Ordering::Release);
+/// Attend que `finished` soit vrai, au plus `timeout`.
+fn wait_until(timeout: Duration, finished: impl Fn() -> bool) -> bool {
     let t0 = Instant::now();
-    while WRITERS.load(Ordering::Acquire) > 0 {
+    while !finished() {
         if t0.elapsed() > timeout {
             return false;
         }
@@ -444,8 +458,36 @@ pub fn emergency_finish(timeout: Duration) -> bool {
     true
 }
 
+/// Arrêt d'urgence, sans passer par l'interface (qui n'est peut-être plus là) : chaque
+/// thread d'écriture écrit tout ce qui est déjà arrivé dans ses tampons, ferme ses fichiers
+/// (en-têtes WAV à jour) et s'arrête, sans attendre la fin de la prise. Le journal de
+/// récupération reste en place : les prises sont réintégrées au prochain lancement.
+/// Attend au plus `timeout` ; `true` si tous les threads ont terminé (copies de sécurité
+/// comprises). Sans prise en cours, rend la main tout de suite. Ne s'annule pas : à
+/// n'appeler qu'à la fin du processus.
+pub fn emergency_finish(timeout: Duration) -> bool {
+    if WRITERS.lock().is_empty() {
+        return true;
+    }
+    EMERGENCY.store(true, Ordering::Release);
+    wait_until(timeout, || WRITERS.lock().is_empty())
+}
+
+/// Arrêt d'urgence de quelques threads seulement (tests : les autres tests du module, qui
+/// tournent en parallèle, ne sont pas touchés). Même déroulement que `emergency_finish`.
+#[cfg(test)]
+fn emergency_finish_slots(slots: &[Arc<WriterSlot>], timeout: Duration) -> bool {
+    for s in slots {
+        s.emergency.store(true, Ordering::Release);
+    }
+    wait_until(timeout, || {
+        slots.iter().all(|s| s.done.load(Ordering::Acquire))
+    })
+}
+
 /// Fin de la boucle d'écriture : à l'arrêt, quand plus rien n'arrive (ou que rien n'a
-/// avancé depuis `STALL_TIMEOUT`) ; en urgence, dès que ce qui était arrivé est écrit.
+/// avancé depuis `STALL_TIMEOUT`) ; en urgence, dès que ce qui était arrivé est écrit
+/// (`emergency` : la dernière passe, faite après la demande, est terminée).
 fn writer_should_exit(stop: bool, emergency: bool, drained: bool, stalled: bool) -> bool {
     emergency || (stop && (drained || stalled))
 }
@@ -555,9 +597,11 @@ impl Recorder {
         let errors2 = errors.clone();
         // Compté avant le départ du thread : un arrêt d'urgence juste après l'attend aussi.
         let alive = WriterAlive::new();
+        let slot = alive.0.clone();
         let handle = std::thread::Builder::new()
             .name("tracksplus-disk-writer".into())
             .spawn(move || {
+                let slot = alive.0.clone();
                 let _alive = alive;
                 raise_disk_thread_priority();
                 let move_aside = backup_dir.is_some();
@@ -573,6 +617,7 @@ impl Recorder {
                     errors2,
                     move_aside,
                     clock,
+                    &slot,
                 )
             })?;
         Ok(Self {
@@ -580,7 +625,18 @@ impl Recorder {
             errors,
             handle: Some(handle),
             backup: None,
+            slot,
         })
+    }
+
+    /// Threads d'écriture de la prise (principal, puis copie de sécurité).
+    #[cfg(test)]
+    fn writer_slots(&self) -> Vec<Arc<WriterSlot>> {
+        let mut v = vec![self.slot.clone()];
+        if let Some(b) = &self.backup {
+            v.extend(b.writer_slots());
+        }
+        v
     }
 
     /// Copie de sécurité en cours.
@@ -691,6 +747,7 @@ fn run(
     errors: Errors,
     move_aside: bool,
     (take_time, time_ref): (chrono::NaiveDateTime, u64),
+    slot: &WriterSlot,
 ) -> Vec<RecResult> {
     let mut lanes: Vec<Lane> = specs
         .into_iter()
@@ -741,6 +798,9 @@ fn run(
     let mut last_sync = Instant::now();
     let mut last_progress = Instant::now();
     let mut peaks_tmp = Vec::with_capacity(1024);
+    // Arrêt d'urgence vu : encore une passe complète, pour écrire tout ce qui était arrivé
+    // dans les tampons au moment de la demande, puis fin.
+    let mut last_pass = false;
     loop {
         let mut worked = false;
         for lane in &mut lanes {
@@ -838,7 +898,11 @@ fn run(
             }
         }
 
-        let emergency = EMERGENCY.load(Ordering::Acquire);
+        if !last_pass && slot.emergency_requested() {
+            last_pass = true;
+            continue;
+        }
+        let emergency = last_pass;
         let stopping = stop.load(Ordering::Acquire);
         if stopping || emergency {
             let drained = lanes
@@ -1370,6 +1434,66 @@ mod tests {
                 assert!(aside, "ancien fichier gardé de côté");
             }
         }
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    /// Fin d'urgence pendant une prise (entrée toujours branchée, rien n'est arrêté) : tout
+    /// ce qui était arrivé est écrit, les fichiers principal et de copie sont lisibles avec
+    /// des en-têtes à jour, et plus aucun thread d'écriture de la prise n'est recensé.
+    #[test]
+    fn emergency_finish_leaves_readable_takes() {
+        let base = std::env::temp_dir().join(format!("tp-urgence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (main, copy) = (base.join("main"), base.join("copie/Audio"));
+        std::fs::create_dir_all(&main).unwrap();
+        let (mut prod, cons) = rtrb::RingBuffer::new(200_000);
+        let (mut cprod, ccons) = rtrb::RingBuffer::new(200_000);
+        let rec = Recorder::start_with_backup(
+            vec![RecSpec {
+                track_id: 1,
+                file: "u.wav".into(),
+                path: main.join("u.wav"),
+                peaks: Arc::new(RwLock::new(PeakData::default())),
+                cons,
+                channels: 2,
+            }],
+            48000,
+            RecFormat::Int24,
+            Some((copy.clone(), vec![ccons])),
+        )
+        .unwrap();
+        let slots = rec.writer_slots();
+        assert_eq!(slots.len(), 2, "prise et copie de sécurité recensées");
+        assert!(
+            slots
+                .iter()
+                .all(|s| WRITERS.lock().iter().any(|w| Arc::ptr_eq(w, s)))
+        );
+        let frames = 40_000;
+        for i in 0..2 * frames {
+            let v = ((i % 89) as f32 - 44.0) / 100.0;
+            prod.push(v).unwrap();
+            cprod.push(v).unwrap();
+        }
+        // Producteurs gardés : la prise est toujours « en cours » côté audio.
+        assert!(emergency_finish_slots(&slots, Duration::from_secs(10)));
+        assert!(
+            slots
+                .iter()
+                .all(|s| !WRITERS.lock().iter().any(|w| Arc::ptr_eq(w, s))),
+            "threads retirés du recensement"
+        );
+        for path in [main.join("u.wav"), copy.join("u.wav")] {
+            let r = hound::WavReader::open(&path).unwrap();
+            assert_eq!(r.duration(), frames as u32, "{}", path.display());
+            assert_eq!(r.spec().channels, 2);
+            assert_eq!(r.spec().bits_per_sample, 24);
+            assert_eq!(r.into_samples::<i32>().count(), 2 * frames);
+        }
+        // Le thread est déjà fini : la fin normale rend la main tout de suite.
+        let res = rec.finish().unwrap();
+        assert_eq!(res[0].frames(), frames as u64);
+        drop((prod, cprod));
         std::fs::remove_dir_all(base).ok();
     }
 

@@ -501,6 +501,8 @@ pub struct App {
     pub rec_watch: (u64, f64),
     /// Dernière sauvegarde automatique.
     pub last_autosave: f64,
+    /// Dernière préparation des sauvegardes de fin de session (`None` : aucune en place).
+    pending_saves_at: Option<f64>,
     /// Empêche la mise en veille de l'ordinateur pendant un enregistrement.
     pub awake: Option<keepawake::KeepAwake>,
     // Soundboard
@@ -645,6 +647,7 @@ impl App {
             update_install: false,
             rec_watch: (0, 0.0),
             last_autosave: 0.0,
+            pending_saves_at: None,
             awake: None,
             board,
             board_changed: None,
@@ -678,19 +681,15 @@ impl App {
         // Relance automatique après une erreur fatale : on revient dans la même session,
         // même si aucune prise n'était en cours.
         let relaunched = crate::shutdown::relaunched();
-        let reopen = recovery::interrupted_session().or_else(|| {
+        let interrupted = recovery::interrupted_session();
+        let take_interrupted = interrupted.is_some();
+        let reopen = interrupted.or_else(|| {
             if relaunched {
                 recovery::last_session()
             } else {
                 None
             }
         });
-        if relaunched {
-            app.notify(
-                "TracksPlus a redémarré tout seul après une erreur interne (détails dans crash.log) : vérifiez la session et relancez l'enregistrement si besoin",
-                true,
-            );
-        }
         // Enregistrement interrompu lors de la dernière utilisation : on restaure.
         if let Some(path) = reopen {
             // Protégé : une session illisible ne doit pas empêcher l'application de démarrer
@@ -713,6 +712,12 @@ impl App {
             // reprendre, créer, ouvrir ou choisir une session.
             app.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&cc.egui_ctx));
             app.start_screen = true;
+        }
+        if relaunched {
+            // Après l'ouverture de la session (qui pose son propre message) : l'alerte reste
+            // affichée jusqu'au clic et reprend le message de l'ouverture, rien n'est perdu.
+            let opened = app.toast.take().map(|t| t.text);
+            app.notify(relaunch_message(take_interrupted, opened.as_deref()), true);
         }
         if let Some(e) = err {
             let mut d = SettingsDialog::new(&app.prefs);
@@ -1163,15 +1168,15 @@ impl App {
         self.backup_session_job(Some(j.clone()), false);
     }
 
-    /// Fin de prise terminée en arrière-plan : on intègre les prises. `wait` : attendre
-    /// (fermeture de l'application).
-    fn poll_finishing(&mut self, wait: bool) {
+    /// Fin de prise terminée en arrière-plan : on intègre les prises. `wait` : attendre au
+    /// plus ce délai (fermeture de l'application) ; au-delà, récupération par le journal.
+    fn poll_finishing(&mut self, wait: Option<std::time::Duration>) {
         let Some(f) = &self.finishing else {
             return;
         };
         use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
-        let res = if wait {
-            match f.rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        let res = if let Some(wait) = wait {
+            match f.rx.recv_timeout(wait) {
                 Ok(r) => r,
                 Err(RecvTimeoutError::Timeout) => Err(FinishError::Timeout),
                 Err(RecvTimeoutError::Disconnected) => Err(FinishError::Panicked),
@@ -2082,6 +2087,10 @@ impl App {
             self.board_changed = Some(self.now + 29.0);
             return false;
         }
+        // Sauvegarde préparée pour la fin de session : plus ancienne, elle ne doit pas
+        // remplacer celle-ci (refaite au prochain passage s'il y a encore à sauvegarder).
+        crate::shutdown::set_pending_board_save(None);
+        self.pending_saves_at = None;
         true
     }
 
@@ -2099,11 +2108,13 @@ impl App {
     /// elle a échoué ou traîne, la session redevient « à sauvegarder » (sauvegarde normale
     /// juste après, par l'appelant).
     fn settle_autosave(&mut self) {
+        self.settle_autosave_within(std::time::Duration::from_secs(10));
+    }
+
+    /// Comme `settle_autosave`, en attendant au plus `timeout`.
+    fn settle_autosave_within(&mut self, timeout: std::time::Duration) {
         if let Some((dir, rx)) = self.autosave_job.take() {
-            let ok = matches!(
-                rx.recv_timeout(std::time::Duration::from_secs(10)),
-                Ok(Ok(()))
-            );
+            let ok = matches!(rx.recv_timeout(timeout), Ok(Ok(())));
             if !ok && dir == self.project.dir {
                 self.project.dirty = true;
             }
@@ -4769,7 +4780,7 @@ impl eframe::App for App {
             }
             self.update_playhead();
             self.complete_journal();
-            self.poll_finishing(false);
+            self.poll_finishing(None);
             self.poll_save_as();
             self.poll_play_errors();
             self.watch_device();
@@ -4826,7 +4837,7 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // Fermeture voulue : pas de relance automatique, même si eframe plante ensuite.
         crate::shutdown::mark_exit_requested();
-        self.shutdown();
+        self.shutdown(ShutdownPace::Normal);
     }
 }
 
@@ -4835,9 +4846,81 @@ impl Drop for App {
     /// d'eframe qui remonte jusqu'à `main`, fin anormale de la boucle d'événements),
     /// l'application est détruite pendant la remontée de l'erreur : c'est la dernière
     /// occasion d'arrêter la prise, de finaliser ses fichiers et de sauvegarder la session.
+    /// Au plus vite dans ce cas : la relance automatique attend la fin de cette fermeture.
     fn drop(&mut self) {
-        self.shutdown();
+        let pace = if crate::shutdown::exit_requested() {
+            ShutdownPace::Normal
+        } else {
+            ShutdownPace::Hurry
+        };
+        self.shutdown(pace);
     }
+}
+
+/// Rythme de la fermeture propre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownPace {
+    /// Fermeture voulue : les copies en cours (« Enregistrer sous », import) se terminent.
+    Normal,
+    /// Après une erreur fatale (relance en attente) ou à la fin de session Windows (le
+    /// processus va être tué) : prises finalisées et session sauvegardée, le reste est
+    /// abandonné comme à une fermeture brutale, avec des délais courts.
+    Hurry,
+}
+
+/// Délais d'attente de la fermeture propre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShutdownWaits {
+    /// Fin de la prise (intégration à la session) ; au-delà, récupération par le journal.
+    finishing: std::time::Duration,
+    /// Sauvegarde automatique déjà lancée.
+    autosave: std::time::Duration,
+    /// Copies « Enregistrer sous » et import (`None` : abandonnées).
+    copies: Option<std::time::Duration>,
+    /// Copies de sécurité sur le second disque.
+    backups: std::time::Duration,
+    /// Double de la session sur le second disque.
+    backup_session: std::time::Duration,
+}
+
+impl ShutdownPace {
+    fn waits(self) -> ShutdownWaits {
+        use std::time::Duration;
+        match self {
+            Self::Normal => ShutdownWaits {
+                finishing: Duration::from_secs(15),
+                autosave: Duration::from_secs(10),
+                copies: Some(Duration::from_secs(120)),
+                backups: Duration::from_secs(15),
+                backup_session: Duration::from_secs(10),
+            },
+            Self::Hurry => ShutdownWaits {
+                finishing: Duration::from_secs(5),
+                autosave: Duration::from_secs(2),
+                copies: None,
+                backups: Duration::from_secs(2),
+                backup_session: Duration::from_secs(1),
+            },
+        }
+    }
+}
+
+/// Message affiché après une relance automatique. `take_interrupted` : une prise était en
+/// cours (son journal est resté) ; `opened` : message de l'ouverture de la session.
+fn relaunch_message(take_interrupted: bool, opened: Option<&str>) -> String {
+    let mut m = String::from(
+        "TracksPlus a redémarré tout seul après une erreur interne (détails dans crash.log)",
+    );
+    m.push_str(if take_interrupted {
+        " : l'enregistrement s'est arrêté, ce qui était enregistré est conservé. Relancez l'enregistrement si besoin"
+    } else {
+        " : vérifiez la session et relancez l'enregistrement si besoin"
+    });
+    if let Some(o) = opened.filter(|o| !o.is_empty()) {
+        m.push_str(". ");
+        m.push_str(o);
+    }
+    m
 }
 
 /// Garde-fous du processus, à l'ouverture de la fenêtre : erreurs de la carte graphique
@@ -4895,9 +4978,9 @@ impl App {
         if crate::shutdown::session_ended() {
             // Windows ferme la session : les prises ont été finalisées en urgence. Si le
             // processus n'est pas encore tué, on termine proprement (prises réintégrées,
-            // session sauvegardée) et on ferme.
+            // session sauvegardée) et on ferme, au plus vite.
             crate::shutdown::mark_exit_requested();
-            self.shutdown();
+            self.shutdown(ShutdownPace::Hurry);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -4906,6 +4989,7 @@ impl App {
             // (la prise en cours, elle, est protégée par son journal).
             self.autosave();
         }
+        self.sync_pending_saves();
         if crate::shutdown::take_shutdown_refused() {
             self.notify(
                 "Windows a demandé l'arrêt de l'ordinateur pendant l'enregistrement : arrêt bloqué, la prise continue. Arrêtez la prise avant d'éteindre",
@@ -4920,21 +5004,67 @@ impl App {
         }
     }
 
+    /// Sauvegardes prêtes pour une fin de session Windows qui arriverait avant le prochain
+    /// passage de l'interface (voir `shutdown::set_pending_session_save`) : préparées tant
+    /// qu'il y a des modifications non sauvegardées (état figé au plus une fois par
+    /// seconde), retirées sinon.
+    fn sync_pending_saves(&mut self) {
+        let session = self.project.dirty && self.worth_saving();
+        let board = self.board_changed.is_some();
+        if !session && !board {
+            if self.pending_saves_at.is_some() {
+                self.pending_saves_at = None;
+                crate::shutdown::set_pending_session_save(None);
+                crate::shutdown::set_pending_board_save(None);
+            }
+            return;
+        }
+        if self
+            .pending_saves_at
+            .is_some_and(|t| self.now - t < PENDING_SAVES_EVERY)
+        {
+            return;
+        }
+        self.pending_saves_at = Some(self.now);
+        crate::shutdown::set_pending_session_save(session.then(|| {
+            // Rang de sauvegarde pris maintenant : n'écrase jamais une sauvegarde plus
+            // récente, faite entre-temps par l'interface.
+            let save = self.project.deferred_save();
+            Box::new(move || {
+                let _ = save();
+            }) as crate::shutdown::PendingWrite
+        }));
+        crate::shutdown::set_pending_board_save(board.then(|| {
+            let b = self.board.clone();
+            let dir = self.project.dir.clone();
+            let session_file = self.project.file_path();
+            Box::new(move || {
+                let _ = b.save_devices();
+                // (Comme `save_board_now` : les pads vont dans une session déjà sur le disque.)
+                if session_file.exists() {
+                    let _ = b.save_session(&dir);
+                }
+            }) as crate::shutdown::PendingWrite
+        }));
+    }
+
     /// Fermeture propre, une seule fois (`on_exit`, ou destruction de l'application après
     /// une erreur fatale). Protégée : si elle échoue en route, les prises encore en
     /// écriture sont au moins finalisées (le journal permet de les réintégrer ensuite).
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, pace: ShutdownPace) {
         if !crate::shutdown::begin_shutdown() {
             return;
         }
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown_steps()));
+        let waits = pace.waits();
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown_steps(waits)));
         if res.is_err() {
             crate::recorder::emergency_finish(std::time::Duration::from_secs(10));
-            crate::recorder::wait_backups(std::time::Duration::from_secs(10));
+            crate::recorder::wait_backups(waits.backups);
         }
     }
 
-    fn shutdown_steps(&mut self) {
+    fn shutdown_steps(&mut self, waits: ShutdownWaits) {
         self.midi.leds_off(self.board.led_mode);
         self.stop();
         self.finish_export_for_exit();
@@ -4943,39 +5073,43 @@ impl App {
             job.cancel.store(true, Ordering::Relaxed);
             let _ = job.join();
         }
-        self.poll_finishing(true);
-        self.settle_autosave();
-        // Copie en cours (« Enregistrer sous », import) : on la laisse se terminer.
-        for rx in [
+        self.poll_finishing(Some(waits.finishing));
+        self.settle_autosave_within(waits.autosave);
+        // Copie en cours (« Enregistrer sous », import) : on la laisse se terminer, sauf au
+        // plus vite (abandonnée, comme à une fermeture brutale).
+        let copies = [
             self.save_as_job.take().map(|r| {
-                Box::new(move || r.recv_timeout(std::time::Duration::from_secs(120)).is_ok())
-                    as Box<dyn FnOnce() -> bool>
+                Box::new(move |t| r.recv_timeout(t).is_ok())
+                    as Box<dyn FnOnce(std::time::Duration) -> bool>
             }),
             self.import_job.take().map(|r| {
-                Box::new(move || r.recv_timeout(std::time::Duration::from_secs(120)).is_ok())
-                    as Box<dyn FnOnce() -> bool>
+                Box::new(move |t| r.recv_timeout(t).is_ok())
+                    as Box<dyn FnOnce(std::time::Duration) -> bool>
             }),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let _ = rx();
+        ];
+        if let Some(t) = waits.copies {
+            for rx in copies.into_iter().flatten() {
+                let _ = rx(t);
+            }
         }
         self.autosave();
         self.board_changed = Some(0.0);
         self.save_board_now();
         // Copie de sécurité : fichiers des prises et double de la session finis d'écrire
         // sur le second disque (borné : un disque mort ne bloque pas la fermeture).
-        crate::recorder::wait_backups(std::time::Duration::from_secs(15));
+        crate::recorder::wait_backups(waits.backups);
         self.backup_jobs = None;
         if let Some(h) = self.backup_thread.take() {
             let t0 = std::time::Instant::now();
-            while !h.is_finished() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            while !h.is_finished() && t0.elapsed() < waits.backup_session {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
     }
 }
+
+/// Fréquence maximale de préparation des sauvegardes de fin de session (`sync_pending_saves`).
+const PENDING_SAVES_EVERY: f64 = 1.0;
 
 impl App {
     fn frame(&mut self, ui: &mut egui::Ui) {
@@ -5524,5 +5658,32 @@ mod tests {
         assert_eq!(fmt_duration(3725), "1 h 02");
         assert_eq!(fmt_time_short(48000 * 3725, 48000), "1:02:05");
         assert_eq!(short("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn relaunch_message_keeps_the_session_message() {
+        // Le message de l'ouverture de la session n'efface pas l'alerte : les deux restent.
+        let m = relaunch_message(
+            true,
+            Some("Enregistrement interrompu récupéré : 3 prise(s)"),
+        );
+        assert!(m.starts_with("TracksPlus a redémarré tout seul"));
+        assert!(m.contains("l'enregistrement s'est arrêté"));
+        assert!(m.ends_with("Enregistrement interrompu récupéré : 3 prise(s)"));
+        let m = relaunch_message(false, None);
+        assert!(m.contains("relancez l'enregistrement si besoin"));
+        assert!(!m.ends_with(". "));
+        assert_eq!(relaunch_message(false, Some("")), m);
+    }
+
+    #[test]
+    fn hurried_shutdown_abandons_copies_and_waits_less() {
+        let (n, h) = (ShutdownPace::Normal.waits(), ShutdownPace::Hurry.waits());
+        assert!(n.copies.is_some() && h.copies.is_none());
+        assert!(h.finishing < n.finishing && h.autosave < n.autosave);
+        assert!(h.backups < n.backups && h.backup_session < n.backup_session);
+        // Au plus vite : la relance n'attend pas plus de quelques secondes.
+        let total = h.finishing + h.autosave + h.backups + h.backup_session;
+        assert!(total <= std::time::Duration::from_secs(10));
     }
 }

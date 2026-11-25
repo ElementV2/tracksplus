@@ -176,9 +176,13 @@ fn install_crash_log() {
 }
 
 /// Délais d'attente des prises encore en écriture à la fin du processus : court après une
-/// fermeture normale (tout est déjà fini, sauf disque bloqué), plus long après une erreur.
+/// fermeture normale (tout est déjà fini, sauf disque bloqué), plus long après une erreur
+/// (les prises passent avant la relance).
 const END_WRITERS_NORMAL: std::time::Duration = std::time::Duration::from_secs(2);
 const END_WRITERS_CRASH: std::time::Duration = std::time::Duration::from_secs(10);
+/// Copies de sécurité après une erreur : déjà terminées avec les prises (leurs threads
+/// d'écriture sont attendus ci-dessus) ; un second disque mort ne retarde pas la relance.
+const END_BACKUPS_CRASH: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> eframe::Result {
     install_crash_log();
@@ -212,26 +216,23 @@ fn main() -> eframe::Result {
     }));
     // Prise encore en écriture (fermeture interrompue, disque lent) : ses tampons sont
     // écrits et ses fichiers fermés avant que le processus disparaisse.
-    let wait = if res.is_ok() {
-        END_WRITERS_NORMAL
+    let (writers, backups) = if res.is_ok() {
+        (END_WRITERS_NORMAL, END_WRITERS_NORMAL)
     } else {
-        END_WRITERS_CRASH
+        (END_WRITERS_CRASH, END_BACKUPS_CRASH)
     };
-    recorder::emergency_finish(wait);
-    recorder::wait_backups(wait);
+    recorder::emergency_finish(writers);
+    recorder::wait_backups(backups);
     match res {
         Ok(r) => r,
         Err(_) => {
             // En plein spectacle, l'application revient d'elle-même dans sa session (les
             // prises interrompues sont réintégrées au démarrage).
-            if shutdown::should_relaunch(
-                started.elapsed(),
-                shutdown::relaunch_count(),
-                shutdown::exit_requested(),
-            ) {
+            let end = shutdown::EndContext::now(started.elapsed());
+            if end.should_relaunch() {
                 // Verrou d'instance unique libéré avant : sinon la relance se croirait en double.
                 drop(instance);
-                if let Err(e) = shutdown::relaunch() {
+                if let Err(e) = shutdown::relaunch(&end) {
                     log_error("relaunch", &format!("Relance automatique impossible : {e}"));
                 }
             }
