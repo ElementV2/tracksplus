@@ -2016,7 +2016,11 @@ impl App {
                 // reste affichée jusqu'à son intégration à la session.
                 let live_span = match self.transport {
                     Transport::Recording { start } => Some((start, None)),
-                    _ => self.finishing.as_ref().map(|f| (f.start, Some(()))),
+                    _ => self
+                        .finishing
+                        .as_ref()
+                        .filter(|f| f.dir() == self.project.dir)
+                        .map(|f| (f.start, Some(()))),
                 };
                 if let Some((start, finishing)) = live_span
                     && let Some(l) = self.live.iter().find(|l| l.track_id == track.id)

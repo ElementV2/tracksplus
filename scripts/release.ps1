@@ -49,10 +49,13 @@ foreach ($f in $setup, $zip) { if (-not (Test-Path $f)) { throw "Fichier manquan
 
 Write-Host "== Signature de l'éditeur"
 $sigs = foreach ($f in $setup, $zip) {
-    cargo run -q --release --example sign_release -- sign $key $f $version
+    # Sortie de l'outil affichée, jamais ajoutée à la liste des fichiers à publier.
+    cargo run -q --release --example sign_release -- sign $key $f $version | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Signature impossible : $f" }
+    if (-not (Test-Path "$f.sig")) { throw "Signature absente : $f.sig" }
     "$f.sig"
 }
+$sigs = @($sigs | Select-Object -Unique)
 
 Write-Host "== Création de la release $tag"
 gh release create $tag $setup $zip @sigs --target (git rev-parse HEAD) --title "TracksPlus $version" --notes-file $Notes

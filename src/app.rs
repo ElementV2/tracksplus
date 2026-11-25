@@ -190,6 +190,13 @@ pub struct Finishing {
     slow_told: bool,
 }
 
+impl Finishing {
+    /// Dossier de la session de la prise.
+    pub fn dir(&self) -> &Path {
+        &self.take.dir
+    }
+}
+
 /// Prise arrêtée, en attente d'intégration à la session : tout ce dont l'intégration a
 /// besoin est figé au Stop (une autre prise peut avoir commencé entre-temps).
 struct TakeEnd {
@@ -779,6 +786,9 @@ enum ResumeStep {
     Cancel,
     /// La carte n'est pas revenue à temps : abandonnée, avec un message.
     Expire,
+    /// Le disque ne répond plus depuis plusieurs prises (`record` refuserait) : abandonnée,
+    /// avec un message.
+    Blocked,
     /// Attendre (prise précédente en finalisation, entrée pas encore revenue…).
     Wait,
     /// Entrée revenue : noter son battement de cœur, relancer dès qu'il avance.
@@ -805,8 +815,11 @@ struct ResumeCtx {
 }
 
 fn resume_step(c: &ResumeCtx) -> ResumeStep {
-    if !c.same_session || !c.enabled || c.disk_stalled || !c.transport_stopped {
+    if !c.same_session || !c.enabled || !c.transport_stopped {
         return ResumeStep::Cancel;
+    }
+    if c.disk_stalled {
+        return ResumeStep::Blocked;
     }
     if c.age > RESUME_MAX {
         return ResumeStep::Expire;
@@ -1072,8 +1085,13 @@ pub struct App {
     last_reopen: Option<(f64, f64)>,
     /// La prise en cours a été coupée par un trou de l'entrée plus long que les tampons.
     take_split: bool,
-    /// Silence inséré dans la prise en cours déjà repéré (trames, voir `watch_take`).
+    /// Silence inséré dans la prise en cours déjà repéré (trames, voir `watch_take`), et
+    /// nombre de trous déjà repérés.
     gap_seen: u64,
+    gap_count_seen: u64,
+    /// Prises abandonnées à la fermeture, disque bloqué (session, journal) : gardées dans
+    /// le journal de leur session jusqu'à la prochaine ouverture.
+    given_up: Vec<(PathBuf, recovery::Journal)>,
     /// Interruption du signal d'entrée en cours déjà notée dans le journal des incidents.
     stall_logged: bool,
     /// Chien de garde des flux (`audio::SLOT_*`) : dernier battement de cœur vu et instant
@@ -1315,6 +1333,8 @@ impl App {
             last_reopen: None,
             take_split: false,
             gap_seen: 0,
+            gap_count_seen: 0,
+            given_up: Vec::new(),
             stall_logged: false,
             hb: [(0, 0.0); audio::SLOTS],
             hb_tick: 0.0,
@@ -1443,6 +1463,10 @@ impl App {
                 .chain(prefs_notice),
         );
         if !launch_warnings.is_empty() {
+            // Le message de l'ouverture (prises récupérées…) est gardé en tête.
+            if !relaunched && let Some(t) = app.take_toast_text() {
+                launch_warnings.insert(0, t);
+            }
             app.notify(launch_warnings.join(" · "), true);
         }
         if let Some(e) = err {
@@ -1462,7 +1486,8 @@ impl App {
     /// Note un événement dans le journal des incidents de la session ouverte (dossier des
     /// réglages tant qu'aucune session n'est ouverte). Ne bloque jamais.
     pub fn incident(&self, text: impl AsRef<str>) {
-        let dir = if self.start_screen {
+        // Session protégée (lecture seule) : rien n'est écrit dans son dossier.
+        let dir = if self.start_screen || self.project.read_only.is_some() {
             match dirs::config_dir() {
                 Some(d) => d.join("TracksPlus"),
                 None => return,
@@ -1503,7 +1528,7 @@ impl App {
         let text = text.into();
         // État de la carte, prise interrompue, coupée ou relancée : aussi dans le journal
         // des incidents de la session (le message à l'écran finit par partir).
-        if level >= Level::Device {
+        if matches!(level, Level::Device | Level::Critical) {
             self.incident(text.clone());
         }
         // Une erreur pas encore lue n'est jamais effacée par un nouveau message (ex. « prise
@@ -1564,6 +1589,12 @@ impl App {
 
     pub fn is_stopped(&self) -> bool {
         self.transport == Transport::Stopped && self.finishing.is_none()
+    }
+
+    /// Prise en cours, ou dont l'écriture n'est pas finie (fin de prise, prises bloquées
+    /// sur un disque lent) : rien ne doit l'interrompre (arrêt de Windows, fermeture…).
+    pub fn take_in_progress(&self) -> bool {
+        self.is_recording() || self.finishing.is_some() || !self.stalled_takes.is_empty()
     }
 
     pub fn is_recording(&self) -> bool {
@@ -1871,7 +1902,12 @@ impl App {
         if let Err(e) = self.engine.start_record(targets) {
             self.engine.stop_playback();
             self.player = None;
-            self.live.clear();
+            // Prise précédente toujours en fin d'écriture : sa forme d'onde reste affichée.
+            self.live = self
+                .finishing
+                .as_ref()
+                .map(|f| f.take.live.clone())
+                .unwrap_or_default();
             self.rec_overdub = false;
             self.rec_latency = 0;
             self.notify(format!("{e:#}"), true);
@@ -1913,41 +1949,26 @@ impl App {
         // écrivent encore (leur disque ne répond plus) : rien n'est alors lu ni réparé ici,
         // ses prises sont reportées dans le nouveau journal.
         let mut carried = Vec::new();
-        match old_journal {
-            Some(text) if !inflight.is_empty() => {
-                match serde_json::from_str::<recovery::Journal>(&text) {
-                    Ok(j) => carried = j.pending_groups(&inflight),
-                    Err(e) => self.notify(
-                        format!(
-                            "Journal de la prise précédente illisible ({e}) : ses fichiers restent dans Audio/"
-                        ),
-                        true,
-                    ),
-                }
-            }
-            Some(_) => match recovery::recover(&mut self.project) {
-                Ok(r) => {
-                    if r.takes > 0 {
-                        self.load_peaks();
-                    }
-                    if let Err(e) = r.saved {
-                        self.notify(
-                            format!(
-                                "{} prise(s) précédente(s) récupérée(s), session pas encore sauvegardée ({e:#}) : nouvel essai automatique",
-                                r.takes
-                            ),
-                            true,
-                        );
+        // Journal d'une prise précédente non intégrée, sans prise en cours d'écriture : ses
+        // prises sont intégrées plus bas, une fois l'écriture de la nouvelle prise lancée
+        // (jamais de réparation ni de sauvegarde avant : les tampons de capture n'attendent
+        // pas). D'ici là, elles sont portées par le nouveau journal.
+        let mut late = None;
+        if let Some(text) = old_journal {
+            match serde_json::from_str::<recovery::Journal>(&text) {
+                Ok(j) => {
+                    carried = j.pending_groups(&inflight);
+                    if inflight.is_empty() {
+                        late = Some(j);
                     }
                 }
                 Err(e) => self.notify(
                     format!(
-                        "Journal de la prise précédente illisible ({e:#}) : ses fichiers restent dans Audio/"
+                        "Journal de la prise précédente illisible ({e}) : ses fichiers restent dans Audio/"
                     ),
                     true,
                 ),
-            },
-            None => {}
+            }
         }
         let mut used = HashSet::new();
         let mut specs = Vec::new();
@@ -2004,6 +2025,20 @@ impl App {
                 "Prise précédente pas encore entièrement écrite (disque lent) : elle sera ajoutée à la session dès que son écriture se termine, et reste récupérable en cas de coupure",
                 true,
             );
+        }
+        // Prises précédentes restées dans l'ancien journal : intégrées maintenant que la
+        // capture a son thread d'écriture (sauvegarde en arrière-plan juste après).
+        if let Some(j) = late {
+            let (n, cleanup) = recovery::apply_journal(&mut self.project, &j, &[]);
+            if n > 0 {
+                self.load_peaks();
+                self.notify(
+                    format!("{n} prise(s) précédente(s) récupérée(s) depuis le disque"),
+                    false,
+                );
+            }
+            let dir = self.project.dir.clone();
+            self.stash_stale_files(&dir, cleanup);
         }
         // 5) Session et « dernière session » (récupération au lancement) écrites en
         //    arrière-plan : jamais d'écriture forcée sur le disque avant la capture.
@@ -2067,6 +2102,7 @@ impl App {
         // préparation lente ne doit pas faire croire à une carte perdue).
         self.rec_watch = (0, self.now + t0.elapsed().as_secs_f64());
         self.gap_seen = 0;
+        self.gap_count_seen = 0;
         self.stall_logged = false;
         self.incident(format!(
             "Prise lancée à {} ({} piste(s))",
@@ -2185,13 +2221,22 @@ impl App {
     /// Journaux des prises de cette session encore en cours d'écriture (prises restées
     /// bloquées, fin de prise en cours), sans les prises en attente qu'ils portent.
     fn inflight_journals(&self) -> Vec<recovery::Journal> {
-        journals_of(
+        let mut v = journals_of(
             self.stalled_takes
                 .iter()
                 .chain(self.finishing.as_ref())
                 .map(|f| &f.take),
             &self.project.dir,
-        )
+        );
+        // Prises abandonnées à la fermeture (disque qui ne répond plus) : toujours à
+        // récupérer à la prochaine ouverture, jamais retirées du journal.
+        v.extend(
+            self.given_up
+                .iter()
+                .filter(|(d, _)| *d == self.project.dir)
+                .map(|(_, j)| j.clone()),
+        );
+        v
     }
 
     /// Prise intégrée et session sauvegardée (aucune prise en cours ni en fin d'écriture
@@ -2407,7 +2452,7 @@ impl App {
     /// (fermeture de l'application), au plus (sans progrès, en tout) ; le résultat n'est
     /// jamais jeté, même très tardif.
     fn poll_finishing(&mut self, wait: Option<(std::time::Duration, std::time::Duration)>) {
-        render::set_recording(self.is_recording() || self.finishing.is_some());
+        render::set_recording(self.take_in_progress());
         self.poll_rec_save();
         self.poll_backups();
         // Prise la plus récente d'abord (son journal porte celles restées bloquées).
@@ -2506,13 +2551,16 @@ impl App {
             }) => (r, backup),
             TakeOutcome::StillWriting => {
                 // Fermeture de l'application, disque bloqué : le journal est conservé ; les
-                // prises seront réparées et réintégrées à la prochaine ouverture.
-                if merge
-                    && !self.is_recording()
-                    && let Some(j) = &journal
-                {
-                    let _ = recovery::keep_journal(&dir, j);
+                // prises seront réparées et réintégrées à la prochaine ouverture. Elle reste
+                // comptée parmi les prises en cours : une autre prise intégrée ensuite ne
+                // la retire jamais du journal (`inflight_journals`).
+                if let Some(j) = &journal {
+                    if !self.is_recording() {
+                        let _ = recovery::keep_journal(&dir, j);
+                    }
+                    self.given_up.push((dir.clone(), j.clone()));
                 }
+                self.take_notes(split, gap, gap_missing, lost_card, None);
                 self.notify(
                     "Le disque ne répond plus : les prises seront récupérées automatiquement à la prochaine ouverture de la session",
                     true,
@@ -2529,6 +2577,7 @@ impl App {
                     // Pas de journal en mémoire : celui de la session, sans les prises
                     // encore en cours d'écriture.
                     let live = self.inflight_journals();
+                    self.take_notes(split, gap, gap_missing, lost_card, None);
                     match recovery::recover_with(&mut self.project, &live) {
                         Ok(r) => {
                             self.load_peaks();
@@ -2553,6 +2602,7 @@ impl App {
                     }
                     return;
                 };
+                self.take_notes(split, gap, gap_missing, lost_card, None);
                 let (n, cleanup) = recovery::apply_journal(&mut self.project, j, &[]);
                 // La session a changé : l'historique d'avant ne s'applique plus (Ctrl+Z ne
                 // doit pas retirer la prise récupérée).
@@ -2688,6 +2738,7 @@ impl App {
                 ),
                 !errors.is_empty(),
             );
+            self.take_notes(split, gap, gap_missing, lost_card, Some(max_len));
             return;
         }
         self.playhead = start + max_len;
@@ -2765,9 +2816,22 @@ impl App {
                 false,
             );
         }
-        // Entrée interrompue puis revenue pendant la prise : le trou a été comblé, ou, plus
-        // long que les tampons, il a coupé la prise (la suite est relancée à sa place).
-        let missing = gap_missing;
+        self.take_notes(split, gap, gap_missing, lost_card, Some(max_len));
+    }
+
+    /// Ce qu'il faut retenir d'une prise, quelle que soit la façon dont elle a fini :
+    /// entrée interrompue puis revenue (trou comblé, ou plus long que les tampons : prise
+    /// coupée, la suite relancée à sa place), carte son perdue. Ces messages s'ajoutent aux
+    /// précédents, ils ne les effacent pas.
+    fn take_notes(
+        &mut self,
+        split: bool,
+        gap: u64,
+        gap_missing: u64,
+        lost_card: bool,
+        len: Option<u64>,
+    ) {
+        let sr = self.sr();
         if split {
             let next = if self.resume.is_some() {
                 "la suite est relancée automatiquement à sa place"
@@ -2777,7 +2841,7 @@ impl App {
             self.notify_level(
                 format!(
                     "L'entrée s'est interrompue pendant la prise (trou de {}, plus long que les tampons) : prise coupée à cet endroit et sauvegardée ; {next}",
-                    fmt_gap(missing as f64 / self.sr() as f64)
+                    fmt_gap(gap_missing as f64 / sr as f64)
                 ),
                 Level::Critical,
             );
@@ -2785,23 +2849,24 @@ impl App {
             self.notify(
                 format!(
                     "L'entrée s'est interrompue pendant la prise : {} de silence inséré, la suite est restée à sa place",
-                    fmt_gap(gap as f64 / self.sr() as f64)
+                    fmt_gap(gap as f64 / sr as f64)
                 ),
                 true,
             );
         }
-        // Prise arrêtée parce que la carte son a disparu : c'est ce qu'il faut retenir
-        // (le message s'ajoute aux précédents, il ne les efface pas).
         if lost_card {
             let next = if self.resume.is_some() {
                 "elle sera relancée automatiquement dès le retour de la carte"
             } else {
                 "relancez l'enregistrement dès le retour de la carte"
             };
+            let kept = match len {
+                Some(n) => format!("prise sauvegardée ({})", fmt_time(n, sr)),
+                None => "ce qui a été capté est gardé".to_string(),
+            };
             self.notify_level(
                 format!(
-                    "Carte son perdue pendant la prise : enregistrement arrêté, prise sauvegardée ({}) ; {next}",
-                    fmt_time(max_len, self.sr())
+                    "Carte son perdue pendant la prise : enregistrement arrêté, {kept} ; {next}"
                 ),
                 Level::Critical,
             );
@@ -2940,16 +3005,26 @@ impl App {
         let base = start + offset + frames;
         let sr = self.sr();
         // Silence inséré à la place d'un trou de l'entrée : repère à cet endroit.
-        let gap = sh.rec_gap_frames.load(Ordering::Relaxed);
+        // (Acquire : la position du trou, écrite avant, est lue à jour.)
+        let gap = sh.rec_gap_frames.load(Ordering::Acquire);
         if gap > self.gap_seen {
             let d = gap - self.gap_seen;
             let at = start + offset + sh.rec_gap_at.load(Ordering::Relaxed);
+            let count = sh.rec_gap_count.load(Ordering::Relaxed);
+            let several = count.saturating_sub(self.gap_count_seen);
             self.gap_seen = gap;
-            self.stall_logged = false;
-            self.incident_marker(
-                at,
-                format!("Trou {} (silence)", fmt_gap(d as f64 / sr as f64)),
-            );
+            self.gap_count_seen = count;
+            let len = fmt_gap(d as f64 / sr as f64);
+            if self.stall_logged {
+                self.stall_logged = false;
+                self.incident(format!("Signal d'entrée revenu après un trou de {len}"));
+            }
+            let name = if several > 1 {
+                format!("{several} trous, {len} en tout (silence)")
+            } else {
+                format!("Trou {len} (silence)")
+            };
+            self.incident_marker(at, name);
         }
         let sh = &self.engine.shared;
         // Signal d'entrée interrompu (pas encore de trou comblé) : noté une fois.
@@ -3051,6 +3126,13 @@ impl App {
             // Autre session, réglage désactivé, lecture lancée entre-temps : l'opérateur a
             // repris la main, rien n'est relancé derrière son dos.
             ResumeStep::Cancel => self.resume = None,
+            ResumeStep::Blocked => {
+                self.resume = None;
+                self.notify_level(
+                    "Relance automatique de la prise impossible : le disque ne répond plus depuis plusieurs prises. Vérifiez-le puis relancez l'enregistrement à la main",
+                    Level::Critical,
+                );
+            }
             ResumeStep::Expire => {
                 self.resume = None;
                 self.notify_level(
@@ -4352,6 +4434,15 @@ impl App {
         let recovered = recovery::recover_with(&mut p, &live);
         self.start_screen = false;
         self.project = p;
+        // Forme d'onde en direct d'une prise d'une autre session (encore en écriture) : elle
+        // ne s'affiche pas sur les pistes de celle-ci (elle reste dans sa fin de prise).
+        if self
+            .finishing
+            .as_ref()
+            .is_none_or(|f| f.take.dir != self.project.dir)
+        {
+            self.live.clear();
+        }
         let board_warning = self.load_session_board();
         self.reset_view_for_session();
         self.load_peaks();
@@ -6946,6 +7037,13 @@ impl eframe::App for App {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.now = ctx.input(|i| i.time);
             self.crash_safety_tick(ctx);
+            // Panique rattrapée dans un callback audio : notée ici, hors du thread audio.
+            if let Some(at) = audio::take_audio_panic() {
+                crate::log_error(
+                    "audio-panic",
+                    &format!("Panique dans un callback audio ({at}) : flux coupé puis rouvert"),
+                );
+            }
             self.engine.collect_garbage();
             if self.cache.poll() {
                 self.sb.midi_dirty = true;
@@ -7150,7 +7248,7 @@ impl App {
     /// Toutes les 100 ms (`logic`) : état partagé avec la fin de session Windows et la fin
     /// du processus, messages des incidents survenus hors de l'interface.
     fn crash_safety_tick(&mut self, ctx: &egui::Context) {
-        let busy = self.is_recording() || self.finishing.is_some();
+        let busy = self.take_in_progress();
         crate::shutdown::set_take_in_progress(busy);
         crate::shutdown::sync_block_reason(busy);
         // Fermeture acceptée (pas de confirmation à demander) : une erreur pendant la
@@ -7242,7 +7340,10 @@ impl App {
         let res =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown_steps(waits)));
         if res.is_err() {
-            crate::recorder::emergency_finish(std::time::Duration::from_secs(10));
+            crate::recorder::emergency_finish(
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(60),
+            );
             crate::recorder::wait_backups(waits.backups.0, waits.backups.1);
         }
     }
@@ -8223,16 +8324,18 @@ mod tests {
                 ..ok
             },
             ResumeCtx {
-                disk_stalled: true,
-                ..ok
-            },
-            ResumeCtx {
                 transport_stopped: false,
                 ..ok
             },
         ] {
             assert_eq!(resume_step(&c), ResumeStep::Cancel);
         }
+        // Disque qui ne répond plus : abandon signalé (pas une annulation silencieuse).
+        let blocked = ResumeCtx {
+            disk_stalled: true,
+            ..ok
+        };
+        assert_eq!(resume_step(&blocked), ResumeStep::Blocked);
     }
 
     /// Chien de garde : flux muet signalé après `STREAM_STALL` (l'entrée en prise après

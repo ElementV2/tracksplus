@@ -999,7 +999,7 @@ pub fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Nom temporaire unique voisin de `path` (`nom.ext.<pid>-<n>.<suffixe>`) : deux écritures
 /// simultanées (session « Soundboard » et `soundboard.json`, double de la session, autre
 /// instance) n'utilisent jamais le même fichier temporaire.
-fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
+pub fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -1226,7 +1226,7 @@ struct Candidate {
 /// (fichiers d'une version qui ne notait pas l'heure). Après une prise, la copie `.bak1`
 /// est plus ancienne que le double du second disque ; plus tard, ce peut être l'inverse.
 fn newest_readable(path: &Path, candidates: impl Iterator<Item = PathBuf>) -> Option<Candidate> {
-    let mut best: Option<((i64, std::time::SystemTime), Candidate)> = None;
+    let mut best: Option<((bool, i64, std::time::SystemTime), Candidate)> = None;
     for cand in candidates {
         let Ok(text) = read_retrying(&cand) else {
             continue;
@@ -1237,7 +1237,17 @@ fn newest_readable(path: &Path, candidates: impl Iterator<Item = PathBuf>) -> Op
         let mtime = std::fs::metadata(&cand)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        let key = (project.saved_at, mtime);
+        // Version venue d'ailleurs (double sur le second disque) : ses prises peuvent citer
+        // des fichiers propres à ce disque (trou d'écriture d'un seul côté). Préférée
+        // seulement si tous ses fichiers sont dans le dossier Audio de la session.
+        let local = cand.parent() == path.parent();
+        let complete = local
+            || project
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .all(|c| project.audio_dir().join(&c.file).is_file());
+        let key = (complete, project.saved_at, mtime);
         if best.as_ref().is_none_or(|(k, _)| key > *k) {
             best = Some((
                 key,

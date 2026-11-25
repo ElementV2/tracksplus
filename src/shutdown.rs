@@ -127,7 +127,7 @@ fn write_pending_saves() {
 fn end_session_now() {
     // Avant tout : une erreur pendant la fermeture de Windows ne relance pas TracksPlus.
     mark_exit_requested();
-    crate::recorder::emergency_finish(END_SESSION_WRITERS);
+    crate::recorder::emergency_finish(END_SESSION_WRITERS, END_SESSION_WRITERS);
     if take_save_request() {
         write_pending_saves();
     }

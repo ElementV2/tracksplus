@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const JOURNAL: &str = ".recording.json";
 
@@ -96,26 +98,92 @@ pub fn keep_journal(dir: &Path, j: &Journal) -> Result<()> {
     }
 }
 
+/// Rang des écritures de journal : chaque écriture (ou suppression) reçoit son rang au
+/// moment où elle est décidée, sur le thread qui la décide. Un journal n'est jamais
+/// remplacé par un plus ancien, même écrit plus tard par un thread d'écriture resté
+/// bloqué sur un disque lent (il ne listerait pas les fichiers de la prise suivante).
+static JOURNAL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Rang d'une écriture de journal décidée maintenant (voir `write_journal_ranked`).
+pub fn next_journal_rank() -> u64 {
+    JOURNAL_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Dernier rang écrit pour chaque dossier (un verrou par dossier : un disque bloqué ne
+/// retient que les journaux de ce disque).
+fn rank_slot(dir: &Path) -> Arc<parking_lot::Mutex<u64>> {
+    static SLOTS: parking_lot::Mutex<Vec<(PathBuf, Arc<parking_lot::Mutex<u64>>)>> =
+        parking_lot::Mutex::new(Vec::new());
+    let mut v = SLOTS.lock();
+    if let Some((_, s)) = v.iter().find(|(d, _)| d == dir) {
+        return s.clone();
+    }
+    let s = Arc::new(parking_lot::Mutex::new(0));
+    v.push((dir.to_path_buf(), s.clone()));
+    s
+}
+
+/// Écriture atomique du journal de `dir` au rang `rank` : fichier temporaire synchronisé,
+/// puis remplacement, seulement si aucun journal de rang plus récent n'a été écrit (ou
+/// supprimé) entre-temps. `Ok(false)` : écriture abandonnée car périmée.
+fn write_ranked(dir: &Path, j: &Journal, rank: u64) -> Result<bool> {
+    let path = journal_path(dir);
+    if *rank_slot(dir).lock() > rank {
+        return Ok(false);
+    }
+    let tmp = crate::project::temp_sibling(&path, "tmp");
+    if let Err(e) = crate::project::write_synced(&tmp, serde_json::to_string_pretty(j)?.as_bytes())
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!("Écriture de {}", tmp.display())));
+    }
+    // Vérifié de nouveau après l'écriture forcée (la partie lente) : remplacement sous le
+    // verrou du dossier, jamais par-dessus un journal plus récent.
+    let slot = rank_slot(dir);
+    let mut last = slot.lock();
+    if *last > rank {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    if let Err(e) = crate::project::replace_file(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!("Écriture de {}", path.display())));
+    }
+    *last = rank;
+    Ok(true)
+}
+
 /// Écrit le journal de la prise en cours (forcé sur le disque) et note la session parmi
 /// celles dont un enregistrement n'est pas terminé (voir `interrupted_sessions`).
 pub fn write_journal(dir: &Path, j: &Journal) -> Result<()> {
-    write_journal_untracked(dir, j)?;
-    track_pending(dir, true);
+    write_journal_ranked(dir, j, next_journal_rank())
+}
+
+/// Comme `write_journal`, au rang `rank` obtenu plus tôt (`next_journal_rank`) : ignorée si
+/// un journal plus récent a déjà été écrit pour ce dossier.
+pub fn write_journal_ranked(dir: &Path, j: &Journal, rank: u64) -> Result<()> {
+    if write_ranked(dir, j, rank)? {
+        track_pending(dir, true);
+    }
     Ok(())
 }
 
 /// Journal du double de la session (copie de sécurité) : jamais proposé à la
 /// récupération automatique au lancement (c'est la session principale qui l'est).
 pub fn write_journal_untracked(dir: &Path, j: &Journal) -> Result<()> {
-    // Écriture atomique (temporaire au nom unique, renommage réessayé sous Windows).
-    crate::project::write_atomic(
-        &journal_path(dir),
-        serde_json::to_string_pretty(j)?.as_bytes(),
-    )
+    write_ranked(dir, j, next_journal_rank()).map(|_| ())
 }
 
 pub fn remove_journal(dir: &Path) {
+    let rank = next_journal_rank();
+    let slot = rank_slot(dir);
+    let mut last = slot.lock();
+    if *last > rank {
+        return;
+    }
     let _ = std::fs::remove_file(journal_path(dir));
+    *last = rank;
+    drop(last);
     track_pending(dir, false);
 }
 
@@ -211,6 +279,7 @@ fn take_segments(base: &str, names: &[String]) -> Vec<String> {
 /// Applique le journal de la session : répare les fichiers et ajoute les prises
 /// manquantes, puis sauvegarde. `Err` seulement si le journal est illisible (fichiers
 /// laissés dans Audio/).
+#[cfg(test)]
 pub fn recover(project: &mut Project) -> Result<Recovered> {
     recover_with(project, &[])
 }
@@ -895,5 +964,37 @@ mod tests {
         let l3 = pending_with(&l2, a, false).unwrap();
         assert_eq!(pending_dirs(&l3), [b]);
         assert!(pending_with(&l3, a, false).is_none());
+    }
+
+    /// Journal écrit en retard par un thread resté bloqué : jamais par-dessus un journal
+    /// décidé après lui, ni après la suppression du journal.
+    #[test]
+    fn older_journal_never_replaces_newer() {
+        let dir = std::env::temp_dir().join(format!("tp-journal-rank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = |start: u64| Journal {
+            start,
+            play_offset: 0,
+            latency: 0,
+            sample_rate: 48000,
+            extra: Vec::new(),
+            takes: Vec::new(),
+        };
+        let (old, new) = (next_journal_rank(), next_journal_rank());
+        write_journal_ranked(&dir, &j(2), new).unwrap();
+        write_journal_ranked(&dir, &j(1), old).unwrap();
+        let read = || {
+            std::fs::read_to_string(journal_path(&dir))
+                .ok()
+                .map(|t| serde_json::from_str::<Journal>(&t).unwrap().start)
+        };
+        assert_eq!(read(), Some(2), "le plus récent reste");
+        remove_journal(&dir);
+        write_journal_ranked(&dir, &j(1), old).unwrap();
+        assert_eq!(read(), None, "journal supprimé jamais ressuscité");
+        write_journal(&dir, &j(3)).unwrap();
+        assert_eq!(read(), Some(3));
+        std::fs::remove_dir_all(dir).ok();
     }
 }

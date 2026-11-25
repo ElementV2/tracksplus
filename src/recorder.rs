@@ -215,7 +215,7 @@ pub struct Recorder {
     /// terminés) : la fin de prise attend tant que ce compteur bouge.
     progress: Arc<AtomicU64>,
     /// Mises à jour du journal de secours, écrites par le thread d'écriture.
-    journal_tx: Sender<(PathBuf, Journal)>,
+    journal_tx: Sender<(PathBuf, Journal, u64)>,
     handle: Option<JoinHandle<Vec<RecResult>>>,
     /// Copie de sécurité sur un second disque (son propre thread et ses propres tampons).
     backup: Option<Box<Recorder>>,
@@ -658,6 +658,9 @@ static EMERGENCY: AtomicBool = AtomicBool::new(false);
 struct WriterSlot {
     /// Arrêt d'urgence demandé à ce thread.
     emergency: AtomicBool,
+    /// Avancement du thread (trames écrites) : un thread qui écrit encore n'est jamais
+    /// abandonné pour un disque mort.
+    progress: Arc<AtomicU64>,
     /// Thread terminé (fichiers fermés), même s'il s'est arrêté sur une erreur.
     done: AtomicBool,
 }
@@ -675,8 +678,11 @@ static WRITERS: parking_lot::Mutex<Vec<Arc<WriterSlot>>> = parking_lot::Mutex::n
 struct WriterAlive(Arc<WriterSlot>);
 
 impl WriterAlive {
-    fn new() -> Self {
-        let slot = Arc::new(WriterSlot::default());
+    fn new(progress: Arc<AtomicU64>) -> Self {
+        let slot = Arc::new(WriterSlot {
+            progress,
+            ..Default::default()
+        });
         WRITERS.lock().push(slot.clone());
         Self(slot)
     }
@@ -689,6 +695,7 @@ impl Drop for WriterAlive {
     }
 }
 
+#[cfg(test)]
 /// Attend que `finished` soit vrai, au plus `timeout`.
 fn wait_until(timeout: Duration, finished: impl Fn() -> bool) -> bool {
     let t0 = Instant::now();
@@ -705,15 +712,35 @@ fn wait_until(timeout: Duration, finished: impl Fn() -> bool) -> bool {
 /// thread d'écriture écrit tout ce qui est déjà arrivé dans ses tampons, ferme ses fichiers
 /// (en-têtes WAV à jour) et s'arrête, sans attendre la fin de la prise. Le journal de
 /// récupération reste en place : les prises sont réintégrées au prochain lancement.
-/// Attend au plus `timeout` ; `true` si tous les threads ont terminé (copies de sécurité
-/// comprises). Sans prise en cours, rend la main tout de suite. Ne s'annule pas : à
-/// n'appeler qu'à la fin du processus.
-pub fn emergency_finish(timeout: Duration) -> bool {
+/// Attend tant que les threads avancent : abandon après `idle` sans aucun progrès, ou
+/// `cap` en tout ; `true` si tous ont terminé (copies de sécurité comprises). Sans prise
+/// en cours, rend la main tout de suite. Ne s'annule pas : à n'appeler qu'à la fin du
+/// processus.
+pub fn emergency_finish(idle: Duration, cap: Duration) -> bool {
     if WRITERS.lock().is_empty() {
         return true;
     }
     EMERGENCY.store(true, Ordering::Release);
-    wait_until(timeout, || WRITERS.lock().is_empty())
+    let total = || -> u64 {
+        WRITERS
+            .lock()
+            .iter()
+            .map(|s| s.progress.load(Ordering::Relaxed))
+            .fold(0u64, u64::wrapping_add)
+    };
+    let t0 = Instant::now();
+    let mut seen = (total(), Instant::now());
+    while !WRITERS.lock().is_empty() {
+        let p = total();
+        if p != seen.0 {
+            seen = (p, Instant::now());
+        }
+        if seen.1.elapsed() > idle || t0.elapsed() > cap {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 /// Arrêt d'urgence de quelques threads seulement (tests : les autres tests du module, qui
@@ -878,8 +905,11 @@ impl Recorder {
         let errors: Errors = Arc::new(parking_lot::Mutex::new(ErrLog::default()));
         let progress = Arc::new(AtomicU64::new(0));
         let (journal_tx, journal_rx) = crossbeam_channel::unbounded();
+        // Rang du journal pris maintenant (thread de l'interface) : écrit plus tard par le
+        // thread d'écriture, il ne remplace jamais un journal décidé après lui.
+        let journal = journal.map(|(d, j)| (d, j, crate::recovery::next_journal_rank()));
         // Compté avant le départ du thread : un arrêt d'urgence juste après l'attend aussi.
-        let alive = WriterAlive::new();
+        let alive = WriterAlive::new(progress.clone());
         let slot = alive.0.clone();
         let ctx = WriterCtx {
             sample_rate,
@@ -903,8 +933,8 @@ impl Recorder {
                 }
                 // Journal de secours avant le premier fichier : après un crash, tout fichier
                 // de la prise est connu de la récupération.
-                if let Some((dir, j)) = &journal {
-                    write_journal_logged(dir, j, &ctx.errors);
+                if let Some((dir, j, rank)) = &journal {
+                    write_journal_logged(dir, j, *rank, &ctx.errors);
                 }
                 run(specs, ctx)
             })?;
@@ -938,7 +968,9 @@ impl Recorder {
     /// Journal de secours complété pendant la prise (décalage d'une prise faite en
     /// écoutant…) : écrit par le thread d'écriture, dans l'ordre, après le journal initial.
     pub fn update_journal(&self, dir: PathBuf, j: Journal) {
-        let _ = self.journal_tx.send((dir, j));
+        let _ = self
+            .journal_tx
+            .send((dir, j, crate::recovery::next_journal_rank()));
     }
 
     /// Compteur d'avancement du thread d'écriture principal (voir `progress`).
@@ -1048,8 +1080,8 @@ fn segment_frames(max_bytes: u64, bytes_per_frame: u64) -> u64 {
     (max_bytes.saturating_sub(1024) / bytes_per_frame.max(1) / block * block).max(block)
 }
 
-fn write_journal_logged(dir: &Path, j: &Journal, errors: &Errors) {
-    if let Err(e) = crate::recovery::write_journal(dir, j) {
+fn write_journal_logged(dir: &Path, j: &Journal, rank: u64, errors: &Errors) {
+    if let Err(e) = crate::recovery::write_journal_ranked(dir, j, rank) {
         let msg = format!("journal de secours non écrit : {e:#}");
         errors.lock().push("journal", msg);
     }
@@ -1065,7 +1097,7 @@ struct WriterCtx {
     progress: Arc<AtomicU64>,
     move_aside: bool,
     clock: (chrono::NaiveDateTime, u64),
-    journal_rx: Receiver<(PathBuf, Journal)>,
+    journal_rx: Receiver<(PathBuf, Journal, u64)>,
     /// Recensement du thread pour l'arrêt d'urgence.
     slot: Arc<WriterSlot>,
 }
@@ -1142,8 +1174,8 @@ fn run(specs: Vec<LaneSpec>, ctx: WriterCtx) -> Vec<RecResult> {
     loop {
         let mut worked = false;
         // Journal complété par l'interface (rare) : écrit ici, dans l'ordre.
-        while let Ok((dir, j)) = journal_rx.try_recv() {
-            write_journal_logged(&dir, &j, &errors);
+        while let Ok((dir, j, rank)) = journal_rx.try_recv() {
+            write_journal_logged(&dir, &j, rank, &errors);
         }
         let stopping = stop.load(Ordering::Acquire);
         for lane in &mut lanes {
@@ -1286,8 +1318,8 @@ fn run(specs: Vec<LaneSpec>, ctx: WriterCtx) -> Vec<RecResult> {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    while let Ok((dir, j)) = journal_rx.try_recv() {
-        write_journal_logged(&dir, &j, &errors);
+    while let Ok((dir, j, rank)) = journal_rx.try_recv() {
+        write_journal_logged(&dir, &j, rank, &errors);
     }
 
     let results: Vec<RecResult> = lanes

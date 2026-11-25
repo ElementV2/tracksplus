@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use rtrb::{Consumer, Producer};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Nombre maximum de canaux d'entrée suivis par les vumètres.
 pub const MAX_INPUTS: usize = 256;
@@ -117,6 +117,65 @@ impl AudioPrefs {
             }
         }
     }
+}
+
+thread_local! {
+    /// Ce thread exécute en ce moment un callback audio (voir `in_audio_callback`).
+    static IN_AUDIO_CB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Le thread courant est dans un callback audio : une panique ne doit alors ni allouer,
+/// ni verrouiller, ni écrire de fichier (le pilote attend son bloc). Voir `note_audio_panic`.
+pub fn in_audio_callback() -> bool {
+    IN_AUDIO_CB.with(|c| c.get())
+}
+
+/// Exécute `f` marqué « callback audio ».
+fn audio_cb<R>(f: impl FnOnce() -> R) -> R {
+    IN_AUDIO_CB.with(|c| c.set(true));
+    let r = f();
+    IN_AUDIO_CB.with(|c| c.set(false));
+    r
+}
+
+/// Dernière panique rattrapée dans un callback audio : fichier (tronqué) et ligne, notés
+/// sans allocation ni verrou ; l'interface l'écrit ensuite dans crash.log.
+static AUDIO_PANIC_FILE: [AtomicU8; 96] = [const { AtomicU8::new(0) }; 96];
+static AUDIO_PANIC_LEN: AtomicUsize = AtomicUsize::new(0);
+static AUDIO_PANIC_LINE: AtomicU32 = AtomicU32::new(0);
+static AUDIO_PANIC_NEW: AtomicBool = AtomicBool::new(false);
+
+/// Note l'emplacement d'une panique survenue dans un callback audio (appelé par le
+/// gestionnaire de panique global, sur le thread audio).
+pub fn note_audio_panic(file: &str, line: u32) {
+    let b = file.as_bytes();
+    // Fin du chemin (le nom du fichier source), dans la place disponible.
+    let b = &b[b.len().saturating_sub(AUDIO_PANIC_FILE.len())..];
+    for (slot, &x) in AUDIO_PANIC_FILE.iter().zip(b) {
+        slot.store(x, Ordering::Relaxed);
+    }
+    AUDIO_PANIC_LEN.store(b.len(), Ordering::Relaxed);
+    AUDIO_PANIC_LINE.store(line, Ordering::Relaxed);
+    AUDIO_PANIC_NEW.store(true, Ordering::Release);
+}
+
+/// Panique notée par `note_audio_panic` depuis le dernier appel (« fichier:ligne »).
+pub fn take_audio_panic() -> Option<String> {
+    if !AUDIO_PANIC_NEW.swap(false, Ordering::Acquire) {
+        return None;
+    }
+    let n = AUDIO_PANIC_LEN
+        .load(Ordering::Relaxed)
+        .min(AUDIO_PANIC_FILE.len());
+    let bytes: Vec<u8> = AUDIO_PANIC_FILE[..n]
+        .iter()
+        .map(|b| b.load(Ordering::Relaxed))
+        .collect();
+    Some(format!(
+        "{}:{}",
+        String::from_utf8_lossy(&bytes),
+        AUDIO_PANIC_LINE.load(Ordering::Relaxed)
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -284,17 +343,23 @@ fn add_unlisted_asio(
         seen.retain(|e| name_of(e).as_deref() != Some(name));
         seen.push(entry);
     }
-    let note = match in_use {
-        Some(cur) => format!("disponible · « {cur} » sera fermé à l'application"),
-        None => {
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let note = |known: bool| match (in_use, known) {
+        (Some(cur), true) => format!("disponible · « {cur} » sera fermé à l'application"),
+        (Some(cur), false) => format!(
+            "non vérifié · « {cur} » sera fermé pour l'essayer (Dante Virtual Soundcard : mode ASIO)"
+        ),
+        (None, _) => {
             "ne répond pas · carte non démarrée ? (Dante Virtual Soundcard : mode ASIO)".to_string()
         }
     };
     for name in registered {
-        if listed.iter().any(|l| l == name) {
+        if listed.iter().any(|l| same(l, name)) {
             continue;
         }
-        let known = seen.iter().find(|e| name_of(e).as_deref() == Some(name));
+        let known = seen
+            .iter()
+            .find(|e| name_of(e).is_some_and(|n| same(&n, name)));
         let blank = || DeviceInfo {
             name: name.clone(),
             channels: 0,
@@ -303,6 +368,7 @@ fn add_unlisted_asio(
             buffer: None,
             note: None,
         };
+        let note = note(known.is_some());
         let (i, o) = match known {
             Some((i, o)) => (i.clone(), o.clone()),
             None => (Some(blank()), Some(blank())),
@@ -316,13 +382,42 @@ fn add_unlisted_asio(
     }
 }
 
-/// Pilotes ASIO déclarés dans Windows (`HKLM\SOFTWARE\ASIO`), dans l'ordre du registre.
+/// Pilotes ASIO déclarés dans Windows (`HKLM\SOFTWARE\ASIO`), dans l'ordre du registre,
+/// nommés comme le fait le SDK ASIO (et donc cpal) : valeur « Description » de la clé, à
+/// défaut le nom de la clé. Les clés sans « CLSID » (pilote désinstallé) sont ignorées.
 #[cfg(all(windows, feature = "asio"))]
 fn asio_driver_names() -> Vec<String> {
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW,
+        RegGetValueW, RegOpenKeyExW,
     };
-    let path: Vec<u16> = r"SOFTWARE\ASIO".encode_utf16().chain([0]).collect();
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    // Valeur texte `value` de la sous-clé `sub` (terminée par un zéro).
+    let read = |key: HKEY, sub: &[u16], value: &str| -> Option<String> {
+        let value = wide(value);
+        let mut buf = [0u16; 512];
+        let mut bytes = std::mem::size_of_val(&buf) as u32;
+        // SAFETY : chaînes terminées par un zéro, `buf` fait `bytes` octets.
+        let r = unsafe {
+            RegGetValueW(
+                key,
+                sub.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if r != 0 {
+            return None;
+        }
+        let n = (bytes as usize / 2).min(buf.len());
+        let text = String::from_utf16_lossy(&buf[..n]);
+        let text = text.trim_end_matches('\0').trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let path = wide(r"SOFTWARE\ASIO");
     let mut key: HKEY = std::ptr::null_mut();
     // SAFETY : chaîne terminée par un zéro, `key` reçoit la clé ouverte (fermée plus bas).
     if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
@@ -348,7 +443,12 @@ fn asio_driver_names() -> Vec<String> {
         if r != 0 {
             break;
         }
-        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        let sub_name = String::from_utf16_lossy(&buf[..len as usize]);
+        let sub = wide(&sub_name);
+        if read(key, &sub, "CLSID").is_none() {
+            continue;
+        }
+        names.push(read(key, &sub, "Description").unwrap_or(sub_name));
     }
     // SAFETY : clé ouverte ci-dessus.
     unsafe { RegCloseKey(key) };
@@ -425,6 +525,8 @@ pub struct Shared {
     /// Position dans la prise (trames depuis son début) du dernier silence inséré : là où
     /// l'interface pose le repère du trou.
     pub rec_gap_at: AtomicU64,
+    /// Nombre de trous comblés dans la prise en cours.
+    pub rec_gap_count: AtomicU64,
     /// Trou de l'entrée plus long que la place libre des tampons disque : trames de silence
     /// qui n'ont pas pu être insérées (0 = aucun). La prise est alors figée (la suite irait
     /// au mauvais endroit de la timeline) et l'interface la relance à sa place.
@@ -470,6 +572,7 @@ impl Shared {
             heartbeat: std::array::from_fn(|_| AtomicU64::new(0)),
             rec_gap_frames: AtomicU64::new(0),
             rec_gap_at: AtomicU64::new(0),
+            rec_gap_count: AtomicU64::new(0),
             rec_gap_overflow: AtomicU64::new(0),
             rec_gap_overflow_ns: AtomicU64::new(0),
             stream_dead: std::sync::atomic::AtomicU8::new(0),
@@ -1736,6 +1839,24 @@ impl Engine {
                 self.plan.sample_rate = sample_rate;
             }
         }
+        // Un seul lecteur de pads à la fois : une sortie soundboard rouverte par un essai
+        // resté bloqué, alors que le main (pas rouvert par cet essai) joue les pads en
+        // attendant, n'est pas gardée (les commandes des pads se partageraient entre les
+        // deux). L'essai suivant les rouvre ensemble (`expand`).
+        if matches!(results[SLOT_PADS], Some(Ok(_)))
+            && self.main_has_pads
+            && self.streams[SLOT_MAIN].is_some()
+            && !matches!(results[SLOT_MAIN], Some(Ok(_)))
+        {
+            results[SLOT_PADS] = Some(Err((
+                format!(
+                    "{} « {} » revenue pendant que le main joue les pads : nouvel essai",
+                    slot_title(SLOT_PADS),
+                    self.plan.want[SLOT_PADS].label()
+                ),
+                true,
+            )));
+        }
         if opened(&results) {
             // Ouverte une fois sur un vrai périphérique : rouverte telle quelle désormais.
             self.plan.rate_fixed = true;
@@ -1847,6 +1968,7 @@ impl Engine {
             .ok_or_else(|| anyhow!("Aucune entrée audio"))?;
         self.shared.rec_frames.store(0, Ordering::Relaxed);
         self.shared.rec_gap_frames.store(0, Ordering::Relaxed);
+        self.shared.rec_gap_count.store(0, Ordering::Relaxed);
         self.shared.rec_gap_overflow.store(0, Ordering::Relaxed);
         // Compteurs propres à cette prise.
         for c in [
@@ -2071,21 +2193,36 @@ impl InState {
     {
         self.shared.heartbeat[SLOT_INPUT].fetch_add(1, Ordering::Relaxed);
         if self.faulted {
+            // Flux en faute : plus rien n'est écrit, mais les commandes sont toujours
+            // traitées (les cibles d'une prise sont rendues tout de suite à l'interface,
+            // qui ne reste pas à attendre l'arrêt).
+            let _ = audio_cb(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.commands();
+                    let old = std::mem::take(&mut self.targets);
+                    self.dispose(old);
+                }))
+            });
             return;
         }
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some((capture, callback)) = ts {
-                // Latence capture → callback (compensation des prises en re-recording).
-                self.shared.in_latency.store(
-                    to_frames(callback.duration_since(capture), self.sample_rate),
-                    Ordering::Relaxed,
-                );
-                if let Some(frames) = data.len().checked_div(self.channels) {
-                    self.check_capture_gap(capture, frames);
+        let ok = audio_cb(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Commandes d'abord : un trou constaté maintenant appartient à la prise d'avant
+                // si elle vient d'être arrêtée ou remplacée (jamais compté dans la nouvelle).
+                let changed = self.commands();
+                if let Some((capture, callback)) = ts {
+                    // Latence capture → callback (compensation des prises en re-recording).
+                    self.shared.in_latency.store(
+                        to_frames(callback.duration_since(capture), self.sample_rate),
+                        Ordering::Relaxed,
+                    );
+                    if let Some(frames) = data.len().checked_div(self.channels) {
+                        self.check_capture_gap(capture, frames, changed);
+                    }
                 }
-            }
-            self.process(data);
-        }))
+                self.process(data);
+            }))
+        })
         .is_ok();
         if !ok {
             self.faulted = true;
@@ -2101,7 +2238,7 @@ impl InState {
     /// Pendant une prise, un vrai trou (horloge Dante perdue quelques secondes, pilote figé)
     /// est comblé par autant de silence : la suite de la prise reste calée sur l'heure
     /// réelle, donc sur la timeline et les autres pistes.
-    fn check_capture_gap(&mut self, capture: cpal::StreamInstant, frames: usize) {
+    fn check_capture_gap(&mut self, capture: cpal::StreamInstant, frames: usize, new_take: bool) {
         if let Some((prev, n)) = self.last_capture
             && let Some(dt) = capture.checked_duration_since(prev)
             && self.sample_rate > 0
@@ -2114,7 +2251,7 @@ impl InState {
             if late > tolerance && self.shared.counting.load(Ordering::Relaxed) {
                 self.shared.xruns.fetch_add(1, Ordering::Relaxed);
             }
-            if late >= GAP_FILL_MIN && !self.targets.is_empty() && !self.halted {
+            if late >= GAP_FILL_MIN && !new_take && !self.targets.is_empty() && !self.halted {
                 self.fill_gap(late, frames);
             }
         }
@@ -2165,8 +2302,10 @@ impl InState {
         // Seul ce callback fait avancer `rec_frames` : lu puis avancé sans course.
         sh.rec_gap_at
             .store(sh.rec_frames.load(Ordering::Relaxed), Ordering::Relaxed);
+        sh.rec_gap_count.fetch_add(1, Ordering::Relaxed);
         sh.rec_frames.fetch_add(n as u64, Ordering::Release);
-        sh.rec_gap_frames.fetch_add(n as u64, Ordering::Relaxed);
+        // Release : position et nombre de trous visibles dès que ce total change.
+        sh.rec_gap_frames.fetch_add(n as u64, Ordering::Release);
     }
 
     fn dispose(&self, v: Vec<RecTarget>) {
@@ -2177,19 +2316,18 @@ impl InState {
 }
 
 impl InState {
-    /// Corps du callback d'entrée (hors horodatage) : commandes, vumètres, monitoring,
-    /// écriture vers les tampons disque. Séparé pour être testé sans carte son.
-    fn process<T>(&mut self, data: &[T])
-    where
-        T: SizedSample,
-        f32: FromSample<T>,
-    {
+    /// Commandes de l'interface (prise, arrêt, monitoring). `true` si les cibles de prise
+    /// ont changé (prise lancée ou arrêtée). Aucune libération mémoire : les anciennes
+    /// cibles partent vers l'interface.
+    fn commands(&mut self) -> bool {
         let st = self;
+        let mut changed = false;
         while let Ok(cmd) = st.rx.try_recv() {
             // Aucune libération mémoire ici : l'ancienne liste part vers l'interface,
             // qui relâche les producteurs (le thread disque voit alors la fin de prise).
             match cmd {
                 InCmd::Record(t) => {
+                    changed = true;
                     st.shared.rec_play_offset.store(
                         st.shared.play_position_now(st.sample_rate),
                         Ordering::Relaxed,
@@ -2199,6 +2337,7 @@ impl InState {
                     st.halted = false;
                 }
                 InCmd::Stop => {
+                    changed = true;
                     let old = std::mem::take(&mut st.targets);
                     st.dispose(old);
                     st.halted = false;
@@ -2212,6 +2351,20 @@ impl InState {
                 }
             }
         }
+        changed
+    }
+}
+
+impl InState {
+    /// Corps du callback d'entrée (hors horodatage) : commandes, vumètres, monitoring,
+    /// écriture vers les tampons disque. Séparé pour être testé sans carte son.
+    fn process<T>(&mut self, data: &[T])
+    where
+        T: SizedSample,
+        f32: FromSample<T>,
+    {
+        self.commands();
+        let st = self;
         let ch = st.channels;
         if ch == 0 {
             return;
@@ -2652,12 +2805,22 @@ impl OutState {
     {
         self.shared.heartbeat[self.slot].fetch_add(1, Ordering::Relaxed);
         if self.faulted {
+            // Flux en faute : silence, mais les commandes sont toujours traitées (lecture
+            // rendue tout de suite, l'interface n'attend pas une réponse qui ne vient pas).
+            let _ = audio_cb(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.commands();
+                    self.release();
+                }))
+            });
             data.fill(T::EQUILIBRIUM);
             return;
         }
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.render_into(&mut *data, ts)
-        }))
+        let ok = audio_cb(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.render_into(&mut *data, ts)
+            }))
+        })
         .is_ok();
         if !ok {
             self.faulted = true;
@@ -2666,24 +2829,10 @@ impl OutState {
         }
     }
 
-    /// Commandes, horodatage, puis mix de tout le bloc converti au format de la carte.
-    fn render_into<T>(
-        &mut self,
-        data: &mut [T],
-        ts: Option<(cpal::StreamInstant, cpal::StreamInstant)>,
-    ) where
-        T: SizedSample + FromSample<f32>,
-    {
+    /// Commandes de l'interface (lecture, bascule, arrêt, monitoring), sans libération
+    /// mémoire : ce qui est remplacé part vers l'interface.
+    fn commands(&mut self) {
         let st = self;
-        if st.main
-            && let Some((callback, playback)) = ts
-        {
-            // Latence callback → restitution (compensation des prises en re-recording).
-            st.shared.out_latency.store(
-                to_frames(playback.duration_since(callback), st.sample_rate),
-                Ordering::Relaxed,
-            );
-        }
         while let Ok(cmd) = st.rx.try_recv() {
             match cmd {
                 OutCmd::Switch(c, at) => {
@@ -2705,6 +2854,27 @@ impl OutState {
                 }
             }
         }
+    }
+
+    /// Commandes, horodatage, puis mix de tout le bloc converti au format de la carte.
+    fn render_into<T>(
+        &mut self,
+        data: &mut [T],
+        ts: Option<(cpal::StreamInstant, cpal::StreamInstant)>,
+    ) where
+        T: SizedSample + FromSample<f32>,
+    {
+        let st = self;
+        if st.main
+            && let Some((callback, playback)) = ts
+        {
+            // Latence callback → restitution (compensation des prises en re-recording).
+            st.shared.out_latency.store(
+                to_frames(playback.duration_since(callback), st.sample_rate),
+                Ordering::Relaxed,
+            );
+        }
+        st.commands();
         let ch = st.channels;
         if ch == 0 {
             return;
@@ -2841,6 +3011,9 @@ impl OutState {
         let mix = &mut self.mix[..frames * ch];
         mix.fill(0.0);
         let route = |mix: &mut [f32], src: &[f32], left: usize, meter: &[AtomicU32; 2]| {
+            // Paire demandée hors de ce périphérique (réglage prévu pour une autre sortie) :
+            // jamais d'écriture hors du bloc, la dernière paire est utilisée.
+            let left = left.min(ch.saturating_sub(1));
             let right = (left + 1).min(ch - 1);
             let (mut pl, mut pr) = (0f32, 0f32);
             for f in 0..frames {
@@ -2999,14 +3172,14 @@ mod tests {
         };
         // Blocs réguliers de 480 trames : rien.
         for k in 0..10 {
-            st.check_capture_gap(at(k * 480), 480);
+            st.check_capture_gap(at(k * 480), 480, false);
         }
         assert_eq!(shared.xruns.load(Ordering::Relaxed), 0);
         // Petit retard d'horloge (5 ms) : pas d'alerte.
-        st.check_capture_gap(at(10 * 480 + 240), 480);
+        st.check_capture_gap(at(10 * 480 + 240), 480, false);
         assert_eq!(shared.xruns.load(Ordering::Relaxed), 0);
         // 1920 trames manquantes (40 ms) : un décrochage.
-        st.check_capture_gap(at(11 * 480 + 240 + 1920), 480);
+        st.check_capture_gap(at(11 * 480 + 240 + 1920), 480, false);
         assert_eq!(shared.xruns.load(Ordering::Relaxed), 1);
     }
 
@@ -3233,9 +3406,9 @@ mod tests {
             Sampler::new(bounded::<PadCmd>(1).1, sgt, 0, 48000),
         )
         .for_slot(SLOT_PADS);
-        // Paire hors du périphérique (impossible en vrai, `left` est borné à l'ouverture) :
-        // indice hors limites dans le mix, donc panique.
-        st.left = 7;
+        // Tampon de mix trop court (impossible en vrai, il est dimensionné à l'ouverture) :
+        // découpage hors limites, donc panique.
+        st.mix = Vec::new();
         let mut data = vec![0.7f32; 64 * 2];
         st.callback(&mut data, None);
         assert!(st.faulted);
@@ -3247,6 +3420,29 @@ mod tests {
         st.callback(&mut data, None);
         assert!(data.iter().all(|&x| x == 0.0));
         assert_eq!(shared.heartbeat[SLOT_PADS].load(Ordering::Relaxed), 2);
+    }
+
+    /// Paire de sortie réglée pour un autre périphérique (plus de canaux) : jouée sur la
+    /// dernière paire de celui-ci, jamais d'écriture hors du bloc ni de faute.
+    #[test]
+    fn out_of_range_pair_is_clamped() {
+        let shared = Arc::new(Shared::new());
+        let (gt, _gr) = bounded(1);
+        let (sgt, _sgr) = bounded(1);
+        let mut st = OutState::new(
+            2,
+            0,
+            bounded::<OutCmd>(1).1,
+            gt,
+            shared.clone(),
+            Sampler::new(bounded::<PadCmd>(1).1, sgt, 0, 48000),
+        )
+        .for_slot(SLOT_PADS);
+        st.left = 7;
+        let mut data = vec![0.7f32; 64 * 2];
+        st.callback(&mut data, None);
+        assert!(!st.faulted);
+        assert_eq!(shared.device_lost.load(Ordering::Acquire), 0);
     }
 
     /// Trou de l'entrée pendant une prise (horloge Dante perdue une demi-seconde) : autant
@@ -3891,8 +4087,21 @@ mod asio_list_tests {
         add_unlisted_asio(&mut ins, &mut outs, &reg, Some(rme));
         let d = ins.iter().find(|d| d.name == dante).expect("Dante listée");
         assert_eq!(d.channels, 16, "caractéristiques connues gardées");
-        assert!(d.note.as_deref().unwrap().contains("sera fermé"));
+        assert!(d.note.as_deref().unwrap().starts_with("disponible"));
         assert!(outs.iter().any(|d| d.name == dante));
+        // Même pilote écrit autrement dans le registre : jamais listé deux fois.
+        let (mut ins, mut outs) = (vec![asio_dev(rme, 18)], vec![asio_dev(rme, 18)]);
+        add_unlisted_asio(
+            &mut ins,
+            &mut outs,
+            &[format!(" {} ", rme.to_uppercase())],
+            None,
+        );
+        assert_eq!(ins.len(), 1);
+        // Pilote jamais vu en marche pendant qu'un autre est ouvert : « non vérifié ».
+        let (mut ins, mut outs) = (vec![asio_dev(rme, 18)], vec![asio_dev(rme, 18)]);
+        add_unlisted_asio(&mut ins, &mut outs, &["Autre [test]".into()], Some(rme));
+        assert!(ins[1].note.as_deref().unwrap().starts_with("non vérifié"));
         // Pilote jamais vu, rien d'ouvert : listé quand même, « ne répond pas ».
         let other = "Pilote inconnu [test]".to_string();
         let (mut ins, mut outs) = (Vec::new(), Vec::new());

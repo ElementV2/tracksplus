@@ -162,6 +162,14 @@ pub fn log_error(key: &str, text: &str) {
 fn install_crash_log() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Panique dans un callback audio (rattrapée juste après, le flux se tait puis est
+        // rouvert) : aucune allocation, aucun verrou, aucune écriture ici — le pilote
+        // attend son bloc. L'interface l'écrit dans crash.log (`take_audio_panic`).
+        if audio::in_audio_callback() {
+            let (file, line) = info.location().map_or(("?", 0), |l| (l.file(), l.line()));
+            audio::note_audio_panic(file, line);
+            return;
+        }
         let key = format!(
             "{}|{}",
             info.location().map(|l| l.to_string()).unwrap_or_default(),
@@ -182,8 +190,15 @@ fn install_crash_log() {
 /// Délais d'attente des prises encore en écriture à la fin du processus : court après une
 /// fermeture normale (tout est déjà fini, sauf disque bloqué), plus long après une erreur
 /// (les prises passent avant la relance).
-const END_WRITERS_NORMAL: std::time::Duration = std::time::Duration::from_secs(2);
-const END_WRITERS_CRASH: std::time::Duration = std::time::Duration::from_secs(10);
+/// (Sans progrès, en tout) : après une erreur, un disque lent qui écrit encore est attendu.
+const END_WRITERS_NORMAL: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(2),
+);
+const END_WRITERS_CRASH: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(60),
+);
 /// Copies de sécurité après une erreur : déjà terminées avec les prises (leurs threads
 /// d'écriture sont attendus ci-dessus) ; un second disque mort ne retarde pas la relance.
 const END_BACKUPS_CRASH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -226,11 +241,11 @@ fn main() -> eframe::Result {
     // Prise encore en écriture (fermeture interrompue, disque lent) : ses tampons sont
     // écrits et ses fichiers fermés avant que le processus disparaisse.
     let (writers, backups) = if res.is_ok() {
-        (END_WRITERS_NORMAL, END_WRITERS_NORMAL)
+        (END_WRITERS_NORMAL, END_WRITERS_NORMAL.1)
     } else {
         (END_WRITERS_CRASH, END_BACKUPS_CRASH)
     };
-    recorder::emergency_finish(writers);
+    recorder::emergency_finish(writers.0, writers.1);
     recorder::wait_backups(backups, backups);
     match res {
         Ok(r) => r,
