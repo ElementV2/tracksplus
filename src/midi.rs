@@ -39,6 +39,55 @@ pub struct Midi {
     outs: Vec<(String, MidiOutputConnection)>,
     /// Dernier message LED envoyé par contrôle (pour n'envoyer que les changements).
     led_sent: HashMap<MidiKey, [u8; 3]>,
+    /// Envoi refusé par une sortie LED (contrôleur débranché, port mort) depuis le dernier
+    /// relevé des ports.
+    send_failed: bool,
+    /// Surveillance des branchements : relevé des ports en cours (thread) et prochain relevé.
+    watch: Option<Receiver<Vec<String>>>,
+    watch_next: f64,
+    dead_hold: f64,
+    /// Ports présents au dernier relevé (ou à la dernière connexion).
+    known: Vec<String>,
+}
+
+/// Intervalle entre deux relevés des ports MIDI (s).
+const WATCH_EVERY: f64 = 1.5;
+
+/// Changement de branchement constaté par `Midi::watch_ports`.
+pub struct PortChange {
+    /// Ports d'entrée présents.
+    pub ports: Vec<String>,
+    /// Contrôleurs connectés qui ont disparu.
+    pub lost: Vec<String>,
+    /// Il faut (re)connecter le port choisi : revenu, apparu, ou connexion morte.
+    pub reconnect: bool,
+}
+
+/// Que faire d'après les ports présents : contrôleurs perdus, et faut-il reconnecter ?
+/// `want` = port choisi (`ALL_PORTS` = tous), `known` = ports déjà vus au relevé précédent
+/// (seul un port qui apparaît déclenche une connexion : un port qui refuse de s'ouvrir,
+/// pris par une autre application, ne fait pas reconnecter en boucle les autres), `dead` =
+/// une sortie LED refuse les envois (sous Windows, un contrôleur débranché puis rebranché
+/// entre deux relevés garde son nom mais l'ancienne connexion ne reçoit plus rien).
+pub fn plan_ports(
+    want: Option<&str>,
+    connected: &[String],
+    known: &[String],
+    ports: &[String],
+    dead: bool,
+) -> (Vec<String>, bool) {
+    let lost: Vec<String> = connected
+        .iter()
+        .filter(|c| !ports.contains(c))
+        .cloned()
+        .collect();
+    let appeared = |p: &String| !known.contains(p);
+    let reconnect = match want {
+        None => false,
+        Some(ALL_PORTS) => dead || ports.iter().any(appeared),
+        Some(p) => ports.iter().any(|x| x == p && (dead || appeared(x))),
+    };
+    (lost, reconnect)
 }
 
 pub fn list_out_ports() -> Vec<String> {
@@ -724,7 +773,10 @@ impl Midi {
                 continue;
             }
             for (_, c) in &mut self.outs {
-                let _ = c.send(&msg);
+                // Envoi refusé : contrôleur débranché (reconnecté au prochain relevé).
+                if c.send(&msg).is_err() {
+                    self.send_failed = true;
+                }
             }
             if present.contains(&k) {
                 self.led_sent.insert(k, msg);
@@ -761,7 +813,73 @@ impl Midi {
             error: None,
             outs: Vec::new(),
             led_sent: HashMap::new(),
+            send_failed: false,
+            watch: None,
+            watch_next: 0.0,
+            dead_hold: 0.0,
+            known: Vec::new(),
         }
+    }
+
+    /// Surveillance des branchements, à appeler régulièrement (`now` en secondes) avec le
+    /// port choisi. La liste des ports est relue dans un thread (WinMM peut être lent), un
+    /// seul relevé à la fois. Un contrôleur disparu est retiré des connectés ; `Some` quand
+    /// quelque chose a changé (à l'appelant de reconnecter si `reconnect`).
+    pub fn watch_ports(&mut self, now: f64, want: Option<&str>) -> Option<PortChange> {
+        if let Some(rx) = &self.watch {
+            let ports = match rx.try_recv() {
+                Ok(p) => p,
+                Err(crossbeam_channel::TryRecvError::Empty) => return None,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.watch = None;
+                    return None;
+                }
+            };
+            self.watch = None;
+            // (Au plus une reconnexion pour envoi refusé toutes les 15 s : une sortie qui
+            // refuse tout ne fait pas boucler.)
+            let dead = std::mem::take(&mut self.send_failed) && now >= self.dead_hold;
+            if dead {
+                self.dead_hold = now + 15.0;
+            }
+            let (lost, reconnect) = plan_ports(want, &self.connected, &self.known, &ports, dead);
+            self.known = ports.clone();
+            // Connexions des contrôleurs disparus fermées (elles ne recevraient plus rien).
+            for name in &lost {
+                if let Some(i) = self.connected.iter().position(|c| c == name) {
+                    self.connected.remove(i);
+                    if i < self.conns.len() {
+                        drop(self.conns.remove(i));
+                    }
+                }
+            }
+            if !lost.is_empty() {
+                let keys: Vec<String> = lost.iter().map(|n| port_key(n)).collect();
+                self.outs.retain(|(n, _)| !keys.contains(&port_key(n)));
+            }
+            if lost.is_empty() && !reconnect {
+                return None;
+            }
+            return Some(PortChange {
+                ports,
+                lost,
+                reconnect,
+            });
+        }
+        if now >= self.watch_next {
+            self.watch_next = now + WATCH_EVERY;
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            if std::thread::Builder::new()
+                .name("tracksplus-midi-ports".into())
+                .spawn(move || {
+                    let _ = tx.send(list_ports());
+                })
+                .is_ok()
+            {
+                self.watch = Some(rx);
+            }
+        }
+        None
     }
 
     /// Connecte un port (ou tous si `ALL_PORTS`). `None` déconnecte.
@@ -773,6 +891,9 @@ impl Midi {
             return;
         };
         let names = list_ports();
+        // (Surveillance des branchements : seuls les ports qui apparaîtront ensuite
+        // déclencheront une nouvelle connexion.)
+        self.known = names.clone();
         for name in names {
             if want != ALL_PORTS && want != name {
                 continue;
@@ -840,6 +961,41 @@ impl Midi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contrôleur débranché en plein spectacle : retiré des connectés ; rebranché (ou
+    /// branché après le lancement) : reconnecté tout seul.
+    #[test]
+    fn controllers_are_reconnected_after_hotplug() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let lp = Some("Launchpad X");
+        let both = s(&["loopMIDI", "Launchpad X"]);
+        // Débranché.
+        let (lost, re) = plan_ports(lp, &s(&["Launchpad X"]), &both, &s(&["loopMIDI"]), false);
+        assert_eq!(lost, s(&["Launchpad X"]));
+        assert!(!re);
+        // Rebranché (ou absent au lancement) : reconnecté.
+        let (lost, re) = plan_ports(lp, &[], &s(&["loopMIDI"]), &both, false);
+        assert!(lost.is_empty() && re);
+        // Toujours là, connexion vivante : rien.
+        let (lost, re) = plan_ports(lp, &s(&["Launchpad X"]), &both, &both, false);
+        assert!(lost.is_empty() && !re);
+        // Présent mais refuse de s'ouvrir (pris par une autre application) : pas de
+        // reconnexion en boucle à chaque relevé.
+        let (_, re) = plan_ports(lp, &[], &both, &both, false);
+        assert!(!re);
+        // Débranché puis rebranché entre deux relevés (sorties LED mortes) : reconnecté.
+        let (_, re) = plan_ports(lp, &s(&["Launchpad X"]), &both, &both, true);
+        assert!(re);
+        // Tous les ports : un nouveau contrôleur est pris aussi, un port déjà vu non.
+        let all = Some(ALL_PORTS);
+        let (_, re) = plan_ports(all, &s(&["A"]), &s(&["A"]), &s(&["A", "B"]), false);
+        assert!(re);
+        let (_, re) = plan_ports(all, &s(&["A"]), &s(&["A", "B"]), &s(&["A", "B"]), false);
+        assert!(!re);
+        // Aucun contrôleur choisi : jamais de connexion automatique.
+        let (_, re) = plan_ports(None, &[], &[], &s(&["A"]), false);
+        assert!(!re);
+    }
 
     #[test]
     fn parse_messages() {

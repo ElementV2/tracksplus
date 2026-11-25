@@ -310,11 +310,74 @@ fn backup_board(mut board: Board, from: &Path, to: &Path) {
     let _ = board.save_session(to);
 }
 
-/// Mesure de la place libre : disque de la session, et second disque de la copie de
-/// sécurité (`None` = pas de copie, `Some(Err)` = second disque introuvable).
-pub struct DiskSpace {
-    main: Option<u64>,
-    backup: Option<Result<u64, ()>>,
+/// État d'une mesure d'espace libre en arrière-plan.
+enum DiskPoll {
+    Idle,
+    Busy,
+    /// Pas de réponse depuis plus de 10 s : disque bloqué.
+    Stuck,
+    Done(Option<u64>),
+}
+
+/// Prise arrêtée par une perte de la carte son, à relancer dès son retour.
+pub struct Resume {
+    /// Position sur la timeline de la fin de ce qui a été capté.
+    pos: u64,
+    /// Instant (horloge de l'interface) de la dernière trame reçue : le trou se mesure
+    /// depuis là, la prise relancée tombe à l'heure réelle.
+    at: f64,
+    /// Session de la prise (une autre session ouverte entre-temps : pas de relance).
+    dir: PathBuf,
+    /// Battement de cœur de l'entrée vu une première fois après son retour : on attend
+    /// qu'elle délivre vraiment des trames avant de relancer.
+    hb_seen: Option<u64>,
+}
+
+/// Ajoute `new` à la suite d'un message affiché, sans dépasser une longueur lisible (les
+/// plus anciens morceaux partent d'abord, le plus récent reste toujours en entier).
+fn join_toast(old: &str, new: &str) -> String {
+    const MAX: usize = 600;
+    let mut parts: Vec<&str> = old.split(" · ").collect();
+    parts.push(new);
+    while parts.len() > 1 && parts.iter().map(|p| p.chars().count() + 3).sum::<usize>() > MAX {
+        parts.remove(0);
+    }
+    parts.join(" · ")
+}
+
+/// Position de la prise relancée : fin de ce qui a été capté + durée du trou à l'heure
+/// réelle, pour que la suite reste à sa place.
+fn resume_position(pos: u64, gap_secs: f64, sr: u32) -> u64 {
+    pos + (gap_secs.max(0.0) * sr as f64).round() as u64
+}
+
+/// Durée d'un trou, lisible (« 4,2 s », « 2 min 05 »).
+fn fmt_gap(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.1} s").replace('.', ",")
+    } else {
+        fmt_duration(secs as u64)
+    }
+}
+
+/// Flux muet depuis plus longtemps que ça (s) : considéré comme perdu et rouvert.
+const STREAM_STALL: f64 = 3.0;
+/// Pendant une prise, l'entrée muette sans erreur du pilote (horloge Dante perdue) garde
+/// la prise ouverte (alerte rouge, silence comblé à la reprise) ; arrêt seulement au-delà.
+const REC_STALL_STOP: f64 = 20.0;
+/// Délai maximal entre deux essais de réouverture (s) ; ASIO, sur le thread principal,
+/// réessaie moins souvent (chaque essai charge les pilotes).
+const RECONNECT_MAX: f64 = 10.0;
+const RECONNECT_MAX_ASIO: f64 = 30.0;
+
+/// Délai de l'essai suivant (de plus en plus espacés : l'interface ne saccade pas tant que
+/// la carte est absente).
+fn next_delay(delay: f64, asio: bool) -> f64 {
+    (delay * 2.0).min(if asio {
+        RECONNECT_MAX_ASIO
+    } else {
+        RECONNECT_MAX
+    })
 }
 
 /// `a` et `b` sont sur le même disque (volume). Windows : même lecteur ou même partage
@@ -433,10 +496,25 @@ pub struct App {
     pub lost_during_take: bool,
     /// Sauvegarde automatique en cours (thread).
     pub autosave_job: Option<(PathBuf, std::sync::mpsc::Receiver<anyhow::Result<()>>)>,
-    /// Réouverture de la carte en cours dans un thread.
-    pub reconnect_job: Option<(f64, std::sync::mpsc::Receiver<anyhow::Result<Engine>>)>,
-    /// Mesure de l'espace disque libre en cours (thread).
-    pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<DiskSpace>)>,
+    /// Réouverture de flux en cours dans un thread : début, résultat, alerte « pilote qui ne
+    /// répond plus » déjà donnée. Un seul essai à la fois, jamais abandonné (pas de threads
+    /// bloqués qui s'accumulent, jamais deux ouvertures du même périphérique).
+    pub reconnect_job: Option<(f64, std::sync::mpsc::Receiver<audio::Reopened>, bool)>,
+    /// Chien de garde des flux (`audio::SLOT_*`) : dernier battement de cœur vu et instant
+    /// où il a changé ; dernier passage (un saut = veille ou interface figée).
+    hb: [(u64, f64); audio::SLOTS],
+    hb_tick: f64,
+    /// Prise arrêtée par une perte de la carte, à relancer dès son retour.
+    pub resume: Option<Resume>,
+    /// Réouverture ASIO en attente de la fin des pads / du transport : déjà signalée.
+    reconnect_wait: bool,
+    /// Dernier état de la carte signalé (pas de répétition à chaque essai).
+    device_note: String,
+    /// Mesure de l'espace libre en cours (thread), disque de la session puis second disque :
+    /// (début, dossier, résultat). Une seule à la fois par disque, jamais abandonnée tant
+    /// que la session ne change pas (un disque bloqué n'accumule pas de threads).
+    pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
+    pub backup_disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
     /// La prise en cours est faite en écoutant les pistes existantes.
@@ -543,8 +621,14 @@ impl App {
             prefs.pad_left = board.out_left;
             prefs.save();
         }
+        // Un flux qui ne s'ouvre pas n'empêche jamais les autres : une carte absente au
+        // démarrage (rack Dante encore éteint) est reprise dès qu'elle apparaît
+        // (`watch_device`) ; un réglage refusé ouvre les réglages avec l'erreur.
         let (engine, err) = match Engine::open(&prefs, &prefs.pad_out()) {
-            Ok(e) => (e, None),
+            Ok(e) => {
+                let err = e.open_errors();
+                (e, err)
+            }
             Err(e) => (Engine::offline(), Some(format!("{e:#}"))),
         };
         let mut project = Project::untitled(engine.status.sample_rate);
@@ -631,7 +715,13 @@ impl App {
             lost_during_take: false,
             autosave_job: None,
             reconnect_job: None,
+            hb: [(0, 0.0); audio::SLOTS],
+            hb_tick: 0.0,
+            resume: None,
+            reconnect_wait: false,
+            device_note: String::new(),
             disk_job: None,
+            backup_disk_job: None,
             rec_latency: 0,
             rec_overdub: false,
             journal_pending: None,
@@ -708,8 +798,20 @@ impl App {
     /// Message en bas de la fenêtre. Une information disparaît seule ; une erreur ou un
     /// avertissement reste affiché jusqu'au clic : on ne peut pas le manquer.
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
+        let text = text.into();
+        // Une erreur pas encore lue n'est jamais effacée par un nouveau message (ex. « prise
+        // arrêtée, carte perdue » puis « carte reconnectée ») : il s'ajoute à la suite.
+        if let Some(t) = &mut self.toast
+            && t.error
+            && t.until.is_infinite()
+        {
+            if !t.text.split(" · ").any(|s| s == text) {
+                t.text = join_toast(&t.text, &text);
+            }
+            return;
+        }
         self.toast = Some(Toast {
-            text: text.into(),
+            text,
             error,
             until: if error { f64::INFINITY } else { self.now + 3.5 },
         });
@@ -777,6 +879,12 @@ impl App {
             );
             return;
         }
+        // Bandes lues sans rééchantillonnage : à une autre fréquence, elles partiraient à la
+        // mauvaise vitesse et à la mauvaise hauteur.
+        if let Some(msg) = self.rate_mismatch() {
+            self.notify(msg, true);
+            return;
+        }
         if self.playhead >= self.project.end() && self.project.end() > 0 {
             self.playhead = self.selection.map_or(0, |s| s.0);
         }
@@ -800,6 +908,11 @@ impl App {
             Transport::Stopped => self.playhead = pos,
             Transport::Playing { .. } => {
                 self.playhead = pos;
+                if let Some(msg) = self.rate_mismatch() {
+                    self.notify(msg, true);
+                    self.stop();
+                    return;
+                }
                 let (player, cons) = Player::start(&self.project, pos, self.project.audible());
                 if !self.engine.start_playback(cons) {
                     self.notify(OUTPUT_STALLED, true);
@@ -840,6 +953,41 @@ impl App {
         }
     }
 
+    /// La session a des bandes à une autre fréquence que la carte : message, sinon `None`.
+    fn rate_mismatch(&self) -> Option<String> {
+        let sr = self.engine.status.sample_rate;
+        (self.project.has_audio() && self.project.sample_rate != sr).then(|| {
+            format!(
+                "La session est en {} kHz mais la carte tourne en {} kHz. Changez la fréquence dans les réglages audio.",
+                fmt_khz(self.project.sample_rate),
+                fmt_khz(sr)
+            )
+        })
+    }
+
+    /// L'entrée existe mais ne délivre rien (perdue, en cours de réouverture, ou muette) :
+    /// message, sinon `None`. Jamais de prise lancée sur un flux mort.
+    fn input_unavailable(&self) -> Option<String> {
+        let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
+        let reopening =
+            self.reconnect_job.is_some() && self.engine.open_mask() & audio::LOST_INPUT == 0;
+        if lost & audio::LOST_INPUT != 0 || reopening {
+            return Some(
+                "Entrée audio perdue : reconnexion en cours, l'enregistrement sera possible dès son retour"
+                    .into(),
+            );
+        }
+        let hb = self.hb[audio::SLOT_INPUT];
+        let beat = self.engine.shared.heartbeat[audio::SLOT_INPUT].load(Ordering::Relaxed);
+        if self.engine.has_input() && beat == hb.0 && self.now - hb.1 > 1.0 {
+            return Some(
+                "L'entrée audio ne délivre plus de signal (câble, carte ou horloge Dante) : vérifiez la connexion"
+                    .into(),
+            );
+        }
+        None
+    }
+
     pub fn record(&mut self) {
         if self.finishing.is_some() {
             self.notify("Finalisation de la prise précédente en cours…", false);
@@ -859,6 +1007,10 @@ impl App {
                 return;
             }
         }
+        if let Some(msg) = self.input_unavailable() {
+            self.notify(msg, true);
+            return;
+        }
         if !self.engine.has_input() {
             self.notify(
                 "Aucune entrée audio : choisissez votre carte dans les réglages audio",
@@ -867,15 +1019,8 @@ impl App {
             return;
         }
         let sr = self.engine.status.sample_rate;
-        if self.project.has_audio() && self.project.sample_rate != sr {
-            self.notify(
-                format!(
-                    "La session est en {} kHz mais la carte tourne en {} kHz. Changez la fréquence dans les réglages audio.",
-                    fmt_khz(self.project.sample_rate),
-                    fmt_khz(sr)
-                ),
-                true,
-            );
+        if let Some(msg) = self.rate_mismatch() {
+            self.notify(msg, true);
             return;
         }
         let in_ch = self.engine.status.in_channels;
@@ -1056,6 +1201,8 @@ impl App {
         self.transport = Transport::Recording {
             start: self.playhead,
         };
+        // Prise lancée (à la main ou par la relance automatique) : plus rien à relancer.
+        self.resume = None;
         self.view.nav_until = 0.0;
         self.reveal_recording_tracks();
         // Une prise modifie la timeline : l'historique d'annulation d'avant ne s'applique
@@ -1337,11 +1484,28 @@ impl App {
                 false,
             );
         }
-        // Prise arrêtée parce que la carte son a disparu : c'est ce qu'il faut retenir.
-        if lost_card {
+        // Entrée interrompue puis revenue pendant la prise : le trou a été comblé.
+        let gap = self.engine.shared.rec_gap_frames.swap(0, Ordering::Relaxed);
+        if gap > 0 {
             self.notify(
                 format!(
-                    "Carte son perdue pendant la prise : enregistrement arrêté, prise sauvegardée ({}). Reconnexion automatique de la carte…",
+                    "L'entrée s'est interrompue pendant la prise : {} de silence inséré, la suite est restée à sa place",
+                    fmt_gap(gap as f64 / self.sr() as f64)
+                ),
+                true,
+            );
+        }
+        // Prise arrêtée parce que la carte son a disparu : c'est ce qu'il faut retenir
+        // (le message s'ajoute aux précédents, il ne les efface pas).
+        if lost_card {
+            let next = if self.resume.is_some() {
+                "elle sera relancée automatiquement dès le retour de la carte"
+            } else {
+                "relancez l'enregistrement dès le retour de la carte"
+            };
+            self.notify(
+                format!(
+                    "Carte son perdue pendant la prise : enregistrement arrêté, prise sauvegardée ({}) ; {next}",
                     fmt_time(max_len, self.sr())
                 ),
                 true,
@@ -1366,130 +1530,419 @@ impl App {
         }
     }
 
-    /// Alertes en direct pendant un enregistrement (bandeau rouge en haut).
-    /// Carte son disparue (DVS relancé, câble USB, pilote réinitialisé) : comme les
-    /// logiciels pro, on la rouvre tout seul. Jamais pendant une prise (elle se termine
-    /// proprement par Stop, la suite est récupérable) ; la lecture, elle, est arrêtée.
+    /// Carte son disparue (DVS relancé, câble USB, pilote réinitialisé, horloge Dante
+    /// perdue) : comme les logiciels pro, chaque flux est surveillé en permanence (même
+    /// fenêtre réduite) et seul celui qui est mort est rouvert, tout seul, sans toucher à
+    /// ceux qui marchent. Une prise arrêtée par la perte de l'entrée est relancée dès son
+    /// retour, à la bonne position (réglage « Relancer la prise »).
     fn watch_device(&mut self) {
-        use crate::audio::{LOST_INPUT, LOST_OUTPUT, LOST_PADS};
-        // Comme Pro Tools, Cubase / Nuendo ou REAPER : carte disparue pendant une prise
-        // (DVS arrêté, câble, horloge Dante perdue : plus aucun échantillon depuis 3 s),
-        // la prise est arrêtée et enregistrée telle quelle — rien n'est perdu de ce qui a
-        // été capté, et on ne continue pas à « enregistrer » du vide.
+        self.poll_reconnect();
+        self.watch_streams();
+        self.watch_take();
+        self.resume_take();
+        self.schedule_reconnect();
+    }
+
+    /// Battement de cœur de chaque flux ouvert : un flux qui ne tourne plus, même sans
+    /// erreur du pilote (horloge Dante perdue, pilote figé), est signalé perdu.
+    fn watch_streams(&mut self) {
+        let now = self.now;
+        // Saut dans le temps (veille, interface figée) : rien n'est jugé sur cet intervalle.
+        let jumped = now - self.hb_tick > 1.5;
+        self.hb_tick = now;
+        let open = self.engine.open_mask();
+        let rec = self.is_recording();
+        let sh = &self.engine.shared;
+        for (slot, hb) in self.hb.iter_mut().enumerate() {
+            let bit = audio::slot_bit(slot);
+            let beat = sh.heartbeat[slot].load(Ordering::Relaxed);
+            if open & bit == 0 || jumped || beat != hb.0 {
+                *hb = (beat, now);
+                continue;
+            }
+            // Pendant une prise, l'entrée muette garde la prise ouverte (voir `watch_take`).
+            let limit = if slot == audio::SLOT_INPUT && rec {
+                REC_STALL_STOP
+            } else {
+                STREAM_STALL
+            };
+            if now - hb.1 > limit {
+                sh.device_lost.fetch_or(bit, Ordering::Release);
+            }
+        }
+    }
+
+    /// Pendant une prise. Entrée muette sans erreur du pilote (horloge Dante perdue
+    /// quelques secondes) : la prise continue (alerte rouge, trou comblé par du silence à
+    /// la reprise). Entrée vraiment perdue (erreur du pilote, ou muette plus de 20 s) :
+    /// prise arrêtée et sauvegardée telle quelle, relancée dès le retour de la carte.
+    fn watch_take(&mut self) {
         if !self.is_recording() {
             self.rec_watch = (0, self.now);
+            return;
         }
-        if self.is_recording() {
-            let sh = &self.engine.shared;
-            let input_lost = sh.device_lost.load(Ordering::Acquire) & LOST_INPUT != 0;
-            let frames = sh.rec_frames.load(Ordering::Relaxed);
-            // Suivi ici aussi (et pas seulement dans l'affichage) : fonctionne fenêtre réduite.
-            if frames != self.rec_watch.0 {
-                self.rec_watch = (frames, self.now);
-            }
-            let stalled = self.now - self.rec_watch.1 > 3.0;
-            if input_lost || stalled {
-                // Flux muet sans erreur du pilote (horloge Dante) : on le traite comme perdu
-                // pour le rouvrir ensuite.
-                sh.device_lost.fetch_or(LOST_INPUT, Ordering::Release);
-                self.lost_during_take = true;
-                self.stop();
-            }
+        let sh = &self.engine.shared;
+        let frames = sh.rec_frames.load(Ordering::Relaxed);
+        // Suivi ici aussi (et pas seulement dans l'affichage) : fonctionne fenêtre réduite.
+        if frames != self.rec_watch.0 {
+            self.rec_watch = (frames, self.now);
+        }
+        let lost = sh.device_lost.load(Ordering::Acquire) & audio::LOST_INPUT != 0;
+        if !lost && self.now - self.rec_watch.1 <= REC_STALL_STOP {
+            return;
+        }
+        sh.device_lost
+            .fetch_or(audio::LOST_INPUT, Ordering::Release);
+        if let Transport::Recording { start } = self.transport {
+            let offset = if self.rec_overdub {
+                sh.rec_play_offset.load(Ordering::Relaxed)
+            } else {
+                0
+            };
+            self.resume = self.prefs.auto_restart.then(|| Resume {
+                pos: start + offset + frames,
+                at: self.rec_watch.1,
+                dir: self.project.dir.clone(),
+                hb_seen: None,
+            });
+        }
+        self.lost_during_take = true;
+        self.stop();
+    }
+
+    /// Relance de la prise arrêtée par une perte de la carte, dès que l'entrée délivre de
+    /// nouveau des trames : nouvelles prises sur les mêmes pistes armées, posées à l'heure
+    /// réelle (fin de ce qui a été capté + durée du trou).
+    fn resume_take(&mut self) {
+        let Some(r) = &self.resume else {
+            return;
+        };
+        // Autre session, réglage désactivé, lecture lancée entre-temps : l'opérateur a
+        // repris la main, rien n'est relancé derrière son dos.
+        if r.dir != self.project.dir
+            || !self.prefs.auto_restart
+            || self.disk_stalled
+            || !matches!(self.transport, Transport::Stopped)
+        {
+            self.resume = None;
+            return;
         }
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
-        if lost != 0 && self.reconnect.is_none() {
+        if !self.is_stopped()
+            || self.reconnect_job.is_some()
+            || lost & audio::LOST_INPUT != 0
+            || self.engine.open_mask() & audio::LOST_INPUT == 0
+        {
+            return;
+        }
+        let beat = self.engine.shared.heartbeat[audio::SLOT_INPUT].load(Ordering::Relaxed);
+        let (pos, at) = (r.pos, r.at);
+        match r.hb_seen {
+            Some(seen) if beat > seen => {}
+            Some(_) => return,
+            None => {
+                if let Some(r) = &mut self.resume {
+                    r.hb_seen = Some(beat);
+                }
+                return;
+            }
+        }
+        let gap = (self.now - at).max(0.0);
+        self.resume = None;
+        self.playhead = resume_position(pos, gap, self.sr());
+        self.record();
+        if self.is_recording() {
+            self.notify(
+                format!(
+                    "Prise relancée automatiquement après perte de la carte (trou de {})",
+                    fmt_gap(gap)
+                ),
+                true,
+            );
+        } else {
+            self.notify(
+                "Relance automatique de la prise impossible : relancez l'enregistrement à la main",
+                true,
+            );
+        }
+    }
+
+    /// Flux perdus ou absents : essais de réouverture espacés (1, 2, 4… jusqu'à 10 s), un
+    /// seul à la fois, dans un thread (pas de gel de l'écran) ; seuls les flux concernés
+    /// sont rouverts.
+    fn schedule_reconnect(&mut self) {
+        use crate::audio::{LOST_INPUT, LOST_OUTPUT, LOST_PADS};
+        let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
+        let need = lost | self.engine.missing();
+        if need == 0 {
+            if self.reconnect_job.is_none() {
+                self.reconnect = None;
+                self.reconnect_wait = false;
+                self.device_note.clear();
+            }
+            return;
+        }
+        if self.reconnect_job.is_some() {
+            return;
+        }
+        // Lecture multipiste arrêtée seulement si c'est sa sortie qui a disparu.
+        if lost & LOST_OUTPUT != 0 && matches!(self.transport, Transport::Playing { .. }) {
+            self.stop();
+        }
+        let asio = self.prefs.host.as_deref() == Some("ASIO");
+        // Essais suspendus (ASIO, flux refusé) puis un flux perd vraiment sa carte : on
+        // repart d'un essai rapide.
+        if lost != 0 && self.reconnect.is_some_and(|(at, _)| at.is_infinite()) {
+            self.reconnect = None;
+        }
+        if self.reconnect.is_none() {
             self.reconnect = Some((self.now + 1.0, 1.0));
-            // Lecture multipiste arrêtée seulement si c'est sa sortie qui a disparu.
-            if lost & LOST_OUTPUT != 0 && matches!(self.transport, Transport::Playing { .. }) {
-                self.stop();
-            }
-            if !self.is_recording() {
-                self.notify("Carte son perdue : reconnexion automatique…", true);
-            }
+            let what = self.engine.problems(lost).join(" · ");
+            self.device_notice(if lost != 0 {
+                format!("Carte son perdue ({what}) : reconnexion automatique…")
+            } else {
+                format!("Carte son : {what} — en attente de son retour…")
+            });
         }
         let Some((at, delay)) = self.reconnect else {
             return;
         };
-        if self.now < at || !self.is_stopped() {
+        if self.now < at {
             return;
         }
-        // Rouvrir la carte coupe tous les pads : on attend qu'ils aient fini, sauf si
-        // c'est justement leur sortie qui a disparu (ils sont muets de toute façon).
-        let pads_dead =
-            lost & LOST_PADS != 0 || (lost & LOST_OUTPUT != 0 && self.prefs.pad_output.is_none());
-        if self.pads_status().0 > 0 && !pads_dead {
-            return;
-        }
-        // Ouverture en cours dans un thread (Windows WASAPI, Linux) : on attend son résultat.
-        if let Some((since, rx)) = &self.reconnect_job {
-            let since = *since;
-            match rx.try_recv() {
-                Ok(opened) => {
-                    self.reconnect_job = None;
-                    self.finish_reconnect(opened, delay);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.reconnect_job = None;
-                    self.finish_reconnect(Err(anyhow::anyhow!("ouverture interrompue")), delay);
-                }
-                // Pilote qui ne répond pas : on abandonne cet essai et on en refait un.
-                Err(std::sync::mpsc::TryRecvError::Empty) if self.now - since > 15.0 => {
-                    self.reconnect_job = None;
-                    self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0)));
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        let pads_bit = self.engine.pads_slot_bit();
+        let pads_busy = self.pads_status().0 > 0 && pads_bit != 0 && lost & pads_bit == 0;
+        if asio {
+            // ASIO : un seul pilote pour tout, rouvert d'un coup, sur ce thread (objets COM).
+            if lost == 0 && self.engine.open_mask() != 0 {
+                // Rien de mort, seulement un flux refusé : on ne coupe pas ce qui marche.
+                self.reconnect = Some((f64::INFINITY, delay));
+                let what = self.engine.problems(0).join(" · ");
+                self.device_notice(format!(
+                    "Carte son : {what} — corrigez-le dans les réglages audio"
+                ));
+                return;
             }
+            if !self.is_stopped() || pads_busy {
+                if !self.reconnect_wait {
+                    self.reconnect_wait = true;
+                    self.notify(
+                        if pads_busy {
+                            "Carte son perdue : elle sera rouverte dès que les pads en lecture seront arrêtés"
+                        } else {
+                            "Carte son perdue : elle sera rouverte dès l'arrêt de la lecture ou de la prise"
+                        },
+                        true,
+                    );
+                }
+                return;
+            }
+            self.reopen_all(delay);
             return;
         }
+        let mut slots = need;
+        // (Entrée perdue pendant une prise : la prise vient d'être arrêtée, voir `watch_take`.)
+        if self.is_recording() {
+            slots &= !LOST_INPUT;
+        }
+        // Pads joués sur le main faute de leur sortie, et cette sortie revenue : le main est
+        // rouvert lui aussi, donc seulement à l'arrêt et sans pad en lecture.
+        // (Sortie soundboard présente mais qui refuse de s'ouvrir : à corriger dans les
+        // réglages, le main n'est pas coupé à chaque essai pour rien.)
+        let (_, _, gated) = self.engine.expand(slots);
+        if gated != 0
+            && (!self.is_stopped()
+                || self.pads_status().0 > 0
+                || self.engine.refused() & LOST_PADS != 0)
+        {
+            slots &= !LOST_PADS;
+        }
+        if slots == 0 {
+            self.reconnect = Some((self.now + delay, delay));
+            return;
+        }
+        let job = self.engine.prepare(slots);
+        // CoreAudio : sur le thread principal, comme à l'ouverture normale.
+        #[cfg(target_os = "macos")]
+        {
+            let r = job.run();
+            self.finish_reconnect(r, delay);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("tracksplus-reconnect".into())
+                .spawn(move || {
+                    let _ = tx.send(job.run());
+                });
+            match spawned {
+                Ok(_) => self.reconnect_job = Some((self.now, rx, false)),
+                // (Les flux de l'essai sont fermés : ils manquent, nouvel essai plus tard.)
+                Err(_) => self.reconnect = Some((self.now + delay, next_delay(delay, false))),
+            }
+        }
+    }
+
+    /// Résultat de l'essai en cours. Il n'est jamais abandonné : un pilote qui ne répond
+    /// plus est signalé, sans lancer d'autre essai (pas de threads bloqués qui s'accumulent,
+    /// jamais deux ouvertures du même périphérique en même temps).
+    fn poll_reconnect(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some((since, rx, alerted)) = &self.reconnect_job else {
+            return;
+        };
+        let (since, alerted) = (*since, *alerted);
+        let delay = self.reconnect.map_or(1.0, |r| r.1);
+        match rx.try_recv() {
+            Ok(r) => {
+                self.reconnect_job = None;
+                self.finish_reconnect(r, delay);
+            }
+            Err(TryRecvError::Disconnected) => {
+                // Essai en échec (erreur interne) : ses flux manquent, nouvel essai plus tard.
+                self.reconnect_job = None;
+                self.reconnect = Some((self.now + delay, next_delay(delay, false)));
+            }
+            Err(TryRecvError::Empty) => {
+                if !alerted && self.now - since > 15.0 {
+                    if let Some(j) = &mut self.reconnect_job {
+                        j.2 = true;
+                    }
+                    self.notify(
+                        "Le pilote de la carte son ne répond plus (ouverture bloquée) : TracksPlus attend sa réponse sans relancer d'essai. Si rien ne bouge, débranchez puis rebranchez la carte, ou redémarrez le service Audio de Windows.",
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Installe le résultat d'un essai de réouverture partielle.
+    fn finish_reconnect(&mut self, r: audio::Reopened, delay: f64) {
+        let touched = r.slots();
+        let rate_before = self.engine.status.sample_rate;
+        self.engine.install(r);
+        for (slot, hb) in self.hb.iter_mut().enumerate() {
+            if touched & audio::slot_bit(slot) != 0 {
+                *hb = (
+                    self.engine.shared.heartbeat[slot].load(Ordering::Relaxed),
+                    self.now,
+                );
+            }
+        }
+        self.reconnect_done(touched, delay, rate_before);
+    }
+
+    /// ASIO : tout le pilote rouvert d'un coup, sur ce thread, à la même fréquence qu'avant
+    /// la perte (en « Auto », la carte pourrait revenir à une autre : la session serait lue
+    /// à la mauvaise vitesse) ; « Auto » seulement si cette fréquence est refusée.
+    fn reopen_all(&mut self, delay: f64) {
+        let rate = self.engine.status.sample_rate;
         self.engine.pad(PadCmd::StopAll);
         // L'ancien pilote est libéré avant (ASIO n'en accepte qu'un à la fois).
         self.engine = Engine::offline();
-        // Ouverture hors du thread de l'interface quand c'est sûr : pas de gel de l'écran
-        // à chaque essai. Les pilotes ASIO (objets COM du système) et CoreAudio restent
-        // ouverts ici, sur le thread principal, comme à l'ouverture normale.
-        #[cfg(not(target_os = "macos"))]
-        if self.prefs.host.as_deref() != Some("ASIO") {
-            let (prefs, pad) = (self.prefs.clone(), self.prefs.pad_out());
-            let (tx, rx) = std::sync::mpsc::channel();
-            if std::thread::Builder::new()
-                .name("tracksplus-reconnect".into())
-                .spawn(move || {
-                    let _ = tx.send(Engine::open(&prefs, &pad));
-                })
-                .is_ok()
-            {
-                self.reconnect_job = Some((self.now, rx));
-                return;
-            }
+        let mut prefs = self.prefs.clone();
+        prefs.sample_rate = prefs.sample_rate.or(Some(rate));
+        let open =
+            |p: &AudioPrefs| Engine::open(p, &p.pad_out()).unwrap_or_else(|_| Engine::offline());
+        let mut e = open(&prefs);
+        if e.open_mask() == 0 && self.prefs.sample_rate.is_none() && e.open_errors().is_some() {
+            drop(e);
+            e = open(&self.prefs);
         }
-        let opened = Engine::open(&self.prefs, &self.prefs.pad_out());
-        self.finish_reconnect(opened, delay);
+        self.engine = e;
+        let now = self.now;
+        self.hb = [(0, now); audio::SLOTS];
+        self.reconnect_done(audio::LOST_ALL, delay, rate);
     }
 
-    fn finish_reconnect(&mut self, opened: anyhow::Result<Engine>, delay: f64) {
-        let complete = match &opened {
-            // Tous les périphériques choisis sont-ils revenus ? (Sinon le moteur tourne avec
-            // ce qui est là, et on réessaie : DVS met parfois plusieurs secondes.)
-            Ok(e) => {
-                let back =
-                    |want: &Option<String>, got: &Option<String>| want.is_none() || want == got;
-                back(&self.prefs.input, &e.status.input)
-                    && back(&self.prefs.output, &e.status.output)
-            }
-            Err(_) => false,
-        };
-        if let Ok(e) = opened {
-            self.engine = e;
-            self.cache.set_sample_rate(self.engine.status.sample_rate);
-            self.sync_engine_to_board();
+    /// Après un essai : soundboard et monitoring rebranchés, puis carte complète (fin des
+    /// essais) ou nouvel essai plus tard, en disant clairement ce qui manque encore.
+    fn reconnect_done(&mut self, touched: u8, delay: f64, rate_before: u32) {
+        self.after_engine_change();
+        for msg in self.engine.take_renamed() {
+            self.notify(msg, false);
         }
-        if complete {
+        let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
+        let need = lost | self.engine.missing();
+        let asio = self.prefs.host.as_deref() == Some("ASIO");
+        if need == 0 {
             self.reconnect = None;
-            self.notify("Carte son reconnectée", false);
+            self.reconnect_wait = false;
+            self.device_note.clear();
+            if touched != 0 {
+                self.notify("Carte son reconnectée", false);
+            }
         } else {
-            // Essais de plus en plus espacés (jusqu'à 10 s) : l'interface ne saccade pas
-            // tant que la carte est absente.
-            self.reconnect = Some((self.now + delay, (delay * 2.0).min(10.0)));
+            self.reconnect = Some((self.now + delay, next_delay(delay, asio)));
+            if touched != 0 {
+                let what = self.engine.problems(lost).join(" · ");
+                self.device_notice(format!("Carte son : {what} — nouvel essai automatique…"));
+            }
+        }
+        // Carte revenue à une autre fréquence que la session : lecture et prise bloquées,
+        // on le dit tout de suite (pas au moment d'appuyer sur Lecture en plein spectacle).
+        if rate_before != self.engine.status.sample_rate
+            && let Some(msg) = self.rate_mismatch()
+        {
+            self.notify(
+                format!("Carte son revenue à une autre fréquence. {msg}"),
+                true,
+            );
+        }
+    }
+
+    /// Nouveau moteur ou flux rouverts : soundboard, MIDI et monitoring rebranchés (même
+    /// fenêtre réduite : le retour casque des musiciens revient tout de suite).
+    fn after_engine_change(&mut self) {
+        self.cache.set_sample_rate(self.engine.status.sample_rate);
+        self.sync_engine_to_board();
+        self.sync_monitoring();
+    }
+
+    /// Message persistant sur l'état de la carte, donné une fois par situation (il ne
+    /// réapparaît pas à chaque essai tant que rien ne change).
+    fn device_notice(&mut self, text: String) {
+        if self.device_note != text {
+            self.device_note = text.clone();
+            self.notify(text, true);
+        }
+    }
+
+    /// Contrôleurs MIDI débranchés / rebranchés (même fenêtre réduite) : la liste des ports
+    /// est relue en arrière-plan, le contrôleur choisi est reconnecté dès son retour.
+    fn watch_midi(&mut self) {
+        let want = self.board.midi_port.clone();
+        let Some(change) = self.midi.watch_ports(self.now, want.as_deref()) else {
+            return;
+        };
+        self.midi_ports = change.ports;
+        if !change.lost.is_empty() {
+            self.notify(
+                format!("Contrôleur MIDI débranché : {}", change.lost.join(", ")),
+                true,
+            );
+        }
+        if change.reconnect {
+            self.midi.connect(want.as_deref());
+            let led = self.board.led_port.clone();
+            self.midi.connect_leds(led.as_deref());
+            // Disposition du contrôleur et LED renvoyées au prochain passage.
+            self.sb.layout_port = None;
+            self.sb.midi_dirty = true;
+            if !self.midi.connected.is_empty() {
+                self.notify(
+                    format!(
+                        "Contrôleur MIDI reconnecté : {}",
+                        self.midi.connected.join(", ")
+                    ),
+                    false,
+                );
+            }
+        } else if !change.lost.is_empty() {
+            self.sb.layout_port = None;
+            self.sb.midi_dirty = true;
         }
     }
 
@@ -1561,6 +2014,36 @@ impl App {
             };
             ui.label(egui::RichText::new(txt).color(col));
         }
+        // Perte de la carte son pendant une prise (réglage de l'ordinateur, appliqué tout de
+        // suite, sans rouvrir la carte).
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new("PERTE DE LA CARTE SON")
+                .font(t::caps(10.0))
+                .color(t::TEXT_3),
+        );
+        ui.add_space(4.0);
+        let mut auto = self.prefs.auto_restart;
+        if ui
+            .checkbox(
+                &mut auto,
+                "Relancer la prise automatiquement dès le retour de la carte",
+            )
+            .changed()
+        {
+            self.prefs.auto_restart = auto;
+            self.prefs.save();
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Carte débranchée, pilote relancé, horloge Dante perdue : ce qui a été capté \
+                 est sauvegardé, puis une nouvelle prise démarre sur les mêmes pistes dès que \
+                 la carte revient, à sa place sur la timeline. Un signal qui revient tout \
+                 seul en moins de 20 s ne coupe même pas la prise.",
+            )
+            .color(t::TEXT_3),
+        );
     }
 
     /// Choix du dossier de la copie (sélecteur du système) ; refusé sur le disque de la
@@ -1738,12 +2221,22 @@ impl App {
                 .input
                 .as_deref()
                 .is_some_and(|n| n.to_lowercase().contains("dante"));
-            alerts.push(if dante {
-                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion et l'horloge Dante"
-                    .to_string()
-            } else {
-                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion".to_string()
-            });
+            // La prise reste ouverte : si le signal revient, le trou est comblé par du
+            // silence et la suite reste à sa place ; sinon arrêt (et relance au retour).
+            let left = (REC_STALL_STOP - (self.now - self.rec_watch.1))
+                .max(0.0)
+                .ceil();
+            alerts.push(format!(
+                "PLUS DE SIGNAL DE LA CARTE SON — vérifiez la connexion{} · la prise continue, arrêt dans {left:.0} s si rien ne revient",
+                if dante { " et l'horloge Dante" } else { "" }
+            ));
+        }
+        let gap = self.engine.shared.rec_gap_frames.load(Ordering::Relaxed);
+        if gap > 0 {
+            alerts.push(format!(
+                "Entrée interrompue pendant la prise : {} de silence inséré (la suite reste à sa place)",
+                fmt_gap(gap as f64 / self.sr() as f64)
+            ));
         }
         let ov = self.engine.shared.overruns.load(Ordering::Relaxed);
         if ov > 0 {
@@ -2565,41 +3058,54 @@ impl App {
         self.add_stereo = stereo;
     }
 
-    pub fn apply_audio(&mut self, prefs: AudioPrefs) -> Result<(), String> {
+    pub fn apply_audio(&mut self, mut prefs: AudioPrefs) -> Result<(), String> {
+        // Réglé à part (onglet Enregistrement), appliqué tout de suite : jamais écrasé ici.
+        prefs.auto_restart = self.prefs.auto_restart;
         if self.editing_locked() {
             return Err("Impossible de changer de carte son pendant un enregistrement : arrêtez d'abord la prise.".into());
         }
-        self.stop();
         // Choix explicite de l'utilisateur : une reconnexion automatique en cours s'efface.
         // Si elle est en train d'ouvrir la carte, on attend qu'elle ait fini (et on jette
-        // son résultat) : jamais deux ouvertures du même périphérique en même temps.
-        self.reconnect = None;
-        if let Some((_, rx)) = self.reconnect_job.take() {
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // son résultat) : jamais deux ouvertures du même périphérique en même temps. Un
+        // pilote qui ne répond plus du tout : on ne l'ouvre pas une seconde fois.
+        if let Some((_, rx, _)) = &self.reconnect_job {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("Le pilote de la carte son ne répond plus (ouverture bloquée) : réessayez dans un instant, ou débranchez puis rebranchez la carte.".into());
+                }
+                // (Résultat jeté ici : ses flux sont fermés.)
+                _ => self.reconnect_job = None,
+            }
         }
+        self.stop();
+        self.reconnect = None;
+        self.reconnect_wait = false;
+        self.device_note.clear();
         self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
-        let res = match Engine::open(&prefs, &prefs.pad_out()) {
-            Ok(e) => {
-                self.engine = e;
-                self.prefs = prefs;
-                self.prefs.save();
-                if !self.project.has_audio() {
-                    self.project.sample_rate = self.engine.status.sample_rate;
-                }
-                Ok(())
-            }
-            Err(e) => {
-                if let Ok(old) = Engine::open(&self.prefs, &self.prefs.pad_out()) {
-                    self.engine = old;
-                }
-                Err(format!("{e:#}"))
-            }
-        };
-        self.cache.set_sample_rate(self.engine.status.sample_rate);
+        // Un flux refusé n'empêche pas les autres : la carte tourne avec ce qui s'ouvre, et
+        // l'erreur reste affichée dans les réglages pour être corrigée.
+        // Rien du tout ne s'ouvre avec les nouveaux réglages : on revient aux anciens.
+        let open =
+            |p: &AudioPrefs| Engine::open(p, &p.pad_out()).unwrap_or_else(|_| Engine::offline());
+        let engine = open(&prefs);
+        let res = engine.open_errors().map_or(Ok(()), Err);
+        if engine.open_mask() == 0 && res.is_err() {
+            drop(engine);
+            self.engine = open(&self.prefs);
+        } else {
+            self.engine = engine;
+            self.prefs = prefs;
+            self.prefs.save();
+        }
+        if !self.project.has_audio() {
+            self.project.sample_rate = self.engine.status.sample_rate;
+        }
+        let now = self.now;
+        self.hb = [(0, now); audio::SLOTS];
         self.out_devices = audio::list_devices(self.prefs.host.as_deref()).1;
-        self.sync_engine_to_board();
+        self.after_engine_change();
         res
     }
 
@@ -2917,40 +3423,73 @@ impl App {
             m[1].update(v[1], now, dt);
         }
         // Espace libre mesuré dans un thread : un disque lent, en veille ou réseau
-        // déconnecté ne fige jamais l'interface (une seule mesure en cours à la fois).
-        if let Some((since, dir, rx)) = &self.disk_job {
+        // déconnecté ne fige jamais l'interface. Disque de la session et second disque
+        // mesurés à part : un second disque bloqué ne fige jamais la mesure du principal.
+        // Une seule mesure en cours par disque, jamais abandonnée tant que la session ne
+        // change pas (un disque qui ne répond plus n'accumule pas de threads bloqués) : au
+        // bout de 10 s, il est signalé comme ne répondant plus.
+        let main_dir = Some(self.project.dir.clone());
+        let backup_dir = self.backup_session_dir();
+        let poll = |job: &mut Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
+                    want: &Option<PathBuf>|
+         -> DiskPoll {
+            use std::sync::mpsc::TryRecvError;
+            let Some((since, dir, rx)) = job else {
+                return DiskPoll::Idle;
+            };
+            if want.as_ref() != Some(dir) {
+                // Session (ou second disque) changé : la mesure de l'ancien ne compte plus.
+                *job = None;
+                return DiskPoll::Idle;
+            }
             match rx.try_recv() {
                 Ok(free) => {
-                    if *dir == self.project.dir {
-                        self.disk_free = free.main;
-                        self.backup_free = free.backup;
-                    }
-                    self.disk_job = None;
+                    *job = None;
+                    DiskPoll::Done(free)
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.disk_job = None,
-                // Mesure bloquée (disque qui ne répond plus) ou session changée : on
-                // l'abandonne pour que les suivantes repartent.
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if now - since > 10.0 || *dir != self.project.dir {
-                        self.disk_job = None;
-                    }
+                Err(TryRecvError::Disconnected) => {
+                    *job = None;
+                    DiskPoll::Done(None)
                 }
+                Err(TryRecvError::Empty) if now - *since > 10.0 => DiskPoll::Stuck,
+                Err(TryRecvError::Empty) => DiskPoll::Busy,
             }
+        };
+        match poll(&mut self.disk_job, &main_dir) {
+            DiskPoll::Done(free) => self.disk_free = free,
+            // Valeur inconnue plutôt que périmée (l'alerte « disque presque plein » ne
+            // s'appuie jamais sur une ancienne mesure).
+            DiskPoll::Stuck => self.disk_free = None,
+            _ => {}
         }
-        if now - self.disk_checked > 2.0 && self.disk_job.is_none() {
+        match poll(&mut self.backup_disk_job, &backup_dir) {
+            DiskPoll::Done(free) => self.backup_free = Some(free.ok_or(())),
+            DiskPoll::Stuck => self.backup_free = Some(Err(())),
+            _ => {}
+        }
+        if backup_dir.is_none() {
+            self.backup_free = None;
+        }
+        if now - self.disk_checked > 2.0 {
             self.disk_checked = now;
-            let dir = self.project.dir.clone();
-            let backup = self.backup_session_dir();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let spawned = std::thread::Builder::new()
-                .name("tracksplus-disk-space".into())
-                .spawn(move || {
-                    let main = free_space(&dir);
-                    let backup = backup.map(|b| free_space(&b).ok_or(()));
-                    let _ = tx.send(DiskSpace { main, backup });
-                });
-            if spawned.is_ok() {
-                self.disk_job = Some((now, self.project.dir.clone(), rx));
+            let spawn = |dir: PathBuf| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let d = dir.clone();
+                std::thread::Builder::new()
+                    .name("tracksplus-disk-space".into())
+                    .spawn(move || {
+                        let _ = tx.send(free_space(&d));
+                    })
+                    .ok()
+                    .map(|_| (now, dir, rx))
+            };
+            if self.disk_job.is_none() {
+                self.disk_job = spawn(self.project.dir.clone());
+            }
+            if self.backup_disk_job.is_none()
+                && let Some(b) = backup_dir
+            {
+                self.backup_disk_job = spawn(b);
             }
         }
     }
@@ -3522,6 +4061,8 @@ impl App {
                 ui.add_space(12.0);
                 if dlg.tab == 1 {
                     self.rec_settings(ui);
+                    // (Réglage appliqué tout de suite : le dialogue suit.)
+                    dlg.prefs.auto_restart = self.prefs.auto_restart;
                     return;
                 }
                 if dlg.tab == 2 {
@@ -4755,6 +5296,7 @@ impl eframe::App for App {
             self.poll_save_as();
             self.poll_play_errors();
             self.watch_device();
+            self.watch_midi();
             self.poll_import();
             self.soundboard_background(ctx);
             self.update_background(ctx);
@@ -5315,6 +5857,39 @@ pub fn open_in_file_manager(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Prise relancée après une perte de la carte : posée à l'heure réelle (fin de ce qui a
+    /// été capté + durée du trou), jamais avant.
+    #[test]
+    fn resumed_take_lands_after_the_gap() {
+        assert_eq!(
+            super::resume_position(480_000, 4.5, 48000),
+            480_000 + 216_000
+        );
+        assert_eq!(super::resume_position(1000, -3.0, 48000), 1000);
+        assert_eq!(super::fmt_gap(4.25), "4,2 s");
+        assert_eq!(super::fmt_gap(125.0), "2 min 05");
+    }
+
+    /// Une erreur affichée n'est jamais effacée par le message suivant : il s'ajoute, et
+    /// le texte reste d'une longueur lisible (le plus récent toujours en entier).
+    #[test]
+    fn toast_messages_pile_up_without_growing_forever() {
+        let a = super::join_toast("Carte son perdue pendant la prise", "Carte son reconnectée");
+        assert_eq!(
+            a,
+            "Carte son perdue pendant la prise · Carte son reconnectée"
+        );
+        let long = "x".repeat(400);
+        let b = super::join_toast(&format!("{long} · {long}"), "dernier");
+        assert!(
+            b.ends_with("dernier") && b.chars().count() <= 600,
+            "{}",
+            b.len()
+        );
+        let huge = "y".repeat(900);
+        assert_eq!(super::join_toast("ancien", &huge), huge);
+    }
+
     /// Copie de sécurité : sons du soundboard copiés, pads pointant vers la copie (qui
     /// marche donc sans le disque principal) ; un son hors de la session garde son chemin.
     #[test]
