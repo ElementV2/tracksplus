@@ -306,7 +306,7 @@ pub struct App {
     /// Dernier changement de session refusé faute de sauvegarde (voir `save_before_leaving`).
     pub leave_anyway_at: f64,
     /// Mesure de l'espace disque libre en cours (thread).
-    pub disk_job: Option<std::sync::mpsc::Receiver<Option<u64>>>,
+    pub disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
     /// La prise en cours est faite en écoutant les pistes existantes.
@@ -844,14 +844,16 @@ impl App {
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
                 Player::start(&self.project, self.playhead, self.project.audible());
-            // Sortie bloquée : la prise se fait quand même, sans la lecture des pistes.
-            if !self.engine.start_playback(cons) {
+            if self.engine.start_playback(cons) {
+                self.player = Some(player);
+                self.play_base = self.playhead;
+                self.rec_overdub = true;
+                self.rec_latency = self.engine.round_trip_latency() as u64;
+            } else {
+                // Sortie bloquée : la prise se fait quand même, sans la lecture des pistes
+                // (donc sans compensation de latence : rien n'a été joué).
                 self.notify(OUTPUT_STALLED, true);
             }
-            self.player = Some(player);
-            self.play_base = self.playhead;
-            self.rec_overdub = true;
-            self.rec_latency = self.engine.round_trip_latency() as u64;
         }
         if let Err(e) = self.engine.start_record(targets) {
             recovery::remove_journal(&self.project.dir);
@@ -1029,8 +1031,16 @@ impl App {
             // Une prise longue peut être répartie sur plusieurs fichiers : une prise par
             // fichier, chacune à sa position dans la prise (bout à bout, ou avec un trou
             // après une erreur d'écriture).
+            let take_len = r.frames();
             for seg in &r.segments {
-                if seg.frames == 0 {
+                let _ = std::fs::remove_file(
+                    self.project
+                        .audio_dir()
+                        .join(crate::recorder::start_sidecar(&seg.file)),
+                );
+                // Fichier vide, ou entièrement avant la latence (morceau d'avant le début,
+                // coupé par une erreur) : rien à poser.
+                if seg.frames == 0 || (seg.start + seg.frames <= lat && take_len > lat) {
                     let _ = std::fs::remove_file(self.project.audio_dir().join(&seg.file));
                     continue;
                 }
@@ -1039,7 +1049,9 @@ impl App {
                     // La forme d'onde en direct couvre toute la prise ; chaque fichier en a
                     // une à lui, calculée à part pour rester exacte.
                     let path = self.project.audio_dir().join(&seg.file);
-                    if r.segments.len() == 1 {
+                    // (La forme d'onde en direct couvre la prise depuis sa première trame :
+                    // valable seulement si ce fichier est toute la prise.)
+                    if r.segments.len() == 1 && seg.start == 0 && seg.frames == take_len {
                         // Fichier fermé : sa forme d'onde est mise en cache pour les
                         // prochaines ouvertures de la session.
                         p.write().shrink();
@@ -1500,6 +1512,14 @@ impl App {
     /// n'abandonne pas la session en cours (disque plein, clé retirée…). Un second essai
     /// dans les 10 s passe outre, pour ne jamais rester bloqué.
     pub fn save_before_leaving(&mut self) -> bool {
+        self.save_before(
+            "Session en cours non sauvegardée : changement annulé. Recommencez pour \
+             changer quand même (les modifications non sauvegardées seront perdues).",
+        )
+    }
+
+    /// Comme `save_before_leaving`, avec le message à afficher en cas d'échec.
+    pub fn save_before(&mut self, refused: &str) -> bool {
         let mut ok = true;
         if self.project.dirty
             && self.worth_saving()
@@ -1518,11 +1538,7 @@ impl App {
             return true;
         }
         self.leave_anyway_at = self.now;
-        self.notify(
-            "Session en cours non sauvegardée : changement annulé. Recommencez pour \
-             changer quand même (les modifications non sauvegardées seront perdues).",
-            true,
-        );
+        self.notify(refused, true);
         false
     }
 
@@ -2274,14 +2290,22 @@ impl App {
         }
         // Espace libre mesuré dans un thread : un disque lent, en veille ou réseau
         // déconnecté ne fige jamais l'interface (une seule mesure en cours à la fois).
-        if let Some(rx) = &self.disk_job {
+        if let Some((since, dir, rx)) = &self.disk_job {
             match rx.try_recv() {
                 Ok(free) => {
-                    self.disk_free = free;
+                    if *dir == self.project.dir {
+                        self.disk_free = free;
+                    }
                     self.disk_job = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.disk_job = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // Mesure bloquée (disque qui ne répond plus) ou session changée : on
+                // l'abandonne pour que les suivantes repartent.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if now - since > 10.0 || *dir != self.project.dir {
+                        self.disk_job = None;
+                    }
+                }
             }
         }
         if now - self.disk_checked > 2.0 && self.disk_job.is_none() {
@@ -2301,7 +2325,7 @@ impl App {
                     let _ = tx.send(fs4::available_space(p).ok());
                 });
             if spawned.is_ok() {
-                self.disk_job = Some(rx);
+                self.disk_job = Some((now, self.project.dir.clone(), rx));
             }
         }
     }

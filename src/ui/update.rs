@@ -46,7 +46,10 @@ impl App {
             // Tout est sauvegardé avant que l'installeur ne ferme l'application ; sinon
             // (disque plein, clé retirée) on ne ferme pas.
             self.board_changed = Some(self.now);
-            if !self.save_before_leaving() {
+            if !self.save_before(
+                "Session non sauvegardée : installation annulée. Recliquez « Installer » \
+                 dans les 10 s pour installer quand même (modifications non sauvegardées perdues).",
+            ) {
                 return;
             }
             match update::launch_installer(&file) {

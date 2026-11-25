@@ -77,6 +77,12 @@ impl RecResult {
     }
 }
 
+/// Fichier « <nom>.start » : position (trames) d'un fichier repris après une erreur
+/// d'écriture, pour que la récupération après un crash le pose à sa vraie place.
+pub fn start_sidecar(file: &str) -> String {
+    format!("{file}.start")
+}
+
 /// Nom du k-ième fichier d'une prise (k = 1 : nom de base).
 pub fn segment_name(base: &str, k: usize) -> String {
     if k <= 1 {
@@ -202,6 +208,11 @@ impl LaneState {
                 w.start = self.elapsed;
                 self.retry_at = None;
                 self.cur = Some(w);
+                // Position notée à côté du fichier (récupération après un crash).
+                let _ = std::fs::write(
+                    self.dir.join(start_sidecar(&name)),
+                    self.elapsed.to_string(),
+                );
             }
             Err(_) => self.retry_at = Some(Instant::now() + RETRY_EVERY),
         }
@@ -792,6 +803,9 @@ mod tests {
         assert_eq!(rec_errors_count(&res), 1);
         let seg = &res[0].segments[0];
         assert_eq!((seg.start, seg.frames), (3000, 2000));
+        // Position notée à côté du fichier, pour la récupération après un crash.
+        let side = std::fs::read_to_string(dir.join(start_sidecar(&seg.file))).unwrap();
+        assert_eq!(side, "3000");
         let r = hound::WavReader::open(dir.join(&seg.file)).unwrap();
         assert_eq!(r.duration(), 2000);
         std::fs::remove_dir_all(dir).ok();

@@ -447,7 +447,12 @@ impl App {
                     }
                     // « Enregistrer sous » entre-temps : la session courante pointe encore
                     // sur l'original, on le copie aussi chez elle.
-                    if self.board.all_pads().any(|(_, p)| p.path == src) {
+                    let queued = self
+                        .sb
+                        .copies
+                        .iter()
+                        .any(|c| c.src == src && c.dir == self.project.dir);
+                    if !queued && self.board.all_pads().any(|(_, p)| p.path == src) {
                         let (tx, rx) = std::sync::mpsc::channel();
                         copy_worker(src.clone(), self.project.dir.clone(), tx);
                         self.sb.copies.push(PendingCopy {

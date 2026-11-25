@@ -137,12 +137,28 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                     Err(_) => break,
                 },
             };
+            // Fichier repris après une erreur d'écriture : sa vraie position est notée.
+            let side = project
+                .audio_dir()
+                .join(crate::recorder::start_sidecar(&file));
+            if let Some(s) = std::fs::read_to_string(&side)
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+            {
+                seg_start = s.min(crate::project::MAX_POS);
+            }
+            let _ = std::fs::remove_file(&side);
             if frames == 0 {
                 continue;
             }
             // Même recalage qu'à la fin normale d'une prise : début du premier fichier
             // sauté de la latence (vaut aussi pour placer les fichiers suivants).
             let lat = j.latency.min(crate::project::MAX_POS);
+            // Morceau entièrement avant la latence (coupé par une erreur) : rien à poser.
+            if seg_start > 0 && seg_start + frames <= lat {
+                seg_start += frames;
+                continue;
+            }
             let skip = lat
                 .saturating_sub(seg_start)
                 .min(frames.saturating_sub(crate::project::MIN_CLIP));
@@ -294,6 +310,55 @@ mod tests {
         assert!(!journal_path(&dir).exists());
         // Rejouer la récupération ne duplique rien.
         assert_eq!(recover(&mut q).unwrap(), 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Prise coupée par une erreur d'écriture puis reprise : après un crash, le fichier
+    /// repris retrouve sa vraie place grâce à sa position notée à côté.
+    #[test]
+    fn recover_places_resumed_file_after_gap() {
+        let dir = std::env::temp_dir().join(format!("tp-recover-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("G".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let t = p.add_track(Some("Voix".into()), Some(0));
+        p.save().unwrap();
+        write_wav(&p.audio_dir().join("Voix_001.wav"), 4800);
+        // 1000 trames perdues, puis reprise à la trame 5800.
+        write_wav(&p.audio_dir().join("Voix_001_p2.wav"), 2000);
+        std::fs::write(
+            p.audio_dir()
+                .join(crate::recorder::start_sidecar("Voix_001_p2.wav")),
+            "5800",
+        )
+        .unwrap();
+        write_journal(
+            &dir,
+            &Journal {
+                start: 0,
+                play_offset: 0,
+                latency: 100,
+                sample_rate: 48000,
+                takes: vec![JournalTake {
+                    track_id: t,
+                    file: "Voix_001.wav".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let mut q = Project::load(&p.file_path()).unwrap();
+        assert_eq!(recover(&mut q).unwrap(), 2);
+        let c: Vec<_> = q.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.start, c.offset, c.len))
+            .collect();
+        assert_eq!(c, [(0, 100, 4700), (5800 - 100, 0, 2000)]);
+        assert!(
+            !p.audio_dir()
+                .join(crate::recorder::start_sidecar("Voix_001_p2.wav"))
+                .exists()
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }
