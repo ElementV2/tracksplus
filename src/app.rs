@@ -583,6 +583,9 @@ impl App {
             Ok(d) => (d, None),
             Err(e) => (None, Some(e)),
         };
+        // Après la lecture du réglage de la copie (qui peut encore se trouver dans ce
+        // fichier) : réglages de l'accueil abîmés mis de côté, à signaler.
+        let prefs_notice = crate::sessions::check_startup_prefs();
         let mut project = Project::untitled(engine.status.sample_rate);
         let n = engine.status.in_channels.clamp(1, 2);
         for i in 0..n {
@@ -738,9 +741,15 @@ impl App {
             app.welcome = Some(crate::ui::welcome::Welcome::with_ctx(&cc.egui_ctx));
             app.start_screen = true;
         }
-        if let Some(e) = &app.backup_prefs_error {
-            let msg = format!("Copie de sécurité : réglage illisible ({e}), copie inactive");
-            app.notify(msg, true);
+        // Un seul message s'affiche à la fois : les deux sont réunis.
+        let launch_warnings: Vec<String> = app
+            .backup_prefs_error
+            .iter()
+            .map(|e| format!("Copie de sécurité : réglage illisible ({e}), copie inactive"))
+            .chain(prefs_notice)
+            .collect();
+        if !launch_warnings.is_empty() {
+            app.notify(launch_warnings.join(" · "), true);
         }
         if let Some(e) = err {
             let mut d = SettingsDialog::new(&app.prefs);
@@ -893,6 +902,19 @@ impl App {
         if self.disk_stalled {
             self.notify(
                 "Le disque ne répondait plus à la fin de la dernière prise : relancez TracksPlus avant d'enregistrer à nouveau (les prises seront récupérées)",
+                true,
+            );
+            return;
+        }
+        // Session qui ne peut pas être enregistrée (lecture seule, fichier d'une autre
+        // session) : la prise ne serait notée nulle part dans la session, et son journal de
+        // secours serait remplacé par celui de la prise suivante. Refus avant tout (la
+        // lecture en cours continue).
+        if let Some(why) = self.project.save_refused() {
+            self.notify(
+                format!(
+                    "Prise impossible : la session ne peut pas être enregistrée ({why}). Faites d'abord « Enregistrer sous »."
+                ),
                 true,
             );
             return;
@@ -1702,8 +1724,12 @@ impl App {
             self.backup_thread = h;
             tx
         });
+        // Heure de l'état copié : le double garde celle de son contenu, même écrit plus tard
+        // (second disque lent), pour départager les versions de secours (`Project::open`).
+        let mut project = self.project.clone();
+        project.mark_state_time();
         let _ = tx.send(BackupJob {
-            project: self.project.clone(),
+            project,
             dir,
             journal,
             done,
@@ -4900,6 +4926,9 @@ impl eframe::App for App {
             self.complete_journal();
             self.poll_finishing(false);
             self.poll_save_as();
+            if let Some(m) = crate::sessions::take_prefs_notice() {
+                self.notify(m, true);
+            }
             self.poll_play_errors();
             self.watch_device();
             self.poll_import();

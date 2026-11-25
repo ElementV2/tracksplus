@@ -44,11 +44,23 @@ pub struct StartupPrefs {
     pub extra: crate::project::Extra,
 }
 
+/// Erreur de lecture d'un fichier de réglages.
+#[derive(Debug)]
+struct PrefsError {
+    msg: String,
+    /// Le fichier se lit mais son contenu n'est pas valide (abîmé pour de bon), par
+    /// opposition à une erreur de lecture, peut-être passagère (fichier verrouillé).
+    invalid: bool,
+}
+
 /// Lit un fichier de réglages JSON : `Ok(None)` s'il n'existe pas encore, `Err` s'il ne se
 /// lit pas (verrouillé, abîmé) — jamais des réglages par défaut qui l'écraseraient ensuite.
 /// Trois essais espacés de 50 ms.
-fn read_prefs<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
-    let mut last = String::new();
+fn read_prefs<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, PrefsError> {
+    let mut last = PrefsError {
+        msg: String::new(),
+        invalid: false,
+    };
     for i in 0..3 {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -56,13 +68,32 @@ fn read_prefs<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, 
         match std::fs::read_to_string(path) {
             Ok(s) => match serde_json::from_str(&s) {
                 Ok(v) => return Ok(Some(v)),
-                Err(e) => last = format!("{} illisible ({e})", path.display()),
+                Err(e) => {
+                    last = PrefsError {
+                        msg: format!("{} illisible ({e})", path.display()),
+                        invalid: true,
+                    }
+                }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => last = format!("lecture de {} impossible ({e})", path.display()),
+            Err(e) => {
+                last = PrefsError {
+                    msg: format!("lecture de {} impossible ({e})", path.display()),
+                    invalid: false,
+                }
+            }
         }
     }
     Err(last)
+}
+
+/// Message à montrer une fois à l'utilisateur : réglages de l'accueil abîmés, remis à zéro
+/// (voir `StartupPrefs::update`). Relevé par l'interface (`take_prefs_notice`).
+static PREFS_NOTICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Message en attente sur les réglages de l'accueil (une seule fois).
+pub fn take_prefs_notice() -> Option<String> {
+    PREFS_NOTICE.try_lock().ok().and_then(|mut n| n.take())
 }
 
 impl StartupPrefs {
@@ -78,31 +109,80 @@ impl StartupPrefs {
             .unwrap_or_default()
     }
 
-    fn save(&self) -> bool {
-        match (Self::path(), serde_json::to_string_pretty(self)) {
-            (Some(p), Ok(s)) => crate::project::write_atomic(&p, s.as_bytes()).is_ok(),
-            _ => false,
+    fn save_to(&self, path: &Path) -> bool {
+        match serde_json::to_string_pretty(self) {
+            Ok(s) => crate::project::write_atomic(path, s.as_bytes()).is_ok(),
+            Err(_) => false,
         }
     }
 
-    /// Modifie les réglages enregistrés. Fichier présent mais illisible : rien n'est écrit
-    /// (il n'est jamais remplacé par des réglages par défaut). Renvoie `true` si c'est écrit.
+    /// Modifie les réglages enregistrés. Fichier momentanément illisible (verrouillé) :
+    /// rien n'est écrit. Fichier abîmé pour de bon : mis de côté (`startup.illisible-….json`),
+    /// les réglages repartent de zéro, et l'utilisateur en est prévenu une fois (au lieu de
+    /// ne plus jamais pouvoir les mettre à jour). Renvoie `true` si c'est écrit.
     pub fn update(f: impl FnOnce(&mut Self)) -> bool {
-        let Some(path) = Self::path() else {
-            return false;
-        };
-        match read_prefs::<Self>(&path) {
-            Ok(prefs) => {
-                let mut prefs = prefs.unwrap_or_default();
-                f(&mut prefs);
-                prefs.save()
-            }
-            Err(e) => {
-                eprintln!("Réglages de l'accueil non modifiés : {e}");
-                false
-            }
+        match Self::path() {
+            Some(path) => Self::update_at(&path, f),
+            None => false,
         }
     }
+
+    fn update_at(path: &Path, f: impl FnOnce(&mut Self)) -> bool {
+        let mut prefs = match read_prefs::<Self>(path) {
+            Ok(prefs) => prefs.unwrap_or_default(),
+            Err(e) if e.invalid => match set_aside_invalid(path, &e) {
+                Some(()) => Self::default(),
+                None => return false,
+            },
+            Err(e) => {
+                eprintln!("Réglages de l'accueil non modifiés : {}", e.msg);
+                return false;
+            }
+        };
+        f(&mut prefs);
+        prefs.save_to(path)
+    }
+}
+
+/// Réglages de l'accueil abîmés pour de bon : le fichier est mis de côté et l'utilisateur
+/// prévenu (`PREFS_NOTICE`). `None` si la mise de côté a échoué (rien n'est alors écrit).
+fn set_aside_invalid(path: &Path, e: &PrefsError) -> Option<()> {
+    match crate::project::set_aside(path, "illisible", true) {
+        Ok(aside) => {
+            let mut msg = format!(
+                "Réglages de l'accueil illisibles ({}) : sessions récentes et dossier des sons                  remis à zéro. L'ancien fichier est conservé sous « {} ».",
+                e.msg,
+                aside.file_name().unwrap_or_default().to_string_lossy()
+            );
+            // Ancien emplacement du réglage de la copie de sécurité : perdu avec ce fichier.
+            if backup_prefs_path().is_some_and(|b| !b.is_file()) {
+                msg += " Si une copie de sécurité était réglée, choisissez de nouveau le second disque.";
+            }
+            if let Ok(mut n) = PREFS_NOTICE.lock() {
+                *n = Some(msg);
+            }
+            Some(())
+        }
+        Err(err) => {
+            eprintln!(
+                "Réglages de l'accueil non modifiés : {} (mise de côté impossible : {err})",
+                e.msg
+            );
+            None
+        }
+    }
+}
+
+/// Au lancement : réglages de l'accueil abîmés pour de bon mis de côté tout de suite (la
+/// liste de l'accueil repart de zéro, l'utilisateur est prévenu). Renvoie le message.
+pub fn check_startup_prefs() -> Option<String> {
+    let path = StartupPrefs::path()?;
+    if let Err(e) = read_prefs::<StartupPrefs>(&path)
+        && e.invalid
+    {
+        set_aside_invalid(&path, &e);
+    }
+    take_prefs_notice()
 }
 
 /// Dossier de la copie de sécurité sur un second disque (`%APPDATA%\TracksPlus\backup.json`),
@@ -126,11 +206,13 @@ pub fn load_backup_root() -> Result<Option<PathBuf>, String> {
     let Some(path) = backup_prefs_path() else {
         return Ok(None);
     };
-    match read_prefs::<BackupPrefs>(&path)? {
+    match read_prefs::<BackupPrefs>(&path).map_err(|e| e.msg)? {
         Some(b) => Ok(b.backup_dir),
         // Pas encore de `backup.json` : ancien emplacement.
         None => match StartupPrefs::path() {
-            Some(p) => Ok(read_prefs::<StartupPrefs>(&p)?.and_then(|s| s.backup_dir)),
+            Some(p) => Ok(read_prefs::<StartupPrefs>(&p)
+                .map_err(|e| e.msg)?
+                .and_then(|s| s.backup_dir)),
             None => Ok(None),
         },
     }
@@ -380,7 +462,44 @@ mod tests {
         assert_eq!(s.backup_dir, Some(PathBuf::from("E:\\Copie")));
         assert_eq!(serde_json::to_value(&s).unwrap()["futur"], 1);
         std::fs::write(&p, b"{\"backup_dir\": tronqu").unwrap();
-        assert!(read_prefs::<StartupPrefs>(&p).is_err());
+        assert!(read_prefs::<StartupPrefs>(&p).is_err_and(|e| e.invalid));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Réglages de l'accueil abîmés pour de bon : mis de côté (jamais perdus), la mise à
+    /// jour repart de zéro au lieu d'être refusée pour toujours, et l'utilisateur est
+    /// prévenu une fois.
+    #[test]
+    fn invalid_startup_prefs_are_set_aside_and_reset() {
+        let dir = std::env::temp_dir().join(format!("tp-prefs-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("startup.json");
+        // Fichier valide : modifié, champs inconnus gardés.
+        std::fs::write(&p, br#"{"recent":["A"],"futur":1}"#).unwrap();
+        assert!(StartupPrefs::update_at(&p, |s| s.recent.push("B".into())));
+        let s = read_prefs::<StartupPrefs>(&p).unwrap().unwrap();
+        assert_eq!(s.recent, [PathBuf::from("A"), PathBuf::from("B")]);
+        assert_eq!(s.extra["futur"], 1);
+        // Fichier abîmé : mis de côté, réglages repartis de zéro.
+        std::fs::write(&p, b"{\"recent\": [tronqu").unwrap();
+        assert!(StartupPrefs::update_at(&p, |s| s.recent.push("C".into())));
+        let s = read_prefs::<StartupPrefs>(&p).unwrap().unwrap();
+        assert_eq!(s.recent, [PathBuf::from("C")]);
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("startup.illisible-") && n.ends_with(".json"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(
+            std::fs::read(dir.join(&aside[0])).unwrap(),
+            b"{\"recent\": [tronqu"
+        );
+        let notice = take_prefs_notice().unwrap();
+        assert!(notice.contains(&aside[0]), "{notice}");
+        assert!(take_prefs_notice().is_none(), "prévenu une seule fois");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

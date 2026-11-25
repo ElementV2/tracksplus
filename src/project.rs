@@ -225,6 +225,20 @@ pub struct Project {
     /// neuve n'écrase jamais un fichier du même nom déjà présent sur le disque.
     #[serde(skip)]
     owns_file: bool,
+    /// Moment de l'état enregistré (millisecondes depuis 1970, horloge de l'ordinateur) :
+    /// départage les versions de secours à l'ouverture d'un fichier abîmé (voir `open`).
+    #[serde(default)]
+    pub saved_at: i64,
+    /// Moment de l'état copié, s'il a été figé avant la sauvegarde (double de la session
+    /// écrit plus tard par un thread : il garde l'heure de son contenu, pas celle de son
+    /// écriture).
+    #[serde(skip)]
+    pub state_at: Option<i64>,
+    /// Champs inconnus des prises (version plus récente), par identifiant de prise :
+    /// réécrits tels quels (voir `parse_project`, `to_json`). Rangés à part pour que les
+    /// prises restent de simples structures.
+    #[serde(skip)]
+    clip_extra: std::collections::HashMap<u64, Extra>,
 }
 
 /// Fréquence par défaut (fichier sans fréquence ou fréquence nulle).
@@ -249,6 +263,9 @@ impl Project {
             extra: Extra::new(),
             read_only: None,
             owns_file: false,
+            saved_at: 0,
+            state_at: None,
+            clip_extra: Default::default(),
         }
     }
 
@@ -360,6 +377,10 @@ impl Project {
         right.clamp_fades();
         // Juste après la moitié gauche : l'ordre de superposition est conservé.
         t.clips.insert(i + 1, right);
+        // Champs inconnus (version plus récente) : valables pour les deux moitiés.
+        if let Some(e) = self.clip_extra.get(&clip_id).cloned() {
+            self.clip_extra.insert(new_id, e);
+        }
         self.next_id += 1;
         self.dirty = true;
         Some(new_id)
@@ -496,22 +517,13 @@ impl Project {
     /// une session en lecture seule, ou pour une session neuve dont le fichier existe déjà
     /// (ce serait celui d'une autre session).
     fn start_write(&mut self, checkpoint: bool) -> Result<std::sync::mpsc::Receiver<Result<()>>> {
-        if let Some(why) = &self.read_only {
+        if let Some(why) = self.save_refused() {
             bail!("{why}");
         }
-        if !self.owns_file {
-            let path = self.file_path();
-            if path.try_exists().unwrap_or(true) {
-                bail!(
-                    "un fichier de session « {} » existe déjà dans {} : il n'est pas remplacé",
-                    self.name,
-                    self.dir.display()
-                );
-            }
-            self.owns_file = true;
-        }
+        self.owns_file = true;
         let seq = next_save_seq();
-        let snapshot = self.clone();
+        let mut snapshot = self.clone();
+        snapshot.saved_at = self.state_at.take().unwrap_or_else(now_ms);
         self.dirty = false;
         let (tx, rx) = std::sync::mpsc::channel();
         let job_tx = tx.clone();
@@ -525,6 +537,62 @@ impl Project {
             let _ = tx.send(self.write_file(seq, checkpoint));
         }
         Ok(rx)
+    }
+
+    /// Raison pour laquelle toute sauvegarde de la session serait refusée (et le resterait) :
+    /// session en lecture seule, ou session neuve dont le fichier existe déjà (ce serait
+    /// celui d'une autre session). Une prise est alors refusée : elle ne serait écrite nulle
+    /// part dans la session.
+    pub fn save_refused(&self) -> Option<String> {
+        if let Some(why) = &self.read_only {
+            return Some(why.clone());
+        }
+        if !self.owns_file && self.file_path().try_exists().unwrap_or(true) {
+            return Some(format!(
+                "un fichier de session « {} » existe déjà dans {} : il n'est pas remplacé",
+                self.name,
+                self.dir.display()
+            ));
+        }
+        None
+    }
+
+    /// Fige l'heure de l'état actuel : la prochaine sauvegarde de cette copie (double de la
+    /// session, écrit plus tard) la note comme moment de son contenu.
+    pub fn mark_state_time(&mut self) {
+        self.state_at = Some(now_ms());
+    }
+
+    /// Texte JSON du fichier de session, champs inconnus des prises compris.
+    fn to_json(&self) -> serde_json::Result<String> {
+        if self.clip_extra.is_empty() {
+            return serde_json::to_string_pretty(self);
+        }
+        let mut v = serde_json::to_value(self)?;
+        let clips = v
+            .get_mut("tracks")
+            .and_then(|t| t.as_array_mut())
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get_mut("clips").and_then(|c| c.as_array_mut()))
+            .flatten();
+        for c in clips {
+            let Some(obj) = c.as_object_mut() else {
+                continue;
+            };
+            let Some(extra) = obj
+                .get("id")
+                .and_then(|i| i.as_u64())
+                .and_then(|id| self.clip_extra.get(&id))
+            else {
+                continue;
+            };
+            for (k, val) in extra {
+                // Un champ connu n'est jamais remplacé par un champ mis de côté.
+                obj.entry(k.clone()).or_insert_with(|| val.clone());
+            }
+        }
+        serde_json::to_string_pretty(&v)
     }
 
     /// Écriture atomique du fichier de session (fichier temporaire synchronisé puis
@@ -553,7 +621,7 @@ impl Project {
             return Ok(());
         }
         self.ensure_dirs()?;
-        let json = serde_json::to_string_pretty(self)?;
+        let json = self.to_json()?;
         rotate_backups(&path, checkpoint);
         write_atomic(&path, json.as_bytes())?;
         *last = seq;
@@ -569,7 +637,7 @@ impl Project {
 
     /// Session lue depuis le texte `json`, rangée à l'emplacement `path`.
     fn from_json(json: &str, path: &Path) -> Result<Self> {
-        let (mut p, unknown): (Project, bool) = match parse_json(json) {
+        let (mut p, unknown) = match parse_project(json) {
             Ok(r) => r,
             Err(e) => {
                 if let Some(v) = newer_format(json) {
@@ -600,9 +668,12 @@ impl Project {
     }
 
     /// Ouverture d'une session par l'utilisateur. Si le fichier est abîmé (illisible), la
-    /// version précédente la plus récente qui se lit est reprise (copies `.bak`, puis
-    /// `fallbacks`, par exemple le double du second disque) ; le fichier abîmé est mis de
-    /// côté sous un autre nom, jamais écrasé. Renvoie aussi le message à afficher.
+    /// version de secours la plus récente qui se lit est reprise, parmi les copies `.bak` et
+    /// `fallbacks` (par exemple le double du second disque et ses copies) : la plus récente
+    /// d'après l'heure de son contenu (`saved_at`), puis la date du fichier. Le fichier abîmé
+    /// est d'abord copié de côté sous un autre nom, puis remplacé d'un coup par la version
+    /// reprise : il y a toujours un fichier de session à sa place (accueil, récupération au
+    /// lancement). Renvoie aussi le message à afficher.
     pub fn open(path: &Path, fallbacks: &[PathBuf]) -> Result<(Self, Option<String>)> {
         // Lecture impossible (fichier verrouillé, disque absent) : pas de repli, le fichier
         // est peut-être intact.
@@ -618,41 +689,53 @@ impl Project {
         let candidates = backup_paths(path)
             .into_iter()
             .chain(fallbacks.iter().cloned());
-        for cand in candidates {
-            let Ok(text) = read_retrying(&cand) else {
-                continue;
-            };
-            let Ok(mut p) = Self::from_json(&text, path) else {
-                continue;
-            };
-            let from = cand.display();
-            let msg = match set_aside(path, "illisible", false) {
-                Ok(aside) => {
-                    p.dirty = true;
-                    format!(
-                        "Fichier de session illisible : version précédente reprise ({from}). Le \
-                         fichier abîmé est conservé sous « {} » ; les prises plus récentes \
-                         restent dans le dossier Audio.",
-                        aside.file_name().unwrap_or_default().to_string_lossy()
-                    )
-                }
-                Err(e) => {
-                    p.read_only = Some(format!(
-                        "le fichier de session abîmé n'a pas pu être mis de côté ({e}) : utilisez \
-                         « Enregistrer sous »"
-                    ));
-                    format!(
-                        "Fichier de session illisible : version précédente ouverte en lecture \
-                         seule ({from})"
-                    )
-                }
-            };
-            return Ok((p, Some(msg)));
+        let Some(best) = newest_readable(path, candidates) else {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            return Err(err.context(format!(
+                "« {name} » illisible, et aucune version précédente lisible"
+            )));
+        };
+        let Candidate {
+            path: from,
+            text,
+            project: mut p,
+        } = best;
+        let from = from.display();
+        let read_only_msg = || {
+            format!(
+                "Fichier de session illisible : version précédente ouverte en lecture seule \
+                 ({from})"
+            )
+        };
+        if p.read_only.is_some() {
+            // Version de secours d'un format plus récent : rien n'est touché sur le disque.
+            return Ok((p, Some(read_only_msg())));
         }
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        Err(err.context(format!(
-            "« {name} » illisible, et aucune version précédente lisible"
-        )))
+        let aside = match copy_aside(path, "illisible") {
+            Ok(a) => a,
+            Err(e) => {
+                p.read_only = Some(format!(
+                    "le fichier de session abîmé n'a pas pu être mis de côté ({e}) : utilisez \
+                     « Enregistrer sous »"
+                ));
+                return Ok((p, Some(read_only_msg())));
+            }
+        };
+        let aside = aside.file_name().unwrap_or_default().to_string_lossy();
+        // Remplacement d'un coup : à sa place, le fichier abîmé (déjà copié de côté) ou la
+        // version reprise, jamais aucun des deux.
+        let restored = write_atomic(path, text.as_bytes());
+        // Fichier en place resté abîmé : la prochaine sauvegarde le remplacera.
+        p.dirty = restored.is_err();
+        let mut msg = format!(
+            "Fichier de session illisible : version précédente reprise ({from}). Le fichier \
+             abîmé est conservé sous « {aside} » ; les prises plus récentes restent dans le \
+             dossier Audio."
+        );
+        if let Err(e) = restored {
+            msg += &format!(" Elle n'a pas encore pu être réécrite ({e:#}).");
+        }
+        Ok((p, Some(msg)))
     }
 
     /// Corrige un fichier incohérent (ancien, partiel ou modifié à la main) : fréquence
@@ -715,10 +798,16 @@ impl Project {
             next += 1;
             next - 1
         };
+        // Les champs inconnus des prises suivent leur prise.
+        let mut old_extra = std::mem::take(&mut self.clip_extra);
         for t in &mut self.tracks {
             t.id = alloc();
             for c in &mut t.clips {
+                let old = c.id;
                 c.id = alloc();
+                if let Some(e) = old_extra.remove(&old) {
+                    self.clip_extra.insert(c.id, e);
+                }
             }
         }
         for m in &mut self.markers {
@@ -1040,6 +1129,37 @@ fn move_file(src: &Path, dst: &Path, replace: bool) -> std::io::Result<()> {
 /// `nom.<motif>-AAAAMMJJ-HHMMSS.ext` avec `keep_ext`), suivi de `-2`, `-3`… si ce nom est
 /// pris. Renvoie le nouveau chemin.
 pub fn set_aside(path: &Path, tag: &str, keep_ext: bool) -> std::io::Result<PathBuf> {
+    place_aside(path, tag, keep_ext, |dst| rename_no_replace(path, dst))
+}
+
+/// Comme `set_aside`, mais en copiant : le fichier reste en place (copie forcée sur le
+/// disque, jamais par-dessus un fichier existant).
+pub fn copy_aside(path: &Path, tag: &str) -> std::io::Result<PathBuf> {
+    place_aside(path, tag, false, |dst| {
+        let tmp = temp_sibling(dst, "copie");
+        let res = (|| {
+            retrying(|| std::fs::copy(path, &tmp))?;
+            // Accès en écriture : exigé par Windows pour forcer l'écriture sur le disque.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)?
+                .sync_all()?;
+            rename_no_replace(&tmp, dst)
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    })
+}
+
+/// Premier nom libre de mise de côté (voir `set_aside`) sur lequel `place` réussit.
+fn place_aside(
+    path: &Path,
+    tag: &str,
+    keep_ext: bool,
+    mut place: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     let date = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let file = path.file_name().unwrap_or_default().to_string_lossy();
     let (stem, ext) = match (keep_ext, file.rsplit_once('.')) {
@@ -1054,13 +1174,51 @@ pub fn set_aside(path: &Path, tag: &str, keep_ext: bool) -> std::io::Result<Path
             String::new()
         };
         let dst = path.with_file_name(format!("{stem}.{tag}-{date}{extra}{ext}"));
-        match rename_no_replace(path, &dst) {
+        match place(&dst) {
             Ok(()) => return Ok(dst),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
             Err(e) => return Err(e),
         }
     }
     Err(last)
+}
+
+/// Version de secours lisible (voir `newest_readable`).
+struct Candidate {
+    path: PathBuf,
+    text: String,
+    project: Project,
+}
+
+/// Parmi `candidates`, la version lisible la plus récente, rangée à l'emplacement `path` :
+/// d'après l'heure de son contenu (`saved_at`), puis la date de modification du fichier
+/// (fichiers d'une version qui ne notait pas l'heure). Après une prise, la copie `.bak1`
+/// est plus ancienne que le double du second disque ; plus tard, ce peut être l'inverse.
+fn newest_readable(path: &Path, candidates: impl Iterator<Item = PathBuf>) -> Option<Candidate> {
+    let mut best: Option<((i64, std::time::SystemTime), Candidate)> = None;
+    for cand in candidates {
+        let Ok(text) = read_retrying(&cand) else {
+            continue;
+        };
+        let Ok(project) = Project::from_json(&text, path) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&cand)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let key = (project.saved_at, mtime);
+        if best.as_ref().is_none_or(|(k, _)| key > *k) {
+            best = Some((
+                key,
+                Candidate {
+                    path: cand,
+                    text,
+                    project,
+                },
+            ));
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 /// Nombre de versions précédentes gardées (`.bak1` la plus récente … `.bak3`).
@@ -1152,9 +1310,16 @@ fn free_dir_name(root: &Path, base: &str) -> String {
 
 // ------------------------------------------------------------- format des fichiers
 
-/// Version du format des fichiers de session et de soundboard. À augmenter quand une
-/// version précédente de l'application ne saurait plus relire correctement un fichier :
-/// elle l'ouvre alors en lecture seule au lieu de le réécrire en perdant des données.
+/// Version du format des fichiers de session et de soundboard. Une version précédente de
+/// l'application ouvre en lecture seule un fichier d'un format plus récent, au lieu de le
+/// réécrire en perdant des données.
+///
+/// Un champ ajouté (session, piste, prise, repère, soundboard, page, pad) n'impose pas de
+/// l'augmenter : les champs inconnus sont relus et réécrits tels quels (`Extra`, et
+/// `clip_extra` pour les prises). Une nouvelle valeur d'un champ existant est protégée par
+/// `lenient`. À augmenter quand un fichier ne serait plus correct sans ce que la version
+/// précédente ignore (nouveau sens d'un champ existant, nouvel objet hors de ces structures,
+/// champ du journal des prises…).
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Champs inconnus d'un objet (version plus récente), réécrits tels quels.
@@ -1205,6 +1370,59 @@ pub fn parse_json<T: serde::de::DeserializeOwned>(s: &str) -> serde_json::Result
     let r = serde_json::from_str(s);
     let unknown = UNKNOWN_VALUE.with(|u| u.replace(false));
     r.map(|v| (v, unknown))
+}
+
+/// Comme `parse_json`, depuis une valeur JSON déjà lue.
+pub fn parse_value<T: serde::de::DeserializeOwned>(
+    v: &serde_json::Value,
+) -> serde_json::Result<(T, bool)> {
+    UNKNOWN_VALUE.with(|u| u.set(false));
+    let r = T::deserialize(v);
+    let unknown = UNKNOWN_VALUE.with(|u| u.replace(false));
+    r.map(|v| (v, unknown))
+}
+
+/// Champs connus d'une prise (`Clip`) : les autres sont gardés à part (`clip_extra`).
+const CLIP_FIELDS: &[&str] = &[
+    "id", "file", "start", "offset", "len", "src_len", "fade_in", "fade_out",
+];
+
+/// Lecture d'un fichier de session (voir `parse_json`), en gardant les champs inconnus des
+/// prises, par identifiant de prise (avant toute correction de `validate`).
+fn parse_project(json: &str) -> serde_json::Result<(Project, bool)> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    let (mut p, unknown) = parse_value::<Project>(&v)?;
+    let raw_tracks = v
+        .get("tracks")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for (t, raw) in p.tracks.iter().zip(raw_tracks) {
+        let raw_clips = raw
+            .get("clips")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (c, rc) in t.clips.iter().zip(raw_clips) {
+            let Some(obj) = rc.as_object() else {
+                continue;
+            };
+            let extra: Extra = obj
+                .iter()
+                .filter(|(k, _)| !CLIP_FIELDS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !extra.is_empty() {
+                p.clip_extra.insert(c.id, extra);
+            }
+        }
+    }
+    Ok((p, unknown))
+}
+
+/// Heure actuelle en millisecondes depuis 1970 (voir `Project::saved_at`).
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// Version de format d'un fichier JSON si elle est plus récente que celle-ci.
@@ -1681,7 +1899,7 @@ mod tests {
         let (q, msg) = Project::open(&path, &[]).unwrap();
         assert!(msg.unwrap().contains("illisible"));
         assert_eq!(q.tracks[0].name, "V3");
-        assert!(q.dirty && q.read_only.is_none());
+        assert!(!q.dirty && q.read_only.is_none());
         let aside: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -1693,8 +1911,10 @@ mod tests {
             std::fs::read(dir.join(&aside[0])).unwrap(),
             b"{\"tracks\": [ tronqu"
         );
-        assert!(!path.exists());
+        // Toujours un fichier de session à sa place : la version reprise, déjà réécrite.
+        assert_eq!(Project::load(&path).unwrap().tracks[0].name, "V3");
         let mut q = q;
+        q.dirty = true;
         q.save().unwrap();
         assert_eq!(Project::load(&path).unwrap().tracks[0].name, "V3");
 
@@ -1719,6 +1939,152 @@ mod tests {
             (r.tracks[0].name.as_str(), r.dir.as_path()),
             ("Double", dir.as_path())
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fichier abîmé juste après une prise : la copie `.bak1` (état d'avant la prise) est
+    /// plus ancienne que le double du second disque (état d'après) : c'est le double qui
+    /// est repris. Plus tard, une copie `.bak1` plus récente que le double l'emporte.
+    #[test]
+    fn corrupt_session_takes_newest_backup() {
+        let dir = fresh_dir("newest");
+        let mut p = Project::new("N".into(), dir.clone(), 48000);
+        p.add_track(Some("Avant la prise".into()), Some(0));
+        p.save().unwrap();
+        // Fin de prise : rotation (.bak1 = avant la prise), puis double à jour.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.tracks[0].name = "Après la prise".into();
+        p.save_checkpoint().unwrap();
+        let mut double = p.clone();
+        double.dir = dir.join("double");
+        double.mark_state_time();
+        double.save().unwrap();
+        let path = p.file_path();
+        let bak1 = backup_paths(&path)[0].clone();
+        assert_eq!(
+            Project::load(&bak1).unwrap().tracks[0].name,
+            "Avant la prise"
+        );
+        std::fs::write(&path, b"abime").unwrap();
+        let (r, msg) = Project::open(&path, &[double.file_path()]).unwrap();
+        assert_eq!(r.tracks[0].name, "Après la prise");
+        assert!(msg.unwrap().contains("double"));
+
+        // L'inverse : des sauvegardes plus récentes que le double (.bak1 plus récente).
+        let mut p = r;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.tracks[0].name = "Plus tard".into();
+        p.dirty = true;
+        p.save_checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.tracks[0].name = "Encore plus tard".into();
+        p.save_checkpoint().unwrap();
+        std::fs::write(&path, b"abime").unwrap();
+        let (r, _) = Project::open(&path, &[double.file_path()]).unwrap();
+        assert_eq!(r.tracks[0].name, "Plus tard");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Version de secours d'un format plus récent : ouverte en lecture seule, et rien n'est
+    /// touché sur le disque (le fichier abîmé reste en place, rien n'est mis de côté).
+    #[test]
+    fn read_only_backup_leaves_disk_untouched() {
+        let dir = fresh_dir("robak");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("R.tracksplus");
+        std::fs::write(&path, b"abime").unwrap();
+        std::fs::write(
+            &backup_paths(&path)[0],
+            r#"{"format_version":99,"tracks":[]}"#,
+        )
+        .unwrap();
+        let (p, msg) = Project::open(&path, &[]).unwrap();
+        assert!(p.read_only.is_some() && msg.unwrap().contains("lecture seule"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"abime");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert!(p.save_refused().is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Session qui ne peut pas être enregistrée (lecture seule, fichier d'une autre
+    /// session) : signalé avant une prise, qui ne serait notée nulle part.
+    #[test]
+    fn save_refused_reports_permanent_refusals() {
+        let dir = fresh_dir("refused");
+        let mut p = Project::new("S".into(), dir.clone(), 48000);
+        assert!(
+            p.save_refused().is_none(),
+            "session neuve, pas encore écrite"
+        );
+        p.save().unwrap();
+        assert!(p.save_refused().is_none());
+        let other = Project::new("S".into(), dir.clone(), 48000);
+        assert!(other.save_refused().unwrap().contains("existe déjà"));
+        let mut q = Project::load(&p.file_path()).unwrap();
+        assert!(q.save_refused().is_none());
+        q.read_only = Some("protégée".into());
+        assert_eq!(q.save_refused().as_deref(), Some("protégée"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Champs inconnus d'une prise (gain, couleur… d'une version plus récente) : conservés
+    /// à la réécriture, après une coupe et une renumérotation ; jamais à la place d'un champ
+    /// connu.
+    #[test]
+    fn unknown_clip_fields_survive() {
+        // La liste des champs connus suit la structure.
+        let c = audio_clip(1, "a.wav");
+        let v = serde_json::to_value(&c).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut known = CLIP_FIELDS.to_vec();
+        keys.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(keys, known);
+
+        let dir = fresh_dir("clipx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("C.tracksplus");
+        std::fs::write(
+            &path,
+            r#"{"format_version":1,"sample_rate":48000,"next_id":10,"tracks":[{"id":1,
+            "name":"A","clips":[{"id":2,"file":"a.wav","start":0,"len":10000,"gain_db":-3.5,
+            "couleur":{"r":1},"len_x":1},{"id":3,"file":"b.wav","start":20000,"len":500}]}]}"#,
+        )
+        .unwrap();
+        let mut p = Project::load(&path).unwrap();
+        assert!(p.read_only.is_none());
+        let right = p.split_clip(1, 2, 4000).unwrap();
+        p.dirty = true;
+        p.save().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let clips = v["tracks"][0]["clips"].as_array().unwrap();
+        let by_id = |id: u64| clips.iter().find(|c| c["id"] == id).unwrap();
+        assert_eq!(by_id(2)["gain_db"], -3.5);
+        assert_eq!(by_id(2)["couleur"]["r"], 1);
+        assert_eq!(by_id(2)["len"], 4000);
+        assert_eq!(by_id(right)["gain_db"], -3.5);
+        assert_eq!(by_id(right)["start"], 4000);
+        assert!(by_id(3).get("gain_db").is_none());
+
+        // Identifiants en double : renumérotés, les champs inconnus suivent leur prise.
+        std::fs::write(
+            &path,
+            r#"{"tracks":[{"id":1,"clips":[{"id":1,"file":"a.wav","len":100,"x":"a"},
+            {"id":7,"file":"b.wav","len":100,"x":"b"}]}]}"#,
+        )
+        .unwrap();
+        let mut p = Project::load(&path).unwrap();
+        p.dirty = true;
+        p.save().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let clips = &v["tracks"][0]["clips"];
+        assert_eq!(clips[0]["file"], "a.wav");
+        assert_eq!(clips[0]["x"], "a");
+        assert_eq!(clips[1]["file"], "b.wav");
+        assert_eq!(clips[1]["x"], "b");
+        assert_ne!(clips[0]["id"], v["tracks"][0]["id"]);
         std::fs::remove_dir_all(dir).ok();
     }
 
