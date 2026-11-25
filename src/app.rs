@@ -143,22 +143,26 @@ impl SettingsDialog {
             .is_none_or(|c| card_of(&d.name, self.asio()) == *c)
     }
 
-    /// Entrées de la carte choisie (toutes sans carte choisie).
+    /// Entrées de la carte choisie (toutes sans carte choisie), dans l'ordre naturel.
     fn card_ins(&self) -> Vec<DeviceInfo> {
-        self.ins
-            .iter()
-            .filter(|d| self.on_card(d))
-            .cloned()
-            .collect()
+        natural_order(
+            self.ins
+                .iter()
+                .filter(|d| self.on_card(d))
+                .cloned()
+                .collect(),
+        )
     }
 
-    /// Sorties de la carte choisie (toutes sans carte choisie).
+    /// Sorties de la carte choisie (toutes sans carte choisie), dans l'ordre naturel.
     fn card_outs(&self) -> Vec<DeviceInfo> {
-        self.outs
-            .iter()
-            .filter(|d| self.on_card(d))
-            .cloned()
-            .collect()
+        natural_order(
+            self.outs
+                .iter()
+                .filter(|d| self.on_card(d))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Choix de la carte son : entrée et sortie principale prises sur elle, soundboard et
@@ -7903,6 +7907,37 @@ fn dest_combo(
     unprobed
 }
 
+/// Périphériques dans l'ordre naturel : chaque famille (« Analog », « ADAT »…) dans l'ordre
+/// où Windows la donne, et dans une famille, les numéros dans l'ordre (« (1+2) » avant
+/// « (7+8) », « 10 » après « 9 ») : Windows les mélange.
+fn natural_order(mut v: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
+    fn family(s: &str) -> String {
+        s.chars()
+            .take_while(|c| !c.is_ascii_digit())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    fn numbers(s: &str) -> Vec<u64> {
+        s.split(|c: char| !c.is_ascii_digit())
+            .filter(|n| !n.is_empty())
+            .map(|n| n.parse().unwrap_or(u64::MAX))
+            .collect()
+    }
+    let mut families: Vec<String> = Vec::new();
+    for d in &v {
+        let f = family(&d.name);
+        if !families.contains(&f) {
+            families.push(f);
+        }
+    }
+    v.sort_by_cached_key(|d| {
+        let f = family(&d.name);
+        let rank = families.iter().position(|x| *x == f).unwrap_or(usize::MAX);
+        (rank, numbers(&d.name), d.name.to_lowercase())
+    });
+    v
+}
+
 /// Carte son d'un périphérique. ASIO : le pilote lui-même. Ailleurs (WASAPI…) : le nom
 /// entre parenthèses à la fin, comme Windows nomme ses périphériques (« DVS Receive 1-2
 /// (Dante Virtual Soundcard) », « Haut-parleurs (Realtek(R) Audio) »), sinon le nom.
@@ -8824,6 +8859,34 @@ mod tests {
 
     /// Cartes son : en WASAPI, les périphériques de Windows regroupés par carte (nom entre
     /// parenthèses, même imbriquées) ; en ASIO, chaque pilote est une carte.
+    #[test]
+    fn card_devices_are_in_natural_order() {
+        let d = |n: &str| DeviceInfo {
+            name: n.into(),
+            channels: 2,
+            rates: Vec::new(),
+            default_rate: None,
+            buffer: None,
+            note: None,
+        };
+        let v = natural_order(vec![
+            d("Analog (7+8) (RME Fireface UC)"),
+            d("Analog (10+11) (RME Fireface UC)"),
+            d("Analog (1+2) (RME Fireface UC)"),
+            d("ADAT (1+2) (RME Fireface UC)"),
+        ]);
+        let names: Vec<&str> = v.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Analog (1+2) (RME Fireface UC)",
+                "Analog (7+8) (RME Fireface UC)",
+                "Analog (10+11) (RME Fireface UC)",
+                "ADAT (1+2) (RME Fireface UC)"
+            ]
+        );
+    }
+
     #[test]
     fn devices_are_grouped_by_card() {
         assert_eq!(

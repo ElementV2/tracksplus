@@ -21,7 +21,7 @@ Fonctionne avec Dante Virtual Soundcard (64 entrées et plus), ASIO, WASAPI et C
 - « Ignorer cette version » ne la propose plus. Menu ☰ → « Rechercher des mises à jour »
   pour vérifier à la main ; la recherche au lancement est désactivable. La version portable
   ouvre la page de téléchargement.
-- Fenêtre de 1280 × 720 minimum (affichage Windows à 100 %).
+- Fenêtre de 940 × 600 minimum (tient dans une moitié d’écran ancrée par Windows).
 
 ## Au lancement
 
