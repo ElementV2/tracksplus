@@ -3726,6 +3726,58 @@ mod tests {
         assert_eq!(sh.play_position_now(48000), 0);
     }
 
+    /// Dante Virtual Soundcard (encodage PCM 16, 24 ou 32 bits) et toutes les cartes en
+    /// entiers : un échantillon de la carte arrive dans la prise à sa vraie valeur, sans
+    /// perte d'échelle ni de signe, quel que soit le format.
+    #[test]
+    fn integer_formats_reach_the_take_at_their_value() {
+        fn take_of<T>(v: f32) -> f32
+        where
+            T: SizedSample + FromSample<f32>,
+            f32: FromSample<T>,
+        {
+            let (tx, rx) = bounded::<InCmd>(4);
+            let mut st = InState {
+                channels: 1,
+                rx,
+                targets: Vec::new(),
+                garbage: bounded(4).0,
+                shared: Arc::new(Shared::new()),
+                monitor: None,
+                sample_rate: 48000,
+                last_capture: None,
+                mon_env: 0.0,
+                mon_release: mon_release(48000),
+                faulted: false,
+                halted: false,
+            };
+            let (prod, mut cons) = rtrb::RingBuffer::new(1024);
+            tx.send(InCmd::Record(vec![RecTarget::new(0, prod)]))
+                .unwrap();
+            let data = vec![T::from_sample(v); 64];
+            st.callback::<T>(&data, None);
+            cons.pop().unwrap()
+        }
+        for v in [0.5f32, -0.25, 0.999] {
+            let (a, b, c) = (
+                take_of::<i16>(v),
+                take_of::<cpal::I24>(v),
+                take_of::<i32>(v),
+            );
+            assert!((a - v).abs() < 1e-4, "16 bits : {v} → {a}");
+            assert!((b - v).abs() < 1e-6, "24 bits : {v} → {b}");
+            assert!((c - v).abs() < 1e-6, "32 bits : {v} → {c}");
+        }
+        // Sortie : jamais de retournement au-delà de la pleine échelle, dans aucun format.
+        use cpal::Sample;
+        for s in [1.0f32, 1.5, 1e9] {
+            assert_eq!(i16::from_sample(super::out_sample(s)), i16::MAX);
+            assert!(i16::from_sample(super::out_sample(-s)) <= -i16::MAX);
+            assert!(i32::from_sample(super::out_sample(s)) > i32::MAX - 256);
+            assert!(i32::from_sample(super::out_sample(-s)) < -(i32::MAX - 256));
+        }
+    }
+
     #[test]
     fn output_never_wraps_on_24_bit_cards() {
         use cpal::Sample;
