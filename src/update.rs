@@ -160,12 +160,23 @@ impl Updater {
         let ctx = ctx.clone();
         let digest = release.sha256.clone();
         std::thread::spawn(move || {
-            let res = curl(&["-sSfL", "--max-time", "600", "-o"], Some(&part), &url)
-                .and_then(|_| verify_download(&part, size, digest.as_deref()))
-                .and_then(|_| {
-                    std::fs::rename(&part, &file)
-                        .map_err(|e| format!("impossible d'enregistrer l'installeur : {e}"))
-                });
+            let res = curl(
+                &[
+                    "-sSfL",
+                    "--max-time",
+                    "600",
+                    "--max-filesize",
+                    "1500000000",
+                    "-o",
+                ],
+                Some(&part),
+                &url,
+            )
+            .and_then(|_| verify_download(&part, size, digest.as_deref()))
+            .and_then(|_| {
+                std::fs::rename(&part, &file)
+                    .map_err(|e| format!("impossible d'enregistrer l'installeur : {e}"))
+            });
             me.set(match res {
                 Ok(()) => State::Ready { release, file },
                 Err(e) => {
@@ -199,8 +210,8 @@ fn verify_download(file: &Path, size: u64, sha256: Option<&str>) -> Result<(), S
             }
             Ok(())
         }
-        None if size == 0 => Err("taille inconnue : installeur impossible à vérifier".into()),
-        None => Ok(()),
+        // Sans empreinte, rien ne garantit l'intégrité : on n'exécute jamais un tel fichier.
+        None => Err("empreinte inconnue : installeur impossible à vérifier".into()),
     }
 }
 
@@ -303,12 +314,21 @@ pub fn launch_installer(file: &Path) -> Result<(), String> {
 
 /// Ouvre une adresse dans le navigateur.
 pub fn open_url(url: &str) {
+    // Jamais un chemin local ou un autre protocole (l'adresse peut venir du réseau).
+    if !url.starts_with("https://") {
+        return;
+    }
     #[cfg(target_os = "windows")]
     let _ = Command::new("explorer").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let _ = Command::new("open").arg(url).spawn();
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
+/// Seule origine acceptée pour un installeur téléchargé automatiquement.
+fn download_prefix() -> String {
+    format!("https://github.com/{REPO}/releases/download/")
 }
 
 /// Page de toutes les versions publiées.
@@ -350,6 +370,8 @@ fn latest_release() -> Result<Release, String> {
             "-sSfL",
             "--max-time",
             "15",
+            "--max-filesize",
+            "4000000",
             "-H",
             "Accept: application/vnd.github+json",
         ],
@@ -369,14 +391,27 @@ fn parse_release(json: &str) -> Result<Release, String> {
         let n = a.name.to_lowercase();
         n.starts_with("tracksplus-setup") && n.ends_with(".exe")
     });
-    let installer = asset.map(|a| (a.name.clone(), a.browser_download_url.clone(), a.size));
     let sha256 = asset
         .and_then(|a| a.digest.as_deref())
         .and_then(parse_digest);
+    // Installation automatique seulement pour un installeur publié sur le dépôt officiel
+    // et accompagné de son empreinte SHA-256 ; sinon on renvoie vers la page de la version.
+    let installer = asset
+        .filter(|a| a.browser_download_url.starts_with(&download_prefix()))
+        .filter(|_| sha256.is_some())
+        .map(|a| (a.name.clone(), a.browser_download_url.clone(), a.size));
+    let page = if r
+        .html_url
+        .starts_with(&format!("https://github.com/{REPO}/"))
+    {
+        r.html_url
+    } else {
+        releases_page()
+    };
     Ok(Release {
         version: r.tag_name.trim_start_matches(['v', 'V']).to_string(),
         notes: r.body.unwrap_or_default(),
-        page: r.html_url,
+        page,
         installer,
         sha256,
     })
@@ -389,7 +424,15 @@ fn curl(args: &[&str], out: Option<&Path>, url: &str) -> Result<String, String> 
     if let Some(o) = out {
         cmd.arg(o);
     }
-    cmd.args(["-A", &format!("TracksPlus/{CURRENT}")]).arg(url);
+    // HTTPS uniquement, redirections comprises. L'adresse commence forcément par
+    // « https:// » : elle ne peut pas être lue comme une option de curl (pas de « -- »,
+    // inconnu des curl livrés avec les premières versions de Windows 10).
+    if !url.starts_with("https://") {
+        return Err("adresse de téléchargement refusée".into());
+    }
+    cmd.args(["--proto", "=https", "--proto-redir", "=https"])
+        .args(["-A", &format!("TracksPlus/{CURRENT}")])
+        .arg(url);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -515,15 +558,14 @@ mod tests {
                       {"name":"TracksPlus-Setup-0.3.0.exe","browser_download_url":"https://a/s.exe","size":42}]}"###;
         let r = parse_release(json).unwrap();
         assert_eq!(r.version, "0.3.0");
-        assert_eq!(
-            r.installer,
-            Some((
-                "TracksPlus-Setup-0.3.0.exe".into(),
-                "https://a/s.exe".into(),
-                42
-            ))
-        );
+        // Pas d'empreinte et adresse hors du dépôt officiel : pas d'installation automatique.
+        assert_eq!(r.installer, None);
         assert_eq!(r.sha256, None, "pas d'empreinte dans cette release");
+        assert_eq!(
+            r.page,
+            releases_page(),
+            "page hors du dépôt : page générique"
+        );
         let notes = plain_notes(&r.notes);
         assert_eq!(notes[0], (true, "Nouveautés".into()));
         assert_eq!(notes[1], (false, "•  Pads plus larges".into()));
@@ -552,6 +594,39 @@ mod tests {
     }
 
     #[test]
+    fn only_official_signed_installer_is_auto_installed() {
+        let json = |url: &str, digest: bool| {
+            let d = if digest {
+                format!(r#","digest":"sha256:{ABC_SHA256}""#)
+            } else {
+                String::new()
+            };
+            format!(
+                r#"{{"tag_name":"v9.0.0","html_url":"https://github.com/{REPO}/releases/tag/v9.0.0","assets":[
+                {{"name":"TracksPlus-Setup-9.0.0.exe","browser_download_url":"{url}","size":3{d}}}]}}"#
+            )
+        };
+        let official = format!("{}v9.0.0/TracksPlus-Setup-9.0.0.exe", download_prefix());
+        let r = parse_release(&json(&official, true)).unwrap();
+        assert_eq!(r.installer.map(|i| i.1), Some(official.clone()));
+        assert!(r.page.starts_with("https://github.com/"));
+        assert!(
+            parse_release(&json(&official, false))
+                .unwrap()
+                .installer
+                .is_none()
+        );
+        let evil = "https://github.com/evil/repo/releases/download/v9/TracksPlus-Setup.exe";
+        assert!(
+            parse_release(&json(evil, true))
+                .unwrap()
+                .installer
+                .is_none()
+        );
+        assert!(curl(&[], None, "-o/tmp/x").is_err());
+    }
+
+    #[test]
     fn download_is_verified() {
         let dir = std::env::temp_dir().join(format!("tp-upd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -562,7 +637,11 @@ mod tests {
         assert_eq!(sha256_file(&f).unwrap(), ABC_SHA256);
         assert!(verify_download(&f, 3, Some(ABC_SHA256)).is_ok());
         assert!(verify_download(&f, 0, Some(ABC_SHA256)).is_ok());
-        assert!(verify_download(&f, 3, None).is_ok());
+        assert!(
+            verify_download(&f, 3, None)
+                .unwrap_err()
+                .contains("empreinte inconnue")
+        );
         let bad = "0".repeat(64);
         assert!(
             verify_download(&f, 3, Some(&bad))
@@ -577,7 +656,7 @@ mod tests {
         assert!(
             verify_download(&f, 0, None)
                 .unwrap_err()
-                .contains("taille inconnue")
+                .contains("empreinte inconnue")
         );
         std::fs::remove_dir_all(dir).ok();
     }

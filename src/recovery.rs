@@ -110,10 +110,15 @@ pub fn recover(project: &mut Project) -> Result<usize> {
     let j: Journal = serde_json::from_str(&text).context("Journal d'enregistrement illisible")?;
     let mut n = 0;
     for take in &j.takes {
+        // Journal falsifié ou abîmé : jamais de chemin hors du dossier Audio/.
+        let base = crate::project::safe_file_name(&take.file);
+        if base.is_empty() {
+            continue;
+        }
         // Une prise longue peut s'étendre sur plusieurs fichiers (nom, nom_p2, nom_p3…).
         let mut pos = j.start + j.play_offset;
         for k in 1.. {
-            let file = crate::recorder::segment_name(&take.file, k);
+            let file = crate::recorder::segment_name(&base, k);
             let path = project.audio_dir().join(&file);
             if !path.exists() {
                 break;
@@ -148,7 +153,7 @@ pub fn recover(project: &mut Project) -> Result<usize> {
                 let track_id = if project.tracks.iter().any(|t| t.id == take.track_id) {
                     take.track_id
                 } else {
-                    let name = take.file.trim_end_matches(".wav").to_string();
+                    let name = base.trim_end_matches(".wav").to_string();
                     let stereo =
                         hound::WavReader::open(&path).is_ok_and(|r| r.spec().channels >= 2);
                     project.add_track_ch(Some(format!("{name} (récupérée)")), None, stereo)

@@ -403,7 +403,8 @@ impl Project {
     }
 
     pub fn clip_path(&self, clip: &Clip) -> PathBuf {
-        self.audio_dir().join(&clip.file)
+        // Défense en profondeur : `validate` assainit déjà les noms au chargement.
+        self.audio_dir().join(safe_file_name(&clip.file))
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
@@ -456,6 +457,13 @@ impl Project {
             }
             for c in &mut t.clips {
                 c.clamp_fades();
+                // Un fichier de session partagé ne doit jamais faire lire ou écrire hors du
+                // dossier Audio/ (« ../../ », chemin absolu, partage réseau \\hôte\…).
+                let safe = safe_file_name(&c.file);
+                if safe != c.file {
+                    eprintln!("Nom de fichier de prise refusé : {:?} → {:?}", c.file, safe);
+                    c.file = safe;
+                }
             }
         }
     }
@@ -626,6 +634,17 @@ pub fn copy_synced(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Premier nom libre « nom (2).wav », « nom (3).wav »… (`taken` en minuscules).
+/// Ramène un nom de fichier de prise à un simple nom, sans dossier ni lecteur :
+/// « ../../x.wav », « C:\\x.wav » ou « \\\\hôte\\x.wav » deviennent « x.wav ».
+/// Renvoie une chaîne vide si rien d'utilisable ne reste (prise muette).
+pub fn safe_file_name(file: &str) -> String {
+    let last = file.rsplit(['/', '\\', ':']).next().unwrap_or("");
+    if last.trim().is_empty() || last == "." || last == ".." || last.contains('\0') {
+        return String::new();
+    }
+    last.to_string()
+}
+
 fn unique_name(file: &str, taken: &HashSet<String>) -> String {
     let p = Path::new(file);
     let stem = p
@@ -961,5 +980,32 @@ mod tests {
     fn sanitize_names() {
         assert_eq!(sanitize("Voix/Lead:1"), "Voix_Lead_1");
         assert_eq!(sanitize("  "), "Piste");
+    }
+
+    #[test]
+    fn clip_file_names_cannot_escape_audio_dir() {
+        for (input, want) in [
+            ("Voix_001.wav", "Voix_001.wav"),
+            ("../../../Startup/x.bat", "x.bat"),
+            ("..\\..\\x.wav", "x.wav"),
+            ("C:\\Windows\\x.wav", "x.wav"),
+            ("C:x.wav", "x.wav"),
+            ("\\\\attaquant\\partage\\a.wav", "a.wav"),
+            ("/etc/passwd", "passwd"),
+            ("..", ""),
+            ("dossier/", ""),
+            ("", ""),
+        ] {
+            assert_eq!(safe_file_name(input), want, "{input}");
+        }
+        let mut p = Project::new("S".into(), std::env::temp_dir().join("tp-safe-name"), 48000);
+        p.add_track(None, None);
+        p.tracks[0].clips.push(audio_clip(50, "../../evil.wav"));
+        p.validate();
+        assert_eq!(p.tracks[0].clips[0].file, "evil.wav");
+        assert_eq!(
+            p.clip_path(&p.tracks[0].clips[0]),
+            p.audio_dir().join("evil.wav")
+        );
     }
 }

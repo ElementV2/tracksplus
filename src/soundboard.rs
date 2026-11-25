@@ -573,6 +573,13 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
         .ok_or_else(|| anyhow!("Aucune piste audio"))?;
     let track_id = track.id;
     let src_sr = track.codec_params.sample_rate.unwrap_or(target_sr);
+    // En-tête invraisemblable (fichier abîmé ou piégé) : on refuse plutôt que de réserver
+    // des gigaoctets d'après une fréquence fantaisiste.
+    if !(1_000..=768_000).contains(&src_sr) {
+        return Err(anyhow!(
+            "Fréquence d'échantillonnage invalide : {src_sr} Hz"
+        ));
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| anyhow!("Codec non supporté : {e}"))?;
@@ -593,8 +600,12 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
     // Directement en stéréo entrelacé (format final) : pas de tampons intermédiaires
     // quand la fréquence est déjà la bonne.
     let mut data: Vec<f32> = Vec::new();
+    // Réservations faillibles : un manque de mémoire devient une erreur affichée sur le
+    // pad, jamais un arrêt brutal de l'application.
+    let oom = |_| anyhow!("Mémoire insuffisante pour charger ce son");
     if let Some(n) = n_frames {
-        data.reserve_exact((n as usize).min(max_frames) * 2);
+        data.try_reserve_exact((n as usize).min(max_frames) * 2)
+            .map_err(oom)?;
     }
     let mut buf: Option<SampleBuffer<f32>> = None;
     loop {
@@ -622,6 +633,7 @@ pub fn load_sample(path: &Path, target_sr: u32) -> Result<SampleData> {
         if data.len() / 2 > max_frames {
             return Err(anyhow!("Son trop long : 30 min maximum pour un pad"));
         }
+        data.try_reserve(b.samples().len() / ch * 2).map_err(oom)?;
         for frame in b.samples().chunks(ch) {
             data.push(frame[0]);
             data.push(if ch > 1 { frame[1] } else { frame[0] });
