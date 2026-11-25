@@ -207,9 +207,21 @@ pub struct ExportDialog {
 }
 
 struct Toast {
-    text: String,
+    /// Messages entiers, du plus ancien au plus récent (affichés l'un sous l'autre).
+    items: Vec<(Level, String)>,
     error: bool,
     until: f64,
+}
+
+/// Importance d'un message : quand il y en a trop, les moins importants partent d'abord.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Info,
+    /// État de la carte son (répété à chaque situation).
+    Device,
+    Warn,
+    /// Prise interrompue, coupée ou relancée : jamais retiré avant d'avoir été lu.
+    Critical,
 }
 
 /// État de l'onglet soundboard.
@@ -333,16 +345,35 @@ pub struct Resume {
     hb_seen: Option<u64>,
 }
 
-/// Ajoute `new` à la suite d'un message affiché, sans dépasser une longueur lisible (les
-/// plus anciens morceaux partent d'abord, le plus récent reste toujours en entier).
-fn join_toast(old: &str, new: &str) -> String {
-    const MAX: usize = 600;
-    let mut parts: Vec<&str> = old.split(" · ").collect();
-    parts.push(new);
-    while parts.len() > 1 && parts.iter().map(|p| p.chars().count() + 3).sum::<usize>() > MAX {
-        parts.remove(0);
+/// Ajoute un message entier à ceux affichés (un message déjà présent n'est pas répété),
+/// sans dépasser une longueur lisible : partent d'abord les informations, puis les états
+/// de la carte, puis les avertissements, les plus anciens en premier. Le plus récent et
+/// les messages de prise interrompue ne partent jamais.
+fn push_toast(items: &mut Vec<(Level, String)>, level: Level, text: String) {
+    const MAX: usize = 900;
+    if let Some(i) = items.iter().position(|(_, t)| *t == text) {
+        let (l, t) = items.remove(i);
+        items.push((l.max(level), t));
+        return;
     }
-    parts.join(" · ")
+    items.push((level, text));
+    let len =
+        |v: &Vec<(Level, String)>| v.iter().map(|(_, t)| t.chars().count() + 1).sum::<usize>();
+    while len(items) > MAX {
+        let last = items.len() - 1;
+        let victim = items[..last]
+            .iter()
+            .enumerate()
+            .filter(|(_, (l, _))| *l < Level::Critical)
+            .min_by_key(|(i, (l, _))| (*l, *i))
+            .map(|(i, _)| i);
+        match victim {
+            Some(i) => {
+                items.remove(i);
+            }
+            None => break,
+        }
+    }
 }
 
 /// Position de la prise relancée : fin de ce qui a été capté + durée du trou à l'heure
@@ -360,8 +391,141 @@ fn fmt_gap(secs: f64) -> String {
     }
 }
 
+/// Relance automatique abandonnée si la carte n'est pas revenue dans ce délai (s) : une
+/// carte rallumée des heures plus tard ne lance jamais une prise toute seule.
+const RESUME_MAX: f64 = 180.0;
+/// Flux reperdu moins longtemps que ça après sa réouverture (s) : les essais suivants
+/// restent espacés (horloge Dante absente : ouverture acceptée mais aucun callback).
+const REOPEN_FLAP: f64 = 20.0;
+/// Essai de réouverture sans réponse depuis plus longtemps que ça (s) : pilote bloqué,
+/// l'essai est isolé et les autres flux peuvent être rouverts sans lui.
+const REOPEN_STUCK: f64 = 15.0;
+
+/// Étape de la relance automatique d'une prise (voir `App::resume_take`).
+#[derive(Debug, PartialEq)]
+enum ResumeStep {
+    /// L'opérateur a repris la main (autre session, réglage coupé, transport) : oubliée.
+    Cancel,
+    /// La carte n'est pas revenue à temps : abandonnée, avec un message.
+    Expire,
+    /// Attendre (prise précédente en finalisation, entrée pas encore revenue…).
+    Wait,
+    /// Entrée revenue : noter son battement de cœur, relancer dès qu'il avance.
+    Arm(u64),
+    /// Relancer maintenant.
+    Go,
+}
+
+/// Ce que regarde la relance automatique.
+struct ResumeCtx {
+    /// Secondes depuis la fin de ce qui a été capté.
+    age: f64,
+    same_session: bool,
+    enabled: bool,
+    disk_stalled: bool,
+    /// Transport à l'arrêt (rien lancé par l'opérateur).
+    transport_stopped: bool,
+    /// Rien en cours, finalisation de la prise précédente comprise.
+    idle: bool,
+    /// Entrée ouverte, ni perdue ni en cours de réouverture.
+    input_ready: bool,
+    beat: u64,
+    hb_seen: Option<u64>,
+}
+
+fn resume_step(c: &ResumeCtx) -> ResumeStep {
+    if !c.same_session || !c.enabled || c.disk_stalled || !c.transport_stopped {
+        return ResumeStep::Cancel;
+    }
+    if c.age > RESUME_MAX {
+        return ResumeStep::Expire;
+    }
+    if !c.idle || !c.input_ready {
+        return ResumeStep::Wait;
+    }
+    match c.hb_seen {
+        None => ResumeStep::Arm(c.beat),
+        Some(seen) if c.beat > seen => ResumeStep::Go,
+        Some(_) => ResumeStep::Wait,
+    }
+}
+
+/// Un passage du chien de garde des flux. `hb[slot]` = (dernier battement vu, instant où
+/// il a changé), tenu à jour ici ; `beats` = battements actuels, `open` = flux ouverts,
+/// `jumped` = saut dans le temps (veille, interface figée : rien n'est jugé), `rec` = prise
+/// en cours (l'entrée a alors droit à `REC_STALL_STOP`). Rend (flux muets depuis trop
+/// longtemps, flux ouverts qui ont battu depuis le passage précédent).
+fn watchdog(
+    hb: &mut [(u64, f64); audio::SLOTS],
+    beats: [u64; audio::SLOTS],
+    open: u8,
+    now: f64,
+    jumped: bool,
+    rec: bool,
+) -> (u8, u8) {
+    let (mut stalled, mut beating) = (0, 0);
+    for (slot, h) in hb.iter_mut().enumerate() {
+        let bit = audio::slot_bit(slot);
+        let beat = beats[slot];
+        if open & bit != 0 && beat != h.0 {
+            beating |= bit;
+        }
+        if open & bit == 0 || jumped || beat != h.0 {
+            *h = (beat, now);
+            continue;
+        }
+        let limit = if slot == audio::SLOT_INPUT && rec {
+            REC_STALL_STOP
+        } else {
+            STREAM_STALL
+        };
+        if now - h.1 > limit {
+            stalled |= bit;
+        }
+    }
+    (stalled, beating)
+}
+
+/// Ce qui est connu du moteur pour choisir les flux à rouvrir (hors ASIO).
+struct ReopenCtx {
+    recording: bool,
+    stopped: bool,
+    pads_playing: bool,
+    /// Flux dont le périphérique est présent mais refuse de s'ouvrir.
+    refused: u8,
+}
+
+/// Flux à rouvrir maintenant parmi `need` (hors ASIO). `expand` = `Engine::expand`.
+fn reopen_slots(need: u8, c: &ReopenCtx, expand: impl Fn(u8) -> (u8, u8, u8)) -> u8 {
+    let mut slots = need;
+    // Entrée perdue pendant une prise : la prise vient d'être arrêtée (`watch_take`).
+    if c.recording {
+        slots &= !audio::LOST_INPUT;
+    }
+    // Pads joués sur le main faute de leur sortie, et cette sortie revenue : le main est
+    // rouvert lui aussi, donc seulement à l'arrêt et sans pad en lecture. (Sortie soundboard
+    // présente mais qui refuse de s'ouvrir : à corriger dans les réglages, le main n'est
+    // pas coupé à chaque essai pour rien.)
+    let (_, _, gated) = expand(slots);
+    if gated != 0 && (!c.stopped || c.pads_playing || c.refused & audio::LOST_PADS != 0) {
+        slots &= !audio::LOST_PADS;
+    }
+    slots
+}
+
+/// Essai de réouverture en cours dans un thread.
+pub struct ReconnectJob {
+    since: f64,
+    rx: std::sync::mpsc::Receiver<audio::Reopened>,
+    /// Flux retirés du moteur par cet essai.
+    slots: u8,
+    /// Alerte « pilote qui ne répond plus » déjà donnée.
+    alerted: bool,
+}
+
 /// Flux muet depuis plus longtemps que ça (s) : considéré comme perdu et rouvert.
 const STREAM_STALL: f64 = 3.0;
+
 /// Pendant une prise, l'entrée muette sans erreur du pilote (horloge Dante perdue) garde
 /// la prise ouverte (alerte rouge, silence comblé à la reprise) ; arrêt seulement au-delà.
 const REC_STALL_STOP: f64 = 20.0;
@@ -496,10 +660,27 @@ pub struct App {
     pub lost_during_take: bool,
     /// Sauvegarde automatique en cours (thread).
     pub autosave_job: Option<(PathBuf, std::sync::mpsc::Receiver<anyhow::Result<()>>)>,
-    /// Réouverture de flux en cours dans un thread : début, résultat, alerte « pilote qui ne
-    /// répond plus » déjà donnée. Un seul essai à la fois, jamais abandonné (pas de threads
-    /// bloqués qui s'accumulent, jamais deux ouvertures du même périphérique).
-    pub reconnect_job: Option<(f64, std::sync::mpsc::Receiver<audio::Reopened>, bool)>,
+    /// Réouverture de flux en cours dans un thread. Un seul essai à la fois, jamais
+    /// abandonné (pas de threads bloqués qui s'accumulent, jamais deux ouvertures du même
+    /// périphérique).
+    pub reconnect_job: Option<ReconnectJob>,
+    /// Essais restés bloqués chez le pilote (plus de `REOPEN_STUCK`), toujours attendus et
+    /// installés s'ils finissent : leurs flux sont exclus des essais suivants, les autres
+    /// flux continuent d'être rouverts. Au plus un par flux (ensembles disjoints).
+    stuck_jobs: Vec<ReconnectJob>,
+    /// Pertes posées par le chien de garde (flux seulement muet) : effacées si le flux
+    /// repart de lui-même, sans le rouvrir (bits `LOST_*`).
+    stalled: u8,
+    /// Flux rouverts qui n'ont pas encore battu : « reconnectée » n'est dit qu'après leur
+    /// premier callback (une ouverture acceptée peut ne jamais tourner).
+    awaiting: u8,
+    /// Reconnexion à annoncer dès que tout tourne.
+    announce: bool,
+    /// Dernière réouverture : instant et délai d'attente d'alors (flux reperdu juste après :
+    /// les essais restent espacés).
+    last_reopen: Option<(f64, f64)>,
+    /// La prise en cours a été coupée par un trou de l'entrée plus long que les tampons.
+    take_split: bool,
     /// Chien de garde des flux (`audio::SLOT_*`) : dernier battement de cœur vu et instant
     /// où il a changé ; dernier passage (un saut = veille ou interface figée).
     hb: [(u64, f64); audio::SLOTS],
@@ -715,6 +896,12 @@ impl App {
             lost_during_take: false,
             autosave_job: None,
             reconnect_job: None,
+            stuck_jobs: Vec::new(),
+            stalled: 0,
+            awaiting: 0,
+            announce: false,
+            last_reopen: None,
+            take_split: false,
             hb: [(0, 0.0); audio::SLOTS],
             hb_tick: 0.0,
             resume: None,
@@ -798,6 +985,11 @@ impl App {
     /// Message en bas de la fenêtre. Une information disparaît seule ; une erreur ou un
     /// avertissement reste affiché jusqu'au clic : on ne peut pas le manquer.
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.notify_level(text, if error { Level::Warn } else { Level::Info });
+    }
+
+    /// Message avec son importance (voir `Level`).
+    pub fn notify_level(&mut self, text: impl Into<String>, level: Level) {
         let text = text.into();
         // Une erreur pas encore lue n'est jamais effacée par un nouveau message (ex. « prise
         // arrêtée, carte perdue » puis « carte reconnectée ») : il s'ajoute à la suite.
@@ -805,13 +997,12 @@ impl App {
             && t.error
             && t.until.is_infinite()
         {
-            if !t.text.split(" · ").any(|s| s == text) {
-                t.text = join_toast(&t.text, &text);
-            }
+            push_toast(&mut t.items, level, text);
             return;
         }
+        let error = level > Level::Info;
         self.toast = Some(Toast {
-            text,
+            items: vec![(level, text)],
             error,
             until: if error { f64::INFINITY } else { self.now + 3.5 },
         });
@@ -872,6 +1063,10 @@ impl App {
         if !self.is_stopped() {
             return;
         }
+        if let Some(msg) = self.output_reopening() {
+            self.notify(msg, true);
+            return;
+        }
         if !self.engine.has_output() {
             self.notify(
                 "Aucune sortie audio : choisissez-en une dans les réglages audio",
@@ -908,7 +1103,7 @@ impl App {
             Transport::Stopped => self.playhead = pos,
             Transport::Playing { .. } => {
                 self.playhead = pos;
-                if let Some(msg) = self.rate_mismatch() {
+                if let Some(msg) = self.rate_mismatch().or_else(|| self.output_reopening()) {
                     self.notify(msg, true);
                     self.stop();
                     return;
@@ -965,12 +1160,19 @@ impl App {
         })
     }
 
+    /// Sortie principale en cours de réouverture (essai lancé, pas encore installé) :
+    /// message, sinon `None`. Rien n'est envoyé à l'ancien flux, fermé juste après.
+    fn output_reopening(&self) -> Option<String> {
+        (self.engine.reopening() & audio::LOST_OUTPUT != 0).then(|| {
+            "Réouverture de la sortie audio en cours : réessayez dans un instant".to_string()
+        })
+    }
+
     /// L'entrée existe mais ne délivre rien (perdue, en cours de réouverture, ou muette) :
     /// message, sinon `None`. Jamais de prise lancée sur un flux mort.
     fn input_unavailable(&self) -> Option<String> {
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
-        let reopening =
-            self.reconnect_job.is_some() && self.engine.open_mask() & audio::LOST_INPUT == 0;
+        let reopening = self.engine.reopening() & audio::LOST_INPUT != 0;
         if lost & audio::LOST_INPUT != 0 || reopening {
             return Some(
                 "Entrée audio perdue : reconnexion en cours, l'enregistrement sera possible dès son retour"
@@ -1164,6 +1366,16 @@ impl App {
         // d'entrée et compensé à la fin, avec la latence entrée + sortie de la carte.
         self.rec_latency = 0;
         self.rec_overdub = false;
+        // Sortie en cours de réouverture : la prise passe avant (elle se fait sans la
+        // lecture des pistes), et on le dit.
+        if self.project.has_audio()
+            && let Some(msg) = self.output_reopening()
+        {
+            self.notify(
+                format!("{msg} — prise lancée sans la lecture des pistes existantes"),
+                true,
+            );
+        }
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
                 Player::start(&self.project, self.playhead, self.project.audible());
@@ -1223,7 +1435,9 @@ impl App {
 
     pub fn stop(&mut self) {
         match self.transport {
-            Transport::Stopped => {}
+            // Stop à l'arrêt : l'opérateur reprend la main, plus de relance automatique.
+            Transport::Stopped => self.cancel_resume(),
+
             Transport::Playing { .. } => {
                 self.engine.stop_playback();
                 self.player = None;
@@ -1326,6 +1540,7 @@ impl App {
     ) {
         // Lu dès le début : jamais reporté sur une prise suivante, quelle que soit l'issue.
         let lost_card = std::mem::take(&mut self.lost_during_take);
+        let split = std::mem::take(&mut self.take_split);
         let results = match finished {
             Some(Ok(r)) => r,
             Some(Err(FinishError::Timeout)) => {
@@ -1484,9 +1699,25 @@ impl App {
                 false,
             );
         }
-        // Entrée interrompue puis revenue pendant la prise : le trou a été comblé.
-        let gap = self.engine.shared.rec_gap_frames.swap(0, Ordering::Relaxed);
-        if gap > 0 {
+        // Entrée interrompue puis revenue pendant la prise : le trou a été comblé, ou, plus
+        // long que les tampons, il a coupé la prise (la suite est relancée à sa place).
+        let sh = &self.engine.shared;
+        let gap = sh.rec_gap_frames.swap(0, Ordering::Relaxed);
+        let missing = sh.rec_gap_overflow.load(Ordering::Relaxed);
+        if split {
+            let next = if self.resume.is_some() {
+                "la suite est relancée automatiquement à sa place"
+            } else {
+                "relancez l'enregistrement"
+            };
+            self.notify_level(
+                format!(
+                    "L'entrée s'est interrompue pendant la prise (trou de {}, plus long que les tampons) : prise coupée à cet endroit et sauvegardée ; {next}",
+                    fmt_gap(missing as f64 / self.sr() as f64)
+                ),
+                Level::Critical,
+            );
+        } else if gap > 0 {
             self.notify(
                 format!(
                     "L'entrée s'est interrompue pendant la prise : {} de silence inséré, la suite est restée à sa place",
@@ -1503,12 +1734,12 @@ impl App {
             } else {
                 "relancez l'enregistrement dès le retour de la carte"
             };
-            self.notify(
+            self.notify_level(
                 format!(
                     "Carte son perdue pendant la prise : enregistrement arrêté, prise sauvegardée ({}) ; {next}",
                     fmt_time(max_len, self.sr())
                 ),
-                true,
+                Level::Critical,
             );
         }
     }
@@ -1544,7 +1775,9 @@ impl App {
     }
 
     /// Battement de cœur de chaque flux ouvert : un flux qui ne tourne plus, même sans
-    /// erreur du pilote (horloge Dante perdue, pilote figé), est signalé perdu.
+    /// erreur du pilote (horloge Dante perdue, pilote figé), est signalé perdu. S'il repart
+    /// de lui-même avant d'avoir été rouvert (ASIO pendant une prise), la perte s'efface :
+    /// le pilote n'est pas redémarré pour rien à l'arrêt de la prise.
     fn watch_streams(&mut self) {
         let now = self.now;
         // Saut dans le temps (veille, interface figée) : rien n'est jugé sur cet intervalle.
@@ -1553,29 +1786,27 @@ impl App {
         let open = self.engine.open_mask();
         let rec = self.is_recording();
         let sh = &self.engine.shared;
-        for (slot, hb) in self.hb.iter_mut().enumerate() {
-            let bit = audio::slot_bit(slot);
-            let beat = sh.heartbeat[slot].load(Ordering::Relaxed);
-            if open & bit == 0 || jumped || beat != hb.0 {
-                *hb = (beat, now);
-                continue;
-            }
-            // Pendant une prise, l'entrée muette garde la prise ouverte (voir `watch_take`).
-            let limit = if slot == audio::SLOT_INPUT && rec {
-                REC_STALL_STOP
-            } else {
-                STREAM_STALL
-            };
-            if now - hb.1 > limit {
-                sh.device_lost.fetch_or(bit, Ordering::Release);
-            }
+        let beats = std::array::from_fn(|s| sh.heartbeat[s].load(Ordering::Relaxed));
+        let (stalled, beating) = watchdog(&mut self.hb, beats, open, now, jumped, rec);
+        // (Un flux fermé n'est plus « seulement muet » : il est rouvert ou absent.)
+        self.stalled &= open;
+        let before = sh.device_lost.fetch_or(stalled, Ordering::AcqRel);
+        self.stalled |= stalled & !before;
+        let revived = beating & self.stalled & !sh.stream_dead.load(Ordering::Acquire);
+        if revived != 0 {
+            sh.device_lost.fetch_and(!revived, Ordering::AcqRel);
+            self.stalled &= !revived;
+            self.announce = true;
         }
+        self.awaiting &= !beating;
     }
 
     /// Pendant une prise. Entrée muette sans erreur du pilote (horloge Dante perdue
     /// quelques secondes) : la prise continue (alerte rouge, trou comblé par du silence à
-    /// la reprise). Entrée vraiment perdue (erreur du pilote, ou muette plus de 20 s) :
-    /// prise arrêtée et sauvegardée telle quelle, relancée dès le retour de la carte.
+    /// la reprise). Trou plus long que les tampons : la prise est coupée au bout de ce qui a
+    /// pu être comblé, et la suite relancée là où tombe le son qui revient. Entrée vraiment
+    /// perdue (erreur du pilote, ou muette plus de 20 s) : prise arrêtée et sauvegardée
+    /// telle quelle, relancée dès le retour de la carte.
     fn watch_take(&mut self) {
         if !self.is_recording() {
             self.rec_watch = (0, self.now);
@@ -1587,95 +1818,146 @@ impl App {
         if frames != self.rec_watch.0 {
             self.rec_watch = (frames, self.now);
         }
+        let Transport::Recording { start } = self.transport else {
+            return;
+        };
+        let offset = if self.rec_overdub {
+            sh.rec_play_offset.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        let base = start + offset + frames;
+        let missing = sh.rec_gap_overflow.load(Ordering::Acquire);
+        if missing > 0 {
+            // Le son qui revient tombe `missing` trames après la fin de la prise (figée),
+            // capté il y a `ago` secondes.
+            let ago = sh.secs_since(sh.rec_gap_overflow_ns.load(Ordering::Relaxed));
+            self.resume = self.prefs.auto_restart.then(|| Resume {
+                pos: base + missing,
+                at: self.now - ago,
+                dir: self.project.dir.clone(),
+                hb_seen: None,
+            });
+            self.take_split = true;
+            self.stop();
+            return;
+        }
         let lost = sh.device_lost.load(Ordering::Acquire) & audio::LOST_INPUT != 0;
         if !lost && self.now - self.rec_watch.1 <= REC_STALL_STOP {
             return;
         }
         sh.device_lost
             .fetch_or(audio::LOST_INPUT, Ordering::Release);
-        if let Transport::Recording { start } = self.transport {
-            let offset = if self.rec_overdub {
-                sh.rec_play_offset.load(Ordering::Relaxed)
-            } else {
-                0
-            };
-            self.resume = self.prefs.auto_restart.then(|| Resume {
-                pos: start + offset + frames,
-                at: self.rec_watch.1,
-                dir: self.project.dir.clone(),
-                hb_seen: None,
-            });
-        }
+        self.resume = self.prefs.auto_restart.then(|| Resume {
+            pos: base,
+            at: self.rec_watch.1,
+            dir: self.project.dir.clone(),
+            hb_seen: None,
+        });
         self.lost_during_take = true;
         self.stop();
     }
 
+    /// Relance automatique en attente : annulée (l'opérateur reprend la main : Stop,
+    /// Échap, panique, indicateur du transport).
+    pub fn cancel_resume(&mut self) {
+        if self.resume.take().is_some() {
+            self.notify_level("Relance automatique de la prise annulée", Level::Critical);
+        }
+    }
+
     /// Relance de la prise arrêtée par une perte de la carte, dès que l'entrée délivre de
     /// nouveau des trames : nouvelles prises sur les mêmes pistes armées, posées à l'heure
-    /// réelle (fin de ce qui a été capté + durée du trou).
+    /// réelle (fin de ce qui a été capté + durée du trou). Jamais au-delà de `RESUME_MAX`.
     fn resume_take(&mut self) {
         let Some(r) = &self.resume else {
             return;
         };
-        // Autre session, réglage désactivé, lecture lancée entre-temps : l'opérateur a
-        // repris la main, rien n'est relancé derrière son dos.
-        if r.dir != self.project.dir
-            || !self.prefs.auto_restart
-            || self.disk_stalled
-            || !matches!(self.transport, Transport::Stopped)
-        {
-            self.resume = None;
-            return;
-        }
-        let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
-        if !self.is_stopped()
-            || self.reconnect_job.is_some()
-            || lost & audio::LOST_INPUT != 0
-            || self.engine.open_mask() & audio::LOST_INPUT == 0
-        {
-            return;
-        }
-        let beat = self.engine.shared.heartbeat[audio::SLOT_INPUT].load(Ordering::Relaxed);
+        let sh = &self.engine.shared;
+        let lost = sh.device_lost.load(Ordering::Acquire);
+        let step = resume_step(&ResumeCtx {
+            age: self.now - r.at,
+            same_session: r.dir == self.project.dir,
+            enabled: self.prefs.auto_restart,
+            disk_stalled: self.disk_stalled,
+            transport_stopped: matches!(self.transport, Transport::Stopped),
+            idle: self.is_stopped(),
+            input_ready: lost & audio::LOST_INPUT == 0
+                && self.engine.reopening() & audio::LOST_INPUT == 0
+                && self.engine.open_mask() & audio::LOST_INPUT != 0,
+            beat: sh.heartbeat[audio::SLOT_INPUT].load(Ordering::Relaxed),
+            hb_seen: r.hb_seen,
+        });
         let (pos, at) = (r.pos, r.at);
-        match r.hb_seen {
-            Some(seen) if beat > seen => {}
-            Some(_) => return,
-            None => {
+        match step {
+            ResumeStep::Wait => {}
+            ResumeStep::Arm(beat) => {
                 if let Some(r) = &mut self.resume {
                     r.hb_seen = Some(beat);
                 }
-                return;
+            }
+            // Autre session, réglage désactivé, lecture lancée entre-temps : l'opérateur a
+            // repris la main, rien n'est relancé derrière son dos.
+            ResumeStep::Cancel => self.resume = None,
+            ResumeStep::Expire => {
+                self.resume = None;
+                self.notify_level(
+                    format!(
+                        "Relance automatique de la prise abandonnée : la carte son n'est pas revenue dans les {} minutes. Relancez l'enregistrement à la main.",
+                        (RESUME_MAX / 60.0).round()
+                    ),
+                    Level::Critical,
+                );
+            }
+            ResumeStep::Go => {
+                let gap = (self.now - at).max(0.0);
+                self.resume = None;
+                self.playhead = resume_position(pos, gap, self.sr());
+                self.record();
+                if self.is_recording() {
+                    self.notify_level(
+                        format!(
+                            "Prise relancée automatiquement à {} (trou de {})",
+                            fmt_time(self.playhead, self.sr()),
+                            fmt_gap(gap)
+                        ),
+                        Level::Critical,
+                    );
+                } else {
+                    self.notify_level(
+                        "Relance automatique de la prise impossible : relancez l'enregistrement à la main",
+                        Level::Critical,
+                    );
+                }
             }
         }
-        let gap = (self.now - at).max(0.0);
-        self.resume = None;
-        self.playhead = resume_position(pos, gap, self.sr());
-        self.record();
-        if self.is_recording() {
-            self.notify(
-                format!(
-                    "Prise relancée automatiquement après perte de la carte (trou de {})",
-                    fmt_gap(gap)
-                ),
-                true,
-            );
-        } else {
-            self.notify(
-                "Relance automatique de la prise impossible : relancez l'enregistrement à la main",
-                true,
-            );
-        }
+    }
+
+    /// Flux retirés par les essais en cours ou bloqués.
+    fn jobs_slots(&self) -> u8 {
+        self.stuck_jobs
+            .iter()
+            .chain(&self.reconnect_job)
+            .fold(0, |m, j| m | j.slots)
     }
 
     /// Flux perdus ou absents : essais de réouverture espacés (1, 2, 4… jusqu'à 10 s), un
     /// seul à la fois, dans un thread (pas de gel de l'écran) ; seuls les flux concernés
     /// sont rouverts.
     fn schedule_reconnect(&mut self) {
-        use crate::audio::{LOST_INPUT, LOST_OUTPUT, LOST_PADS};
+        use crate::audio::LOST_OUTPUT;
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
-        let need = lost | self.engine.missing();
+        // Flux d'un essai bloqué chez le pilote : attendus à part, pas rouverts en double.
+        let stuck = self.stuck_jobs.iter().fold(0, |m, j| m | j.slots);
+        let need = (lost | self.engine.missing()) & !stuck;
+        self.awaiting &= self.engine.open_mask() & !lost;
         if need == 0 {
-            if self.reconnect_job.is_none() {
+            if self.reconnect_job.is_none() && stuck == 0 && self.awaiting == 0 {
+                // Tout tourne vraiment (premier callback reçu) : c'est maintenant seulement
+                // que la carte est dite reconnectée.
+                if std::mem::take(&mut self.announce) {
+                    self.notify("Carte son reconnectée", false);
+                }
                 self.reconnect = None;
                 self.reconnect_wait = false;
                 self.device_note.clear();
@@ -1696,7 +1978,13 @@ impl App {
             self.reconnect = None;
         }
         if self.reconnect.is_none() {
-            self.reconnect = Some((self.now + 1.0, 1.0));
+            // Flux reperdu juste après sa réouverture (ouvert, mais aucun callback) : les
+            // essais restent espacés au lieu de repartir à 1 s.
+            let delay = match self.last_reopen {
+                Some((at, d)) if self.now - at < REOPEN_FLAP => next_delay(d, asio),
+                _ => 1.0,
+            };
+            self.reconnect = Some((self.now + delay, delay));
             let what = self.engine.problems(lost).join(" · ");
             self.device_notice(if lost != 0 {
                 format!("Carte son perdue ({what}) : reconnexion automatique…")
@@ -1726,13 +2014,13 @@ impl App {
             if !self.is_stopped() || pads_busy {
                 if !self.reconnect_wait {
                     self.reconnect_wait = true;
-                    self.notify(
+                    self.notify_level(
                         if pads_busy {
                             "Carte son perdue : elle sera rouverte dès que les pads en lecture seront arrêtés"
                         } else {
                             "Carte son perdue : elle sera rouverte dès l'arrêt de la lecture ou de la prise"
                         },
-                        true,
+                        Level::Device,
                     );
                 }
                 return;
@@ -1740,28 +2028,21 @@ impl App {
             self.reopen_all(delay);
             return;
         }
-        let mut slots = need;
-        // (Entrée perdue pendant une prise : la prise vient d'être arrêtée, voir `watch_take`.)
-        if self.is_recording() {
-            slots &= !LOST_INPUT;
-        }
-        // Pads joués sur le main faute de leur sortie, et cette sortie revenue : le main est
-        // rouvert lui aussi, donc seulement à l'arrêt et sans pad en lecture.
-        // (Sortie soundboard présente mais qui refuse de s'ouvrir : à corriger dans les
-        // réglages, le main n'est pas coupé à chaque essai pour rien.)
-        let (_, _, gated) = self.engine.expand(slots);
-        if gated != 0
-            && (!self.is_stopped()
-                || self.pads_status().0 > 0
-                || self.engine.refused() & LOST_PADS != 0)
-        {
-            slots &= !LOST_PADS;
-        }
+        let ctx = ReopenCtx {
+            recording: self.is_recording(),
+            stopped: self.is_stopped(),
+            pads_playing: self.pads_status().0 > 0,
+            refused: self.engine.refused(),
+        };
+        let slots = reopen_slots(need, &ctx, |s| self.engine.expand(s));
         if slots == 0 {
             self.reconnect = Some((self.now + delay, delay));
             return;
         }
         let job = self.engine.prepare(slots);
+        // (Bits effectivement retirés, après `expand` : main rouvert avec les pads.)
+        let taken = self.engine.reopening() & !self.jobs_slots();
+        self.stalled &= !taken;
         // CoreAudio : sur le thread principal, comme à l'ouverture normale.
         #[cfg(target_os = "macos")]
         {
@@ -1777,42 +2058,56 @@ impl App {
                     let _ = tx.send(job.run());
                 });
             match spawned {
-                Ok(_) => self.reconnect_job = Some((self.now, rx, false)),
+                Ok(_) => {
+                    self.reconnect_job = Some(ReconnectJob {
+                        since: self.now,
+                        rx,
+                        slots: taken,
+                        alerted: false,
+                    })
+                }
                 // (Les flux de l'essai sont fermés : ils manquent, nouvel essai plus tard.)
-                Err(_) => self.reconnect = Some((self.now + delay, next_delay(delay, false))),
+                Err(_) => {
+                    self.engine.reopen_lost(taken);
+                    self.reconnect = Some((self.now + delay, next_delay(delay, false)));
+                }
             }
         }
     }
 
-    /// Résultat de l'essai en cours. Il n'est jamais abandonné : un pilote qui ne répond
-    /// plus est signalé, sans lancer d'autre essai (pas de threads bloqués qui s'accumulent,
-    /// jamais deux ouvertures du même périphérique en même temps).
+    /// Résultat de l'essai en cours et des essais bloqués. Aucun n'est jamais abandonné :
+    /// un essai sans réponse depuis `REOPEN_STUCK` est signalé (en nommant le périphérique)
+    /// et mis à part ; ses flux ne sont pas rouverts une seconde fois, les autres si.
     fn poll_reconnect(&mut self) {
         use std::sync::mpsc::TryRecvError;
-        let Some((since, rx, alerted)) = &self.reconnect_job else {
-            return;
-        };
-        let (since, alerted) = (*since, *alerted);
         let delay = self.reconnect.map_or(1.0, |r| r.1);
-        match rx.try_recv() {
-            Ok(r) => {
-                self.reconnect_job = None;
-                self.finish_reconnect(r, delay);
-            }
-            Err(TryRecvError::Disconnected) => {
-                // Essai en échec (erreur interne) : ses flux manquent, nouvel essai plus tard.
-                self.reconnect_job = None;
-                self.reconnect = Some((self.now + delay, next_delay(delay, false)));
-            }
-            Err(TryRecvError::Empty) => {
-                if !alerted && self.now - since > 15.0 {
-                    if let Some(j) = &mut self.reconnect_job {
-                        j.2 = true;
+        let mut jobs = std::mem::take(&mut self.stuck_jobs);
+        jobs.extend(self.reconnect_job.take());
+        for mut job in jobs {
+            match job.rx.try_recv() {
+                Ok(r) => self.finish_reconnect(r, delay),
+                Err(TryRecvError::Disconnected) => {
+                    // Essai en échec (erreur interne) : ses flux manquent, nouvel essai plus tard.
+                    self.engine.reopen_lost(job.slots);
+                    self.reconnect = Some((self.now + delay, next_delay(delay, false)));
+                }
+                Err(TryRecvError::Empty) => {
+                    let stuck = self.now - job.since > REOPEN_STUCK;
+                    if stuck && !job.alerted {
+                        job.alerted = true;
+                        let what = self.engine.slots_label(job.slots);
+                        self.notify_level(
+                            format!(
+                                "Le pilote de la carte son ne répond plus pour {what} (ouverture bloquée) : TracksPlus attend sa réponse et continue de rouvrir les autres flux. Si rien ne bouge, débranchez puis rebranchez la carte, ou redémarrez le service Audio de Windows."
+                            ),
+                            Level::Warn,
+                        );
                     }
-                    self.notify(
-                        "Le pilote de la carte son ne répond plus (ouverture bloquée) : TracksPlus attend sa réponse sans relancer d'essai. Si rien ne bouge, débranchez puis rebranchez la carte, ou redémarrez le service Audio de Windows.",
-                        true,
-                    );
+                    if stuck {
+                        self.stuck_jobs.push(job);
+                    } else {
+                        self.reconnect_job = Some(job);
+                    }
                 }
             }
         }
@@ -1836,29 +2131,39 @@ impl App {
 
     /// ASIO : tout le pilote rouvert d'un coup, sur ce thread, à la même fréquence qu'avant
     /// la perte (en « Auto », la carte pourrait revenir à une autre : la session serait lue
-    /// à la mauvaise vitesse) ; « Auto » seulement si cette fréquence est refusée.
+    /// à la mauvaise vitesse) ; « Auto » seulement si cette fréquence est refusée, ou si
+    /// elle n'a encore jamais été ouverte (aucune carte au lancement).
     fn reopen_all(&mut self, delay: f64) {
         let rate = self.engine.status.sample_rate;
+        let fixed = self.engine.rate_fixed();
         self.engine.pad(PadCmd::StopAll);
         // L'ancien pilote est libéré avant (ASIO n'en accepte qu'un à la fois).
         self.engine = Engine::offline();
         let mut prefs = self.prefs.clone();
-        prefs.sample_rate = prefs.sample_rate.or(Some(rate));
+        if fixed {
+            prefs.sample_rate = prefs.sample_rate.or(Some(rate));
+        }
         let open =
             |p: &AudioPrefs| Engine::open(p, &p.pad_out()).unwrap_or_else(|_| Engine::offline());
         let mut e = open(&prefs);
-        if e.open_mask() == 0 && self.prefs.sample_rate.is_none() && e.open_errors().is_some() {
+        if e.open_mask() == 0
+            && fixed
+            && self.prefs.sample_rate.is_none()
+            && e.open_errors().is_some()
+        {
             drop(e);
             e = open(&self.prefs);
         }
         self.engine = e;
         let now = self.now;
         self.hb = [(0, now); audio::SLOTS];
+        self.stalled = 0;
         self.reconnect_done(audio::LOST_ALL, delay, rate);
     }
 
-    /// Après un essai : soundboard et monitoring rebranchés, puis carte complète (fin des
-    /// essais) ou nouvel essai plus tard, en disant clairement ce qui manque encore.
+    /// Après un essai : soundboard et monitoring rebranchés, puis nouvel essai plus tard
+    /// pour ce qui manque encore (en le disant clairement). « Reconnectée » n'est annoncé
+    /// qu'au premier callback des flux rouverts (`schedule_reconnect`).
     fn reconnect_done(&mut self, touched: u8, delay: f64, rate_before: u32) {
         self.after_engine_change();
         for msg in self.engine.take_renamed() {
@@ -1867,13 +2172,16 @@ impl App {
         let lost = self.engine.shared.device_lost.load(Ordering::Acquire);
         let need = lost | self.engine.missing();
         let asio = self.prefs.host.as_deref() == Some("ASIO");
+        let opened = touched & self.engine.open_mask();
+        if opened != 0 {
+            self.awaiting |= opened;
+            self.announce = true;
+            self.last_reopen = Some((self.now, delay));
+        }
         if need == 0 {
+            // Plus d'essai programmé ; si un flux rouvert ne tourne pas, le chien de garde
+            // le signale et les essais reprennent, espacés (`last_reopen`).
             self.reconnect = None;
-            self.reconnect_wait = false;
-            self.device_note.clear();
-            if touched != 0 {
-                self.notify("Carte son reconnectée", false);
-            }
         } else {
             self.reconnect = Some((self.now + delay, next_delay(delay, asio)));
             if touched != 0 {
@@ -1906,7 +2214,7 @@ impl App {
     fn device_notice(&mut self, text: String) {
         if self.device_note != text {
             self.device_note = text.clone();
-            self.notify(text, true);
+            self.notify_level(text, Level::Device);
         }
     }
 
@@ -3068,10 +3376,19 @@ impl App {
         // Si elle est en train d'ouvrir la carte, on attend qu'elle ait fini (et on jette
         // son résultat) : jamais deux ouvertures du même périphérique en même temps. Un
         // pilote qui ne répond plus du tout : on ne l'ouvre pas une seconde fois.
-        if let Some((_, rx, _)) = &self.reconnect_job {
-            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        let blocked = |e: &Engine, slots: u8| {
+            format!(
+                "Le pilote de la carte son ne répond plus pour {} (ouverture bloquée) : réessayez dans un instant, ou débranchez puis rebranchez la carte.",
+                e.slots_label(slots)
+            )
+        };
+        if let Some(j) = self.stuck_jobs.first() {
+            return Err(blocked(&self.engine, j.slots));
+        }
+        if let Some(j) = &self.reconnect_job {
+            match j.rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err("Le pilote de la carte son ne répond plus (ouverture bloquée) : réessayez dans un instant, ou débranchez puis rebranchez la carte.".into());
+                    return Err(blocked(&self.engine, j.slots));
                 }
                 // (Résultat jeté ici : ses flux sont fermés.)
                 _ => self.reconnect_job = None,
@@ -3081,6 +3398,10 @@ impl App {
         self.reconnect = None;
         self.reconnect_wait = false;
         self.device_note.clear();
+        self.stalled = 0;
+        self.awaiting = 0;
+        self.announce = false;
+        self.last_reopen = None;
         self.engine.pad(PadCmd::StopAll);
         // Libère d'abord l'ancien pilote (ASIO n'en autorise qu'un à la fois).
         self.engine = Engine::offline();
@@ -3676,12 +3997,13 @@ impl App {
             self.seek(0);
             self.view.scroll = 0.0;
         }
+        // (À l'arrêt, Stop annule aussi une relance automatique de prise en attente.)
         if w::icon_button(
             ui,
             Icon::Stop,
             30.0,
             BtnStyle::Ghost,
-            !stopped,
+            !stopped || self.resume.is_some(),
             "Stop (Espace) — pendant une prise : deux clics pour arrêter",
         )
         .clicked()
@@ -3768,6 +4090,23 @@ impl App {
             t::medium(9.5),
             if recording { t::REC } else { t::TEXT_3 },
         );
+        // Relance automatique en attente : visible tant qu'elle l'est, annulable d'un clic.
+        if self.resume.is_some() {
+            ui.add_space(8.0);
+            let blink = (self.now * 1.6).fract() < 0.55;
+            let text = egui::RichText::new("RELANCE DE LA PRISE EN ATTENTE")
+                .font(t::semibold(10.5))
+                .color(if blink { t::REC } else { t::TEXT_2 });
+            if ui
+                .add(egui::Button::new(text).fill(t::INSET))
+                .on_hover_text(
+                    "La prise a été arrêtée par une perte de la carte son : elle repartira toute seule dès son retour. Cliquer pour annuler.",
+                )
+                .clicked()
+            {
+                self.cancel_resume();
+            }
+        }
     }
 
     fn main_menu(&mut self, ui: &mut egui::Ui) {
@@ -5244,11 +5583,18 @@ impl App {
                     })
                     .show(ui, |ui| {
                         ui.set_max_width(620.0);
-                        ui.label(
-                            egui::RichText::new(&tt.text)
-                                .font(t::medium(12.0))
-                                .color(t::TEXT.gamma_multiply(fade)),
-                        );
+                        for (level, text) in &tt.items {
+                            let col = if *level == Level::Critical {
+                                t::REC
+                            } else {
+                                t::TEXT
+                            };
+                            ui.label(
+                                egui::RichText::new(text)
+                                    .font(t::medium(12.0))
+                                    .color(col.gamma_multiply(fade)),
+                            );
+                        }
                     });
                 let r = resp.response.rect;
                 ui.painter().rect_filled(
@@ -5870,24 +6216,275 @@ mod tests {
         assert_eq!(super::fmt_gap(125.0), "2 min 05");
     }
 
-    /// Une erreur affichée n'est jamais effacée par le message suivant : il s'ajoute, et
-    /// le texte reste d'une longueur lisible (le plus récent toujours en entier).
+    /// Une erreur affichée n'est jamais effacée par le message suivant : il s'ajoute, en
+    /// entier, et la liste reste d'une longueur lisible. Partent d'abord les informations,
+    /// puis les états de la carte (même composés de « · »), jamais une prise interrompue ni
+    /// le message le plus récent.
     #[test]
     fn toast_messages_pile_up_without_growing_forever() {
-        let a = super::join_toast("Carte son perdue pendant la prise", "Carte son reconnectée");
+        use super::{Level, push_toast};
+        let mut v = Vec::new();
+        push_toast(
+            &mut v,
+            Level::Critical,
+            "Carte son perdue pendant la prise : enregistrement arrêté".into(),
+        );
+        push_toast(&mut v, Level::Info, "Carte son reconnectée".into());
+        push_toast(&mut v, Level::Info, "Carte son reconnectée".into());
+        assert_eq!(v.len(), 2);
+        // Notices de carte longues, faites de morceaux séparés par « · ».
+        let notice = |k: usize| format!("Carte son : Entrée « A{k} » perdue · {}", "x".repeat(250));
+        for k in 0..6 {
+            push_toast(&mut v, Level::Device, notice(k));
+        }
+        push_toast(
+            &mut v,
+            Level::Warn,
+            "Prise enregistrée, mais 3 saturations disque".into(),
+        );
+        let len: usize = v.iter().map(|(_, t)| t.chars().count() + 1).sum();
+        assert!(len <= 900, "{len}");
+        // La prise interrompue est toujours là, en entier ; l'information est partie avant
+        // les notices ; la plus récente notice restante est entière (jamais coupée).
+        assert_eq!(v[0].0, Level::Critical);
+        assert!(v.iter().all(|(l, _)| *l != Level::Info));
+        assert!(v.iter().any(|(_, t)| *t == notice(5)));
+        assert_eq!(v.last().unwrap().0, Level::Warn);
+        // Un seul message énorme : gardé entier.
+        let mut w = vec![(Level::Info, "ancien".to_string())];
+        let huge = "y".repeat(2000);
+        push_toast(&mut w, Level::Warn, huge.clone());
+        assert_eq!(w, vec![(Level::Warn, huge)]);
+        // Uniquement des prises interrompues : rien n'est retiré.
+        let mut c = Vec::new();
+        for k in 0..5 {
+            push_toast(&mut c, Level::Critical, format!("{k}{}", "z".repeat(300)));
+        }
+        assert_eq!(c.len(), 5);
+    }
+
+    /// Relance automatique : annulée si l'opérateur reprend la main, abandonnée au-delà
+    /// de `RESUME_MAX` (carte rallumée le lendemain : aucune prise ne part seule), lancée
+    /// seulement quand l'entrée revenue a vraiment battu.
+    #[test]
+    fn resume_waits_for_the_input_and_expires() {
+        use super::{RESUME_MAX, ResumeCtx, ResumeStep, resume_step};
+        let ok = ResumeCtx {
+            age: 5.0,
+            same_session: true,
+            enabled: true,
+            disk_stalled: false,
+            transport_stopped: true,
+            idle: true,
+            input_ready: true,
+            beat: 100,
+            hb_seen: None,
+        };
+        assert_eq!(resume_step(&ok), ResumeStep::Arm(100));
         assert_eq!(
-            a,
-            "Carte son perdue pendant la prise · Carte son reconnectée"
+            resume_step(&ResumeCtx {
+                hb_seen: Some(100),
+                ..ok
+            }),
+            ResumeStep::Wait
         );
-        let long = "x".repeat(400);
-        let b = super::join_toast(&format!("{long} · {long}"), "dernier");
-        assert!(
-            b.ends_with("dernier") && b.chars().count() <= 600,
-            "{}",
-            b.len()
+        assert_eq!(
+            resume_step(&ResumeCtx {
+                hb_seen: Some(99),
+                ..ok
+            }),
+            ResumeStep::Go
         );
-        let huge = "y".repeat(900);
-        assert_eq!(super::join_toast("ancien", &huge), huge);
+        // Entrée absente ou prise précédente en finalisation : on attend.
+        for c in [
+            ResumeCtx {
+                input_ready: false,
+                ..ok
+            },
+            ResumeCtx { idle: false, ..ok },
+        ] {
+            assert_eq!(resume_step(&c), ResumeStep::Wait);
+        }
+        // Trop tard, même si l'entrée est revenue.
+        assert_eq!(
+            resume_step(&ResumeCtx {
+                age: RESUME_MAX + 1.0,
+                hb_seen: Some(1),
+                ..ok
+            }),
+            ResumeStep::Expire
+        );
+        assert_eq!(
+            resume_step(&ResumeCtx {
+                age: RESUME_MAX + 1.0,
+                input_ready: false,
+                ..ok
+            }),
+            ResumeStep::Expire
+        );
+        // L'opérateur a repris la main.
+        for c in [
+            ResumeCtx {
+                same_session: false,
+                ..ok
+            },
+            ResumeCtx {
+                enabled: false,
+                ..ok
+            },
+            ResumeCtx {
+                disk_stalled: true,
+                ..ok
+            },
+            ResumeCtx {
+                transport_stopped: false,
+                ..ok
+            },
+        ] {
+            assert_eq!(resume_step(&c), ResumeStep::Cancel);
+        }
+    }
+
+    /// Chien de garde : flux muet signalé après `STREAM_STALL` (l'entrée en prise après
+    /// `REC_STALL_STOP`), rien jugé sur un saut de temps ni sur un flux fermé, flux qui
+    /// bat de nouveau rendu dans `beating`.
+    #[test]
+    fn watchdog_flags_silent_streams_only() {
+        use super::{REC_STALL_STOP, STREAM_STALL, watchdog};
+        use crate::audio::{LOST_INPUT, LOST_MONITOR, LOST_OUTPUT, SLOTS};
+        let mut hb = [(0u64, 0.0f64); SLOTS];
+        let open = LOST_INPUT | LOST_OUTPUT;
+        // Premier passage : tout bat (référence posée).
+        let (s, b) = watchdog(&mut hb, [1, 1, 1, 1], open, 0.0, false, false);
+        assert_eq!((s, b), (0, open));
+        // Muets depuis peu : rien.
+        let (s, b) = watchdog(
+            &mut hb,
+            [1, 1, 1, 1],
+            open,
+            STREAM_STALL - 0.5,
+            false,
+            false,
+        );
+        assert_eq!((s, b), (0, 0));
+        // Saut dans le temps : rien jugé, références repartent de là.
+        let t = STREAM_STALL + 10.0;
+        assert_eq!(watchdog(&mut hb, [1, 1, 1, 1], open, t, true, false).0, 0);
+        assert_eq!(
+            watchdog(
+                &mut hb,
+                [1, 1, 1, 1],
+                open,
+                t + STREAM_STALL - 0.5,
+                false,
+                false
+            )
+            .0,
+            0
+        );
+        // Muets trop longtemps : signalés (seulement les flux ouverts).
+        let t2 = t + STREAM_STALL + 0.5;
+        let (s, _) = watchdog(&mut hb, [1, 1, 1, 1], open, t2, false, false);
+        assert_eq!(s, open);
+        assert_eq!(s & LOST_MONITOR, 0);
+        // Pendant une prise, l'entrée a droit à plus.
+        let (s, _) = watchdog(&mut hb, [1, 1, 1, 1], open, t2, false, true);
+        assert_eq!(s, LOST_OUTPUT);
+        // La sortie repart : rendue dans `beating`, plus signalée.
+        let (s, b) = watchdog(&mut hb, [1, 2, 1, 1], open, t2 + 0.1, false, true);
+        assert_eq!((s & LOST_OUTPUT, b), (0, LOST_OUTPUT));
+        let (s, _) = watchdog(
+            &mut hb,
+            [1, 2, 1, 1],
+            open,
+            t + REC_STALL_STOP + 1.0,
+            false,
+            true,
+        );
+        assert_eq!(s, LOST_INPUT | LOST_OUTPUT);
+        // Flux fermés : jamais signalés.
+        let (s, b) = watchdog(&mut hb, [1, 2, 1, 1], 0, 1e6, false, false);
+        assert_eq!((s, b), (0, 0));
+    }
+
+    /// Choix des flux à rouvrir (hors ASIO) : jamais l'entrée pendant une prise ; sortie
+    /// soundboard revenue avec les pads repliés sur le main : main rouvert avec elle,
+    /// seulement à l'arrêt, sans pad en lecture et si elle ne refuse pas de s'ouvrir.
+    #[test]
+    fn reopen_slots_respect_take_and_pads() {
+        use super::{ReopenCtx, reopen_slots};
+        use crate::audio::expand_slots;
+        use crate::audio::{LOST_ALL, LOST_INPUT, LOST_MONITOR, LOST_OUTPUT, LOST_PADS};
+        let idle = ReopenCtx {
+            recording: false,
+            stopped: true,
+            pads_playing: false,
+            refused: 0,
+        };
+        let folded = |s| expand_slots(s, LOST_ALL, true, true);
+        let separate = |s| expand_slots(s, LOST_ALL, false, true);
+        assert_eq!(
+            reopen_slots(LOST_INPUT | LOST_MONITOR, &idle, folded),
+            LOST_INPUT | LOST_MONITOR
+        );
+        let rec = ReopenCtx {
+            recording: true,
+            stopped: false,
+            ..idle
+        };
+        assert_eq!(
+            reopen_slots(LOST_INPUT | LOST_MONITOR, &rec, folded),
+            LOST_MONITOR
+        );
+        // Sortie soundboard de retour, pads joués sur le main (« gated »).
+        assert_eq!(reopen_slots(LOST_PADS, &idle, folded), LOST_PADS);
+        assert_eq!(
+            folded(LOST_PADS),
+            (LOST_PADS | LOST_OUTPUT, LOST_PADS, LOST_PADS | LOST_OUTPUT)
+        );
+        for c in [
+            ReopenCtx {
+                stopped: false,
+                ..idle
+            },
+            ReopenCtx {
+                pads_playing: true,
+                ..idle
+            },
+            ReopenCtx {
+                refused: LOST_PADS,
+                ..idle
+            },
+        ] {
+            assert_eq!(reopen_slots(LOST_PADS, &c, folded), 0);
+        }
+        // Pads sur leur propre sortie : rien à garder, pas de main touché.
+        assert_eq!(separate(LOST_PADS), (LOST_PADS, 0, 0));
+        assert_eq!(
+            reopen_slots(
+                LOST_PADS,
+                &ReopenCtx {
+                    pads_playing: true,
+                    ..idle
+                },
+                separate
+            ),
+            LOST_PADS
+        );
+        // Main fermé (perdu lui aussi) : rouvert avec, sans condition de présence.
+        assert_eq!(
+            expand_slots(LOST_PADS | LOST_OUTPUT, LOST_ALL, true, true).2,
+            0
+        );
+        assert_eq!(
+            expand_slots(LOST_PADS, LOST_ALL, true, false),
+            (LOST_PADS, 0, 0)
+        );
+        // Flux non attendus (pas de sortie soundboard à part) : jamais rouverts.
+        assert_eq!(
+            expand_slots(LOST_PADS, LOST_INPUT | LOST_OUTPUT, true, true).0,
+            0
+        );
     }
 
     /// Copie de sécurité : sons du soundboard copiés, pads pointant vers la copie (qui

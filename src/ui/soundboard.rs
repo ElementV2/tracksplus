@@ -158,6 +158,8 @@ impl App {
     /// Panique en deux temps, comme QLab ou SCS : un premier appui éteint tous les pads
     /// en fondu d'une seconde ; un second appui pendant ce fondu les coupe net.
     pub fn stop_all_pads(&mut self) {
+        // Panique : rien ne repart tout seul derrière (relance de prise en attente).
+        self.cancel_resume();
         let fading = self.now - self.sb.panic_at < PANIC_FADE_S + 0.5;
         if fading {
             self.engine.pad(PadCmd::StopAll);

@@ -283,6 +283,16 @@ pub struct Shared {
     /// Silence inséré dans la prise en cours à la place d'un trou de l'entrée (trames) :
     /// la suite reste à sa place sur la timeline.
     pub rec_gap_frames: AtomicU64,
+    /// Trou de l'entrée plus long que la place libre des tampons disque : trames de silence
+    /// qui n'ont pas pu être insérées (0 = aucun). La prise est alors figée (la suite irait
+    /// au mauvais endroit de la timeline) et l'interface la relance à sa place.
+    pub rec_gap_overflow: AtomicU64,
+    /// Instant (`now_ns`) où ce trou a été constaté.
+    pub rec_gap_overflow_ns: AtomicU64,
+    /// Flux morts pour de bon (bits `LOST_*`) : perte signalée par le pilote ou panique
+    /// rattrapée. Un flux seulement muet (chien de garde) qui repart n'y figure pas : il
+    /// n'est pas rouvert pour rien.
+    pub stream_dead: std::sync::atomic::AtomicU8,
 }
 
 impl Shared {
@@ -317,13 +327,27 @@ impl Shared {
             out_latency: AtomicU32::new(0),
             heartbeat: std::array::from_fn(|_| AtomicU64::new(0)),
             rec_gap_frames: AtomicU64::new(0),
+            rec_gap_overflow: AtomicU64::new(0),
+            rec_gap_overflow_ns: AtomicU64::new(0),
+            stream_dead: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Flux `stream` mort pour de bon : rouvert par l'interface.
+    fn dead(&self, stream: u8) {
+        self.stream_dead.fetch_or(stream, Ordering::Release);
+        self.device_lost.fetch_or(stream, Ordering::Release);
     }
 
     /// Panique rattrapée dans un callback : le flux se tait et sera rouvert.
     fn fault(&self, stream: u8) {
-        self.device_lost.fetch_or(stream, Ordering::Release);
+        self.dead(stream);
         self.stream_error.store(8, Ordering::Release);
+    }
+
+    /// Secondes écoulées depuis l'instant `ns` (horloge de `now_ns`).
+    pub fn secs_since(&self, ns: u64) -> f64 {
+        self.now_ns().saturating_sub(ns) as f64 / 1e9
     }
 
     /// Latence aller-retour signalée par le pilote (entrée + sortie, en trames ;
@@ -379,7 +403,7 @@ impl Shared {
                 | cpal::ErrorKind::HostUnavailable
                 | cpal::ErrorKind::DeviceBusy
         ) {
-            self.device_lost.fetch_or(stream, Ordering::Release);
+            self.dead(stream);
         }
         if err.kind() == cpal::ErrorKind::Xrun {
             if self.counting.load(Ordering::Relaxed) {
@@ -449,8 +473,12 @@ pub const fn slot_bit(slot: usize) -> u8 {
     1 << slot
 }
 
-/// Délai maximal d'activation d'un flux par le pilote : une ouverture ne reste jamais
-/// bloquée indéfiniment (service audio figé après une mise en veille).
+/// Délai maximal d'activation d'un flux, passé à cpal. Attention : cpal 0.18 (WASAPI) ne
+/// l'applique qu'aux périphériques « par défaut du système » ; un périphérique précis (le
+/// cas ici, même réglé sur « Par défaut », voir `find_device`) est activé sans délai
+/// maximal, et l'énumération elle-même n'en a pas. Une ouverture peut donc rester bloquée
+/// chez un pilote figé : l'interface isole alors cet essai (`App::poll_reconnect`) et
+/// continue de rouvrir les autres flux.
 const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Trou de l'entrée au-delà duquel du silence est inséré dans la prise (s) : en dessous,
@@ -613,6 +641,10 @@ struct Plan {
     host: Option<String>,
     host_name: String,
     sample_rate: u32,
+    /// Fréquence figée : choisie dans les réglages, ou déjà ouverte une fois sur un vrai
+    /// périphérique (rouverte telle quelle, DEV-13). Sinon (« Auto » sans aucune carte
+    /// présente à l'ouverture), elle est reprise du premier périphérique qui apparaît.
+    rate_fixed: bool,
     buffer: Option<u32>,
     /// Périphérique de chaque flux (`SLOT_*`) ; soundboard et monitoring seulement s'ils
     /// ont leur propre flux.
@@ -640,6 +672,35 @@ impl Plan {
             None => cpal::BufferSize::Default,
         }
     }
+}
+
+/// Flux réellement touchés par la réouverture de `slots` (voir `Engine::expand`) :
+/// (flux à rouvrir, périphériques requis, flux soumis à leur présence). `wanted` = flux
+/// attendus, `main_has_pads` / `main_open` = le main joue les pads / est ouvert.
+pub(crate) fn expand_slots(
+    slots: u8,
+    wanted: u8,
+    main_has_pads: bool,
+    main_open: bool,
+) -> (u8, u8, u8) {
+    let mut slots = slots & wanted;
+    let (mut require, mut gated) = (0, 0);
+    if slots & LOST_PADS != 0 && main_has_pads && main_open && slots & LOST_OUTPUT == 0 {
+        slots |= LOST_OUTPUT;
+        require = LOST_PADS;
+        gated = LOST_PADS | LOST_OUTPUT;
+    }
+    (slots, require, gated)
+}
+
+/// Monitoring à rebrancher quand `slots` sont rouverts (`mon_on` = flux qui le joue) :
+/// `None` si ni l'entrée ni ce flux ne le sont ; sinon (entrée rouverte, porteur rouvert).
+/// Un nouveau tampon est créé : chaque moitié va au flux rouvert, ou par commande à celui
+/// resté ouvert (`Engine::install`).
+fn mon_rewire(slots: u8, mon_on: usize) -> Option<(bool, bool)> {
+    let input = slots & LOST_INPUT != 0;
+    let carrier = slots & slot_bit(mon_on) != 0;
+    (input || carrier).then_some((input, carrier))
 }
 
 /// Nom d'un flux en tête de message.
@@ -675,6 +736,10 @@ pub struct Engine {
     main_has_pads: bool,
     /// Périphériques retrouvés sous un autre nom, à signaler une fois.
     renamed: Vec<String>,
+    /// Flux retirés du moteur par un essai de réouverture pas encore installé (bits
+    /// `LOST_*`) : rien ne leur est envoyé entre-temps (une lecture lancée sur l'ancien
+    /// flux, fermé juste après, resterait muette sans aucun message).
+    reopening: u8,
     /// Objets rendus par les callbacks pour être libérés hors du thread audio.
     garbage_tx: Sender<OutGarbage>,
     garbage_rx: Receiver<OutGarbage>,
@@ -693,7 +758,10 @@ pub struct ReopenJob {
     /// Périphériques qui doivent être présents pour toucher aux flux de `gated`.
     require: u8,
     gated: u8,
-    old: Vec<(usize, cpal::Stream)>,
+    /// Flux retirés du moteur, avec leurs commandes (rendues si le flux est rendu tel quel).
+    old: Vec<(usize, cpal::Stream, Option<SlotTx>)>,
+    /// D'autres flux restent ouverts hors de cet essai (à la fréquence du plan).
+    any_open: bool,
     /// Périphériques déjà cherchés (ouverture complète : pas de seconde énumération).
     found: [Option<Found>; SLOTS],
     searched: u8,
@@ -729,9 +797,13 @@ type SlotResult = Result<SlotOpen, (String, bool)>;
 /// Résultat d'un `ReopenJob`, à installer par `Engine::install`.
 pub struct Reopened {
     slots: u8,
+    /// Flux retirés du moteur par `prepare` (rouverts, ou rendus tels quels).
+    asked: u8,
+    /// Fréquence à laquelle les flux ont été ouverts.
+    sample_rate: u32,
     results: [Option<SlotResult>; SLOTS],
-    /// Flux rendus tels quels (périphérique requis absent).
-    returned: Vec<(usize, cpal::Stream)>,
+    /// Flux rendus tels quels (périphérique requis absent), avec leurs commandes.
+    returned: Vec<(usize, cpal::Stream, Option<SlotTx>)>,
     /// Moitié du nouveau tampon de monitoring pour le flux resté ouvert.
     mon_to_input: Option<Producer<f32>>,
     mon_to_carrier: Option<Consumer<f32>>,
@@ -751,11 +823,12 @@ impl ReopenJob {
     /// CoreAudio, qui restent sur le thread principal).
     pub fn run(self) -> Reopened {
         let ReopenJob {
-            plan,
+            mut plan,
             mut slots,
             require,
             gated,
             old,
+            any_open,
             mut found,
             searched,
             shared,
@@ -773,13 +846,23 @@ impl ReopenJob {
                 *f = find_device(&host, &plan.want[slot], slot == SLOT_INPUT);
             }
         }
+        // « Auto » sans fréquence encore ouverte (aucune carte au lancement) : celle du
+        // premier périphérique présent, entrée d'abord. WASAPI partagé n'accepte en capture
+        // que la fréquence de Windows : 48 kHz imposé refuserait une carte réglée en 44,1.
+        if !plan.rate_fixed
+            && !any_open
+            && let Some(sr) = auto_rate(&found)
+        {
+            plan.sample_rate = sr;
+        }
+        let asked = slots;
         // Sortie soundboard toujours absente : le main (qui joue les pads en attendant)
         // n'est pas touché, le reste de l'essai continue.
         let (old, returned): (Vec<_>, Vec<_>) =
             if (0..SLOTS).any(|s| require & slot_bit(s) != 0 && found[s].is_none()) {
                 slots &= !gated;
                 old.into_iter()
-                    .partition(|(s, _)| gated & slot_bit(*s) == 0)
+                    .partition(|(s, _, _)| gated & slot_bit(*s) == 0)
             } else {
                 (old, Vec::new())
             };
@@ -787,6 +870,7 @@ impl ReopenJob {
         // effacées : toute perte signalée ensuite vient des nouveaux flux.
         drop(old);
         shared.device_lost.fetch_and(!slots, Ordering::AcqRel);
+        shared.stream_dead.fetch_and(!slots, Ordering::AcqRel);
 
         let has = |slot: usize| slots & slot_bit(slot) != 0;
         let absent = |slot: usize| {
@@ -887,6 +971,8 @@ impl ReopenJob {
         }
         Reopened {
             slots,
+            asked,
+            sample_rate: plan.sample_rate,
             results,
             returned,
             mon_to_input: mon_prod,
@@ -894,6 +980,19 @@ impl ReopenJob {
             main_pads,
         }
     }
+}
+
+/// Fréquence par défaut du premier périphérique trouvé, entrée d'abord.
+fn auto_rate(found: &[Option<Found>; SLOTS]) -> Option<u32> {
+    let input = found[SLOT_INPUT]
+        .as_ref()
+        .and_then(|f| f.dev.default_input_config().ok());
+    input.map(|c| c.sample_rate()).or_else(|| {
+        [SLOT_MAIN, SLOT_PADS, SLOT_MON].iter().find_map(|&s| {
+            let f = found[s].as_ref()?;
+            f.dev.default_output_config().ok().map(|c| c.sample_rate())
+        })
+    })
 }
 
 /// Ouvre et démarre le flux d'entrée.
@@ -924,6 +1023,7 @@ fn open_input(
         mon_env: 0.0,
         mon_release: mon_release(sample_rate),
         faulted: false,
+        halted: false,
     };
     let dev = &f.dev;
     let stream = match fmt {
@@ -1163,6 +1263,7 @@ impl Engine {
             pad_chan: bounded(256),
             main_has_pads: false,
             renamed: Vec::new(),
+            reopening: 0,
             garbage_tx,
             garbage_rx,
             sample_garbage_tx,
@@ -1178,6 +1279,7 @@ impl Engine {
             host: None,
             host_name: String::new(),
             sample_rate: 48000,
+            rate_fixed: false,
             buffer: None,
             want: Default::default(),
             mon_on: SLOT_MAIN,
@@ -1205,20 +1307,10 @@ impl Engine {
             find_device(&host, &Want::named(prefs.output.clone()), false)
         };
 
-        // Fréquence : celle demandée, sinon celle par défaut de l'entrée.
-        let sample_rate = prefs
-            .sample_rate
-            .or_else(|| {
-                fin.as_ref()
-                    .and_then(|f| f.dev.default_input_config().ok())
-                    .map(|c| c.sample_rate())
-            })
-            .or_else(|| {
-                fout.as_ref()
-                    .and_then(|f| f.dev.default_output_config().ok())
-                    .map(|c| c.sample_rate())
-            })
-            .unwrap_or(48000);
+        // Fréquence : celle demandée, sinon celle par défaut du premier périphérique
+        // trouvé, entrée d'abord (choisie par `ReopenJob::run`, ici comme à chaque essai
+        // tant qu'aucun flux ne s'est ouvert).
+        let sample_rate = prefs.sample_rate.unwrap_or(48000);
 
         let ident = |f: &Option<Found>, name: &Option<String>| match f {
             Some(f) => Want {
@@ -1270,6 +1362,7 @@ impl Engine {
             host: prefs.host.clone(),
             host_name,
             sample_rate,
+            rate_fixed: prefs.sample_rate.is_some(),
             buffer: prefs.buffer,
             want,
             mon_on,
@@ -1377,30 +1470,62 @@ impl Engine {
     /// sortie soundboard de retour : le main doit être rouvert lui aussi (un seul lecteur
     /// de pads à la fois), seulement si cette sortie est bien revenue.
     pub fn expand(&self, slots: u8) -> (u8, u8, u8) {
-        let mut slots = slots & self.plan.wanted();
-        let (mut require, mut gated) = (0, 0);
-        if slots & LOST_PADS != 0
-            && self.main_has_pads
-            && self.streams[SLOT_MAIN].is_some()
-            && slots & LOST_OUTPUT == 0
-        {
-            slots |= LOST_OUTPUT;
-            require = LOST_PADS;
-            gated = LOST_PADS | LOST_OUTPUT;
-        }
-        (slots, require, gated)
+        expand_slots(
+            slots,
+            self.plan.wanted(),
+            self.main_has_pads,
+            self.streams[SLOT_MAIN].is_some(),
+        )
+    }
+
+    /// Flux retirés par un essai de réouverture pas encore installé (bits `LOST_*`).
+    pub fn reopening(&self) -> u8 {
+        self.reopening
+    }
+
+    /// Essai de réouverture perdu (thread mort) : ses flux manquent, à réessayer.
+    pub fn reopen_lost(&mut self, slots: u8) {
+        self.reopening &= !slots;
+        self.refresh_status();
+    }
+
+    /// La fréquence est figée (choisie, ou déjà ouverte sur un vrai périphérique).
+    pub fn rate_fixed(&self) -> bool {
+        self.plan.rate_fixed
+    }
+
+    /// Périphériques des flux `slots`, en clair (« Entrée « X », Sortie principale « Y » »).
+    pub fn slots_label(&self, slots: u8) -> String {
+        (0..SLOTS)
+            .filter(|&s| slots & slot_bit(s) != 0)
+            .map(|s| format!("{} « {} »", slot_title(s), self.plan.want[s].label()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Prépare la réouverture de `slots` (voir `expand`) : les flux concernés sont retirés
     /// du moteur (fermés par l'essai), les autres continuent sans coupure.
     pub fn prepare(&mut self, slots: u8) -> ReopenJob {
         let (slots, require, gated) = self.expand(slots);
-        let old = (0..SLOTS)
-            .filter(|&s| slots & slot_bit(s) != 0)
-            .filter_map(|s| self.streams[s].take().map(|st| (s, st)))
-            .collect();
+        // Flux et commandes retirés ensemble : plus rien n'est envoyé à un flux qui va être
+        // fermé (Lecture refusée avec un message pendant ce temps, voir `reopening`).
+        let mut old = Vec::new();
+        for s in (0..SLOTS).filter(|&s| slots & slot_bit(s) != 0) {
+            let tx = if s == SLOT_INPUT {
+                self.in_tx.take().map(SlotTx::In)
+            } else {
+                self.out_tx[s].take().map(SlotTx::Out)
+            };
+            if let Some(st) = self.streams[s].take() {
+                old.push((s, st, tx));
+            }
+        }
+        self.reopening |= slots;
+        // Soundboard : plus d'envoi tant que le flux qui le joue est retiré.
+        self.pad_tx = (self.pads_slot_bit() != 0).then(|| self.pad_chan.0.clone());
         // Entrée ou sortie du monitoring rouverte : nouveau tampon entre les deux.
-        let mon = (slots & (LOST_INPUT | slot_bit(self.plan.mon_on)) != 0)
+        let mon = mon_rewire(slots, self.plan.mon_on)
+            .is_some()
             .then(|| rtrb::RingBuffer::<f32>::new(MON_RING * 2));
         ReopenJob {
             plan: self.plan.clone(),
@@ -1408,6 +1533,7 @@ impl Engine {
             require,
             gated,
             old,
+            any_open: self.open_mask() != 0,
             found: Default::default(),
             searched: 0,
             shared: self.shared.clone(),
@@ -1425,14 +1551,48 @@ impl Engine {
     pub fn install(&mut self, r: Reopened) {
         let Reopened {
             slots: _,
+            asked,
+            sample_rate,
             mut results,
             returned,
             mon_to_input,
             mon_to_carrier,
             main_pads,
         } = r;
-        for (s, st) in returned {
+        self.reopening &= !asked;
+        for (s, st, tx) in returned {
             self.streams[s] = Some(st);
+            match tx {
+                Some(SlotTx::In(tx)) => self.in_tx = Some(tx),
+                Some(SlotTx::Out(tx)) => self.out_tx[s] = Some(tx),
+                None => {}
+            }
+        }
+        let opened = |r: &[Option<SlotResult>; SLOTS]| r.iter().any(|x| matches!(x, Some(Ok(_))));
+        // Fréquence reprise d'un périphérique (« Auto », aucune carte au lancement) alors
+        // que d'autres flux se sont ouverts entre-temps à celle du plan (essai resté bloqué
+        // longtemps) : ces flux-ci ne sont pas gardés, ils seront rouverts à la bonne.
+        if sample_rate != self.plan.sample_rate {
+            if self.open_mask() != 0 {
+                for (slot, res) in results.iter_mut().enumerate() {
+                    if matches!(res, Some(Ok(_))) {
+                        *res = Some(Err((
+                            format!(
+                                "{} « {} » ouverte à une autre fréquence : nouvel essai",
+                                slot_title(slot),
+                                self.plan.want[slot].label()
+                            ),
+                            true,
+                        )));
+                    }
+                }
+            } else if opened(&results) {
+                self.plan.sample_rate = sample_rate;
+            }
+        }
+        if opened(&results) {
+            // Ouverte une fois sur un vrai périphérique : rouverte telle quelle désormais.
+            self.plan.rate_fixed = true;
         }
         for (slot, res) in results.iter_mut().enumerate() {
             let Some(res) = res.take() else {
@@ -1541,6 +1701,7 @@ impl Engine {
             .ok_or_else(|| anyhow!("Aucune entrée audio"))?;
         self.shared.rec_frames.store(0, Ordering::Relaxed);
         self.shared.rec_gap_frames.store(0, Ordering::Relaxed);
+        self.shared.rec_gap_overflow.store(0, Ordering::Relaxed);
         // Compteurs propres à cette prise.
         for c in [
             &self.shared.xruns,
@@ -1741,6 +1902,10 @@ struct InState {
     mon_release: f32,
     /// Panique rattrapée : le flux ne fait plus rien (il va être rouvert).
     faulted: bool,
+    /// Trou plus long que la place libre des tampons : la prise est figée jusqu'à la
+    /// commande suivante (la suite irait au mauvais endroit), l'interface la relance à sa
+    /// place (`Shared::rec_gap_overflow`).
+    halted: bool,
 }
 
 /// Coefficient de retour du limiteur de monitoring (~150 ms).
@@ -1803,7 +1968,7 @@ impl InState {
             if late > tolerance && self.shared.counting.load(Ordering::Relaxed) {
                 self.shared.xruns.fetch_add(1, Ordering::Relaxed);
             }
-            if late >= GAP_FILL_MIN && !self.targets.is_empty() {
+            if late >= GAP_FILL_MIN && !self.targets.is_empty() && !self.halted {
                 self.fill_gap(late, frames);
             }
         }
@@ -1812,7 +1977,10 @@ impl InState {
 
     /// Insère `secs` de silence dans toutes les pistes de la prise, la même durée partout
     /// (synchronisation entre pistes), dans la place libre des tampons seulement : le son
-    /// qui revient n'est jamais sacrifié pour combler le trou.
+    /// qui revient n'est jamais sacrifié pour combler le trou. Trou plus long que cette
+    /// place (tampons de 4 à 15 s) : ce qui tient est inséré (à sa place), puis la prise
+    /// est figée et signalée — l'interface l'arrête et la relance là où tombe le son qui
+    /// revient, au lieu de le poser des secondes trop tôt.
     fn fill_gap(&mut self, secs: f64, frames: usize) {
         let want = (secs.min(GAP_FILL_MAX) * self.sample_rate as f64) as usize;
         let room = |p: &Producer<f32>, w: usize, pending: usize| {
@@ -1831,7 +1999,14 @@ impl InState {
             .unwrap_or(0);
         // Le bloc qui arrive doit encore tenir derrière le silence.
         let n = want.min(free.saturating_sub(2 * frames));
-        if n == 0 {
+        if n < want {
+            // Rien d'inséré : la prise s'arrête exactement là où le son s'est arrêté, la
+            // suite repartira `full` trames plus loin (trou réel, sans plafond).
+            let full = (secs * self.sample_rate as f64).round().max(1.0) as u64;
+            let sh = &self.shared;
+            sh.rec_gap_overflow_ns.store(sh.now_ns(), Ordering::Relaxed);
+            sh.rec_gap_overflow.store(full, Ordering::Release);
+            self.halted = true;
             return;
         }
         for t in &mut self.targets {
@@ -1872,10 +2047,12 @@ impl InState {
                     );
                     let old = std::mem::replace(&mut st.targets, t);
                     st.dispose(old);
+                    st.halted = false;
                 }
                 InCmd::Stop => {
                     let old = std::mem::take(&mut st.targets);
                     st.dispose(old);
+                    st.halted = false;
                 }
                 InCmd::Monitor(p) => {
                     if let Some(old) = st.monitor.replace(p)
@@ -1961,7 +2138,8 @@ impl InState {
             }
         }
 
-        if !st.targets.is_empty() {
+        // (Prise figée après un trou trop long : plus rien n'y est écrit, voir `fill_gap`.)
+        if !st.targets.is_empty() && !st.halted {
             for t in &mut st.targets {
                 let cs = t.channels;
                 let sample = |f: usize, k: usize| {
@@ -2624,6 +2802,7 @@ mod tests {
                 mon_env: 0.0,
                 mon_release: mon_release(48000),
                 faulted: false,
+                halted: false,
             };
             st.process(&vec![level; 512 * 8]);
             let mut out = Vec::new();
@@ -2660,6 +2839,7 @@ mod tests {
             mon_env: 0.0,
             mon_release: mon_release(48000),
             faulted: false,
+            halted: false,
         };
         let t0 = cpal::StreamInstant::ZERO;
         let at = |frames: u64| {
@@ -2720,6 +2900,7 @@ mod tests {
             mon_env: 0.0,
             mon_release: mon_release(48000),
             faulted: false,
+            halted: false,
         };
         let (p1, _c1) = rtrb::RingBuffer::new(4096);
         let (p2, _c2) = rtrb::RingBuffer::new(1 << 20);
@@ -2767,6 +2948,19 @@ mod tests {
         tx.send(InCmd::Monitor(mprod2)).unwrap();
         assert_no_alloc(|| ins.callback(&data_f, Some((at(pos), at(pos)))));
         assert!(ins.monitor.is_some());
+        // Trou de 2 s, plus long que les tampons : prise figée et trou signalé.
+        let (p6, _c6) = rtrb::RingBuffer::new(8192);
+        tx.send(InCmd::Record(vec![RecTarget::new(0, p6)])).unwrap();
+        assert_no_alloc(|| {
+            ins.callback(&data_f, Some((at(pos), at(pos))));
+            pos += 256 + 96000;
+            for _ in 0..3 {
+                ins.callback(&data_f, Some((at(pos), at(pos))));
+                pos += 256;
+            }
+        });
+        assert_eq!(shared.rec_gap_overflow.load(Ordering::Relaxed), 96000);
+        assert!(ins.halted);
 
         // --- sortie : lecture, bascule, pads, nouveau monitoring.
         let (otx, orx) = bounded::<OutCmd>(8);
@@ -2925,6 +3119,7 @@ mod tests {
             mon_env: 0.0,
             mon_release: mon_release(48000),
             faulted: false,
+            halted: false,
         };
         let (prod, mut cons) = rtrb::RingBuffer::new(1 << 18);
         tx.send(InCmd::Record(vec![RecTarget::new(0, prod)]))
@@ -2959,6 +3154,153 @@ mod tests {
         assert!(got[..7 * 480].iter().all(|&x| x == 0.5));
         assert!(got[7 * 480..7 * 480 + 24000].iter().all(|&x| x == 0.0));
         assert!(got[7 * 480 + 24000..].iter().all(|&x| x == 0.5));
+    }
+
+    /// Trou de l'entrée plus long que la place libre des tampons : rien n'est inséré, la
+    /// prise s'arrête là où le son s'est arrêté (le son qui revient n'est jamais posé trop
+    /// tôt), le trou réel est signalé pour relancer la suite à sa place ; une nouvelle
+    /// prise repart normalement.
+    #[test]
+    fn input_gap_longer_than_buffers_halts_the_take() {
+        let shared = Arc::new(Shared::new());
+        let (tx, rx) = bounded::<InCmd>(4);
+        let (gtx, _grx) = bounded::<InGarbage>(16);
+        let mut st = InState {
+            channels: 1,
+            rx,
+            targets: Vec::new(),
+            garbage: gtx,
+            shared: shared.clone(),
+            monitor: None,
+            sample_rate: 48000,
+            last_capture: None,
+            mon_env: 0.0,
+            mon_release: mon_release(48000),
+            faulted: false,
+            halted: false,
+        };
+        // Tampon d'une seconde, vidé au fil de l'eau (thread disque).
+        let (prod, mut cons) = rtrb::RingBuffer::new(48000);
+        tx.send(InCmd::Record(vec![RecTarget::new(0, prod)]))
+            .unwrap();
+        let at = |frames: u64| {
+            cpal::StreamInstant::ZERO
+                .checked_add(std::time::Duration::from_nanos(
+                    frames * 1_000_000_000 / 48000,
+                ))
+                .unwrap()
+        };
+        let data = vec![0.5f32; 480];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        for k in 0..12 {
+            // Trou de 2 s au 8e bloc : plus long que le tampon.
+            if k == 7 {
+                pos += 96000;
+            }
+            st.callback(&data, Some((at(pos), at(pos))));
+            pos += 480;
+            while let Ok(x) = cons.pop() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got.len(), 7 * 480);
+        assert!(got.iter().all(|&x| x == 0.5));
+        assert_eq!(shared.rec_frames.load(Ordering::Relaxed), 7 * 480);
+        assert_eq!(shared.rec_gap_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.rec_gap_overflow.load(Ordering::Relaxed), 96000);
+        // Prise suivante : elle repart normalement.
+        shared.rec_gap_overflow.store(0, Ordering::Relaxed);
+        shared.rec_frames.store(0, Ordering::Relaxed);
+        let (prod, cons) = rtrb::RingBuffer::new(48000);
+        tx.send(InCmd::Record(vec![RecTarget::new(0, prod)]))
+            .unwrap();
+        for _ in 0..3 {
+            st.callback(&data, Some((at(pos), at(pos))));
+            pos += 480;
+        }
+        assert_eq!(cons.slots(), 3 * 480);
+        assert_eq!(shared.rec_gap_overflow.load(Ordering::Relaxed), 0);
+    }
+
+    /// Monitoring rebranché quand seule l'entrée, ou seul le flux qui le joue, est rouvert :
+    /// chaque moitié du nouveau tampon va au flux rouvert ou, par commande, à celui resté
+    /// ouvert. Rien à faire si aucun des deux n'est touché.
+    #[test]
+    fn monitoring_is_rewired_after_a_partial_reopen() {
+        assert_eq!(mon_rewire(LOST_INPUT, SLOT_MAIN), Some((true, false)));
+        assert_eq!(mon_rewire(LOST_OUTPUT, SLOT_MAIN), Some((false, true)));
+        assert_eq!(mon_rewire(LOST_PADS, SLOT_PADS), Some((false, true)));
+        assert_eq!(
+            mon_rewire(LOST_INPUT | LOST_MONITOR, SLOT_MON),
+            Some((true, true))
+        );
+        assert_eq!(mon_rewire(LOST_PADS, SLOT_MAIN), None);
+        assert_eq!(mon_rewire(0, SLOT_MAIN), None);
+
+        let result = |to_input, to_carrier, asked| Reopened {
+            slots: asked,
+            asked,
+            sample_rate: 48000,
+            results: Default::default(),
+            returned: Vec::new(),
+            mon_to_input: to_input,
+            mon_to_carrier: to_carrier,
+            main_pads: None,
+        };
+        let engine = || {
+            let mut e = Engine::offline();
+            let (itx, irx) = bounded::<InCmd>(4);
+            let (otx, orx) = bounded::<OutCmd>(4);
+            e.in_tx = Some(itx);
+            e.out_tx[SLOT_MAIN] = Some(otx);
+            e.opened[SLOT_MAIN] = Some(("Sortie".into(), 2));
+            (e, irx, orx)
+        };
+        // Entrée rouverte : le flux d'écoute resté ouvert reçoit sa moitié.
+        let (mut e, irx, orx) = engine();
+        e.reopening = LOST_INPUT;
+        let (_p, c) = rtrb::RingBuffer::<f32>::new(16);
+        e.install(result(None, Some(c), LOST_INPUT));
+        assert!(matches!(orx.try_recv(), Ok(OutCmd::Monitor(_))));
+        assert!(irx.try_recv().is_err());
+        assert_eq!(e.reopening(), 0);
+        // Flux d'écoute rouvert : l'entrée restée ouverte reçoit la sienne.
+        let (mut e, irx, orx) = engine();
+        let (p, _c) = rtrb::RingBuffer::<f32>::new(16);
+        e.install(result(Some(p), None, LOST_OUTPUT));
+        assert!(matches!(irx.try_recv(), Ok(InCmd::Monitor(_))));
+        assert!(orx.try_recv().is_err());
+    }
+
+    /// Pendant un essai, les flux retirés ne reçoivent plus rien (Lecture refusée avec un
+    /// message au lieu d'une lecture muette) ; un essai perdu les rend à la liste des
+    /// flux manquants.
+    #[test]
+    fn reopening_streams_take_no_commands() {
+        let mut e = Engine::offline();
+        e.plan.want[SLOT_INPUT] = Want::named(Some("Entrée".into()));
+        e.plan.want[SLOT_MAIN] = Want::named(Some("Sortie".into()));
+        e.in_tx = Some(bounded::<InCmd>(4).0);
+        let (otx, _orx) = bounded::<OutCmd>(4);
+        e.out_tx[SLOT_MAIN] = Some(otx);
+        // (Aucun flux réellement ouvert ici : seules les commandes sont en jeu.)
+        let job = e.prepare(LOST_OUTPUT);
+        assert_eq!(e.reopening(), LOST_OUTPUT);
+        assert!(!e.has_output());
+        assert!(e.has_input());
+        assert!(e.pad_tx.is_none());
+        assert!(!job.any_open);
+        drop(job);
+        e.reopen_lost(LOST_OUTPUT);
+        assert_eq!(e.reopening(), 0);
+        assert_eq!(e.missing(), LOST_INPUT | LOST_OUTPUT);
+        assert_eq!(
+            e.slots_label(LOST_INPUT | LOST_OUTPUT),
+            "Entrée « Entrée », Sortie principale « Sortie »"
+        );
+        // Fréquence pas encore ouverte (aucune carte) : elle n'est pas figée.
+        assert!(!e.rate_fixed());
     }
 
     /// Une carte rebranchée sur un autre port USB revient sous un autre nom (« 2- … ») :
