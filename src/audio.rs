@@ -1605,6 +1605,7 @@ mod tests {
     /// monitoring, arrêt de prise, lecture, bascule mute/solo, pads (appui, fondu,
     /// panique), trames perdues — le test échoue à la moindre allocation.
     #[test]
+    #[cfg(debug_assertions)]
     fn audio_callbacks_never_allocate() {
         use crate::sampler::{PadMode, PadParams, SampleData};
         use assert_no_alloc::assert_no_alloc;

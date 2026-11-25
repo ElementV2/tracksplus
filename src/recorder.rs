@@ -11,10 +11,11 @@
 use crate::project::RecFormat;
 use crate::render::{PeakAccum, Peaks};
 use crossbeam_channel::Sender;
-use hound::{WavSpec, WavWriter};
+use hound::WavSpec;
 use rtrb::Consumer;
 use std::fs::File;
 use std::io::BufWriter;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,7 +117,7 @@ pub struct Recorder {
 }
 
 struct SegWriter {
-    w: WavWriter<BufWriter<File>>,
+    w: TakeWav,
     /// Second accès au fichier pour forcer l'écriture sur le disque (partagé avec le
     /// thread de synchronisation : jamais plus d'une demande en attente par fichier).
     file: Arc<File>,
@@ -148,26 +149,130 @@ struct LaneState {
     elapsed: u64,
     /// Prochain essai de réouverture après une erreur d'écriture.
     retry_at: Option<Instant>,
+    /// Date et heure du début de la prise, et sa position depuis minuit (trames) :
+    /// TimeReference du BWF.
+    take_time: chrono::NaiveDateTime,
+    time_ref: u64,
 }
 
-fn open_segment(path: &Path, wav: WavSpec) -> std::io::Result<SegWriter> {
+/// Fichier WAV d'une prise, au format BWF : en-tête `fmt`, bloc `bext` (date, heure et
+/// position depuis minuit — les logiciels pro s'en servent pour poser le fichier à son
+/// heure réelle ou caler plusieurs enregistreurs), puis les données. Les tailles de
+/// l'en-tête sont réécrites à chaque `flush` : le fichier reste lisible après un crash.
+struct TakeWav {
+    w: BufWriter<File>,
+    /// Position du champ « taille » du bloc `data`.
+    data_size_at: u64,
+    bytes: u64,
+    /// Octet de bourrage final écrit (`finalize`).
+    padded: bool,
+}
+
+impl TakeWav {
+    fn create(file: File, spec: WavSpec, bext: &[u8]) -> std::io::Result<Self> {
+        let float = spec.sample_format == hound::SampleFormat::Float;
+        debug_assert!(float == (spec.bits_per_sample == 32));
+        let bytes_per_sample = spec.bits_per_sample / 8;
+        let block = spec.channels * bytes_per_sample;
+        let mut h = Vec::with_capacity(64 + bext.len());
+        h.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&(if float { 3u16 } else { 1u16 }).to_le_bytes());
+        h.extend_from_slice(&spec.channels.to_le_bytes());
+        h.extend_from_slice(&spec.sample_rate.to_le_bytes());
+        h.extend_from_slice(&(spec.sample_rate * block as u32).to_le_bytes());
+        h.extend_from_slice(&block.to_le_bytes());
+        h.extend_from_slice(&spec.bits_per_sample.to_le_bytes());
+        if !bext.is_empty() {
+            // Taille toujours paire, octet de bourrage compris : certains lecteurs (hound,
+            // utilisé pour relire les prises) ignorent le bourrage RIFF des blocs impairs.
+            let len = bext.len().next_multiple_of(2);
+            h.extend_from_slice(b"bext");
+            h.extend_from_slice(&(len as u32).to_le_bytes());
+            h.extend_from_slice(bext);
+            h.resize(h.len() + len - bext.len(), 0);
+        }
+        h.extend_from_slice(b"data\0\0\0\0");
+        let data_size_at = h.len() as u64 - 4;
+        let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
+        w.write_all(&h)?;
+        Ok(Self {
+            w,
+            data_size_at,
+            bytes: 0,
+            padded: false,
+        })
+    }
+
+    #[inline]
+    fn write_i24(&mut self, v: i32) -> std::io::Result<()> {
+        self.bytes += 3;
+        self.w.write_all(&v.to_le_bytes()[..3])
+    }
+
+    #[inline]
+    fn write_f32(&mut self, v: f32) -> std::io::Result<()> {
+        self.bytes += 4;
+        self.w.write_all(&v.to_le_bytes())
+    }
+
+    /// Données sur le disque (tampon vidé) et tailles de l'en-tête à jour.
+    fn flush(&mut self) -> std::io::Result<()> {
+        let data = self.bytes.min(u32::MAX as u64 - 64);
+        let riff = (self.data_size_at + 4 + data + self.padded as u64 - 8).min(u32::MAX as u64);
+        self.w.seek(SeekFrom::Start(4))?;
+        self.w.write_all(&(riff as u32).to_le_bytes())?;
+        self.w.seek(SeekFrom::Start(self.data_size_at))?;
+        self.w.write_all(&(data as u32).to_le_bytes())?;
+        self.w.seek(SeekFrom::End(0))?;
+        self.w.flush()
+    }
+
+    /// Fin du fichier : octet de bourrage RIFF si besoin, tailles définitives.
+    fn finalize(mut self) -> std::io::Result<()> {
+        if self.bytes % 2 == 1 {
+            self.w.write_all(&[0])?;
+            self.padded = true;
+        }
+        self.flush()
+    }
+}
+
+fn open_segment(
+    path: &Path,
+    wav: WavSpec,
+    bext: &dyn Fn(u64) -> Vec<u8>,
+    start: u64,
+) -> std::io::Result<SegWriter> {
     // Jamais d'écrasement : si le fichier existe déjà, c'est une erreur signalée.
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
     let sync = file.try_clone()?;
-    let w = WavWriter::new(BufWriter::with_capacity(WRITE_BUFFER, file), wav)
-        .map_err(std::io::Error::other)?;
+    let w = TakeWav::create(file, wav, &bext(start))?;
     Ok(SegWriter {
         w,
         file: Arc::new(sync),
         frames: 0,
-        start: 0,
+        start,
     })
 }
 
 impl LaneState {
+    /// Bloc BWF d'un fichier de la prise commençant à la trame `at` de la prise.
+    fn bext(&self, at: u64) -> Vec<u8> {
+        let name = self.file.trim_end_matches(".wav");
+        crate::encode::bext_bytes(
+            name,
+            self.time_ref.saturating_add(at),
+            self.take_time,
+            self.wav.sample_rate,
+            self.wav.bits_per_sample,
+            self.wav.channels as usize,
+        )
+    }
+
     fn fail(&mut self, errors: &Errors, msg: String) {
         errors.lock().push(msg.clone());
         self.error.get_or_insert(msg);
@@ -199,7 +304,12 @@ impl LaneState {
 
     fn open_next(&mut self, errors: &Errors) {
         let name = segment_name(&self.file, self.done.len() + 1);
-        match open_segment(&self.dir.join(&name), self.wav) {
+        match open_segment(
+            &self.dir.join(&name),
+            self.wav,
+            &|at| self.bext(at),
+            self.elapsed,
+        ) {
             Ok(mut w) => {
                 w.start = self.elapsed;
                 self.cur = Some(w);
@@ -217,7 +327,12 @@ impl LaneState {
     fn retry(&mut self) {
         // Échecs répétés : l'erreur a déjà été signalée, on ne la répète pas chaque seconde.
         let name = segment_name(&self.file, self.done.len() + 1);
-        match open_segment(&self.dir.join(&name), self.wav) {
+        match open_segment(
+            &self.dir.join(&name),
+            self.wav,
+            &|at| self.bext(at),
+            self.elapsed,
+        ) {
             Ok(mut w) => {
                 w.start = self.elapsed;
                 self.retry_at = None;
@@ -340,6 +455,15 @@ fn run(
     stop: Arc<AtomicBool>,
     errors: Errors,
 ) -> Vec<RecResult> {
+    // Heure du début de la prise (la même pour toutes les pistes : elles restent calées
+    // entre elles dans un logiciel qui place les fichiers à leur heure).
+    let take_time = chrono::Local::now().naive_local();
+    let time_ref = {
+        use chrono::Timelike;
+        let t = take_time.time();
+        t.num_seconds_from_midnight() as u64 * sample_rate as u64
+            + t.nanosecond() as u64 * sample_rate as u64 / 1_000_000_000
+    };
     let mut lanes: Vec<Lane> = specs
         .into_iter()
         .map(|spec| {
@@ -362,6 +486,8 @@ fn run(
                 error: None,
                 elapsed: 0,
                 retry_at: None,
+                take_time,
+                time_ref,
             };
             st.open_next(&errors);
             Lane {
@@ -429,8 +555,8 @@ fn run(
                 let r = match format {
                     RecFormat::Int24 => seg
                         .w
-                        .write_sample((s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32),
-                    RecFormat::Float32 => seg.w.write_sample(if s.is_finite() { s } else { 0.0 }),
+                        .write_i24((s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32),
+                    RecFormat::Float32 => seg.w.write_f32(if s.is_finite() { s } else { 0.0 }),
                 };
                 match r {
                     Ok(()) => {
@@ -825,6 +951,100 @@ mod tests {
         assert_eq!(side, "3000");
         let r = hound::WavReader::open(dir.join(&seg.file)).unwrap();
         assert_eq!(r.duration(), 2000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Bloc `bext` d'un fichier : (description, TimeReference).
+    fn read_bext(path: &Path) -> Option<(String, u64)> {
+        let b = std::fs::read(path).ok()?;
+        let mut pos = 12;
+        while pos + 8 <= b.len() {
+            let size = u32::from_le_bytes(b[pos + 4..pos + 8].try_into().ok()?) as usize;
+            if &b[pos..pos + 4] == b"bext" {
+                let d = &b[pos + 8..pos + 8 + size];
+                let desc = String::from_utf8_lossy(&d[..256])
+                    .trim_end_matches('\0')
+                    .to_string();
+                let lo = u32::from_le_bytes(d[338..342].try_into().ok()?) as u64;
+                let hi = u32::from_le_bytes(d[342..346].try_into().ok()?) as u64;
+                return Some((desc, lo | hi << 32));
+            }
+            pos += 8 + size + (size & 1);
+        }
+        None
+    }
+
+    /// Prises au format BWF : nom de la piste, heure du début (TimeReference, trames depuis
+    /// minuit), et les fichiers suivants d'une prise longue décalés de leur position.
+    #[test]
+    fn takes_are_bwf_with_time_reference() {
+        let dir = std::env::temp_dir().join(format!("tp-bwf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut prod, cons) = rtrb::RingBuffer::new(100_000);
+        let before = {
+            use chrono::Timelike;
+            chrono::Local::now().time().num_seconds_from_midnight() as u64
+        };
+        let rec = Recorder::start_with_limit(
+            vec![RecSpec {
+                track_id: 1,
+                file: "Voix_001.wav".into(),
+                path: dir.join("Voix_001.wav"),
+                peaks: Arc::new(RwLock::new(PeakData::default())),
+                cons,
+                channels: 1,
+            }],
+            48000,
+            RecFormat::Int24,
+            1024 + 3 * 10_000,
+        )
+        .unwrap();
+        for i in 0..25_000 {
+            prod.push((i % 100) as f32 / 200.0).unwrap();
+        }
+        drop(prod);
+        let res = rec.finish().unwrap();
+        let segs = &res[0].segments;
+        assert!(segs.len() >= 2);
+        let (desc, t0) = read_bext(&dir.join(&segs[0].file)).unwrap();
+        assert_eq!(desc, "Voix_001");
+        let secs = t0 / 48000;
+        // Minuit peut tomber pendant le test : on accepte le passage à 0.
+        assert!(secs.abs_diff(before) <= 2 || secs < 2, "{secs} / {before}");
+        let (_, t1) = read_bext(&dir.join(&segs[1].file)).unwrap();
+        assert_eq!(t1, t0 + segs[1].start);
+        // Toujours lisible tel quel, échantillons intacts.
+        let mut r = hound::WavReader::open(dir.join(&segs[0].file)).unwrap();
+        assert_eq!(r.duration() as u64, segs[0].frames);
+        let v: Vec<i32> = r.samples::<i32>().take(3).map(|x| x.unwrap()).collect();
+        assert_eq!(v[1], (0.005f32 * 8_388_607.0).round() as i32);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coupure de courant : en-tête resté à la dernière mise à jour, données au-delà sur le
+    /// disque — la réparation retrouve tout, bloc BWF compris.
+    #[test]
+    fn bwf_take_survives_crash() {
+        let dir = std::env::temp_dir().join(format!("tp-bwf-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.wav");
+        let file = std::fs::File::create(&path).unwrap();
+        let spec = wav_spec(RecFormat::Int24, 48000, 2);
+        let mut w = TakeWav::create(file, spec, &[7u8; 603]).unwrap();
+        for i in 0..2000 {
+            w.write_i24(i).unwrap();
+        }
+        w.flush().unwrap();
+        for i in 0..1001 {
+            w.write_i24(i).unwrap();
+        }
+        // Pas de finalize : le tampon part sur le disque, l'en-tête reste à 1000 trames.
+        drop(w);
+        assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 1000);
+        assert_eq!(crate::recovery::repair_wav(&path).unwrap(), 1500);
+        assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 1500);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -273,9 +273,29 @@ fn put_fixed(b: &mut Vec<u8>, s: &str, n: usize) {
 
 /// Corps du chunk `bext` (EBU Tech 3285, version 1).
 pub(crate) fn bext_chunk(spec: &SinkSpec, now: chrono::NaiveDateTime) -> Vec<u8> {
-    let m = spec.meta;
+    let pcm = Pcm::from_depth(spec.depth);
+    bext_bytes(
+        &spec.meta.description,
+        spec.meta.time_reference,
+        now,
+        spec.sample_rate,
+        pcm.bits(),
+        spec.channels,
+    )
+}
+
+/// Contenu d'un bloc `bext` (BWF, EBU Tech 3285 v1) : description, auteur, date et heure
+/// d'origine, TimeReference (trames depuis minuit) et historique de codage.
+pub(crate) fn bext_bytes(
+    description: &str,
+    time_reference: u64,
+    now: chrono::NaiveDateTime,
+    sample_rate: u32,
+    bits: u16,
+    channels: usize,
+) -> Vec<u8> {
     let mut b = Vec::with_capacity(700);
-    put_fixed(&mut b, &ascii_fold(&m.description), 256);
+    put_fixed(&mut b, &ascii_fold(description), 256);
     put_fixed(&mut b, "TracksPlus", 32);
     // OriginatorReference au format USID : pays, organisation, numéro de série,
     // heure d'origine, nombre aléatoire (32 caractères).
@@ -286,23 +306,22 @@ pub(crate) fn bext_chunk(spec: &SinkSpec, now: chrono::NaiveDateTime) -> Vec<u8>
         "FRTPL{:012}{}{:09}",
         (nanos / 1_000_000) % 1_000_000_000_000,
         now.format("%H%M%S"),
-        (nanos as u64 ^ m.time_reference.rotate_left(17)) % 1_000_000_000
+        (nanos as u64 ^ time_reference.rotate_left(17)) % 1_000_000_000
     );
     put_fixed(&mut b, &usid, 32);
     put_fixed(&mut b, &now.format("%Y-%m-%d").to_string(), 10);
     put_fixed(&mut b, &now.format("%H:%M:%S").to_string(), 8);
-    b.extend_from_slice(&(m.time_reference as u32).to_le_bytes());
-    b.extend_from_slice(&((m.time_reference >> 32) as u32).to_le_bytes());
+    b.extend_from_slice(&(time_reference as u32).to_le_bytes());
+    b.extend_from_slice(&((time_reference >> 32) as u32).to_le_bytes());
     b.extend_from_slice(&1u16.to_le_bytes()); // Version
     b.resize(b.len() + 64, 0); // UMID (non renseigné)
     b.resize(b.len() + 190, 0); // Réservé (version 1)
     debug_assert_eq!(b.len(), 602);
-    let pcm = Pcm::from_depth(spec.depth);
     let history = format!(
         "A=PCM,F={},W={},M={},T={}\r\n",
-        spec.sample_rate,
-        pcm.bits(),
-        if spec.channels == 1 { "mono" } else { "stereo" },
+        sample_rate,
+        bits,
+        if channels == 1 { "mono" } else { "stereo" },
         ascii_fold(ENCODER)
     );
     b.extend_from_slice(history.as_bytes());

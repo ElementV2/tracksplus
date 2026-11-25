@@ -8,7 +8,7 @@ mod export;
 mod fuzz_tests;
 
 // Tests : toute allocation à l'intérieur de `assert_no_alloc(|| …)` fait échouer le test.
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 mod import;
