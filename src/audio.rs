@@ -567,6 +567,8 @@ impl Engine {
                 monitor: mon_prod.take(),
                 sample_rate,
                 last_capture: None,
+                mon_env: 0.0,
+                mon_release: mon_release(sample_rate),
             };
             let stream = match fmt {
                 SampleFormat::F32 => build_input::<f32>(dev, cfg, st),
@@ -907,6 +909,14 @@ struct InState {
     sample_rate: u32,
     /// Bloc précédent : instant de capture de sa première trame et nombre de trames.
     last_capture: Option<(cpal::StreamInstant, usize)>,
+    /// Limiteur du monitoring : enveloppe de crête et coefficient de retour par trame.
+    mon_env: f32,
+    mon_release: f32,
+}
+
+/// Coefficient de retour du limiteur de monitoring (~150 ms).
+fn mon_release(sample_rate: u32) -> f32 {
+    (-1.0 / (0.15 * sample_rate.max(1) as f32)).exp()
 }
 
 impl InState {
@@ -1005,6 +1015,15 @@ impl InState {
             if n > 0
                 && let Ok(chunk) = mp.write_chunk_uninit(n * 2)
             {
+                // Comme sur une console : une entrée mono au centre à -3 dB (loi de
+                // panoramique à puissance constante), une paire stéréo à 0 dB de chaque côté.
+                // Puis limiteur de sécurité à -1 dBFS sur ce mix d'écoute seulement (les
+                // prises ne sont jamais touchées) : plusieurs entrées écoutées ensemble ne
+                // saturent pas le casque ou la façade.
+                const CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
+                const LIMIT: f32 = 0.891; // -1 dBFS
+                let rel = st.mon_release;
+                let mut env = st.mon_env;
                 chunk.fill_from_iter((0..n).flat_map(|f| {
                     let (mut l, mut r) = (0f32, 0f32);
                     for &(c, m) in &act[..na] {
@@ -1013,13 +1032,22 @@ impl InState {
                             2 => l += s,
                             3 => r += s,
                             _ => {
-                                l += s;
-                                r += s;
+                                l += s * CENTER;
+                                r += s * CENTER;
                             }
                         }
                     }
-                    [l, r]
+                    // Attaque instantanée (rien ne dépasse), retour en ~150 ms.
+                    let peak = l.abs().max(r.abs());
+                    env = if peak.is_finite() {
+                        peak.max(env * rel)
+                    } else {
+                        env
+                    };
+                    let g = if env > LIMIT { LIMIT / env } else { 1.0 };
+                    [l * g, r * g]
                 }));
+                st.mon_env = env;
             }
         }
 
@@ -1614,6 +1642,46 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Monitoring : entrée mono au centre à -3 dB ; beaucoup d'entrées écoutées ensemble
+    /// ne dépassent jamais -1 dBFS (limiteur), sans toucher aux prises.
+    #[test]
+    fn monitor_mix_pan_law_and_limiter() {
+        let run = |listened: usize, level: f32| -> Vec<f32> {
+            let shared = Arc::new(Shared::new());
+            shared.monitor_on.store(true, Ordering::Relaxed);
+            for c in 0..listened {
+                shared.monitor[c].store(1, Ordering::Relaxed);
+            }
+            let (mprod, mut mcons) = rtrb::RingBuffer::new(1 << 16);
+            let mut st = InState {
+                channels: 8,
+                rx: bounded::<InCmd>(1).1,
+                targets: Vec::new(),
+                garbage: bounded(1).0,
+                shared,
+                monitor: Some(mprod),
+                sample_rate: 48000,
+                last_capture: None,
+                mon_env: 0.0,
+                mon_release: mon_release(48000),
+            };
+            st.process(&vec![level; 512 * 8]);
+            let mut out = Vec::new();
+            while let Ok(x) = mcons.pop() {
+                out.push(x);
+            }
+            out
+        };
+        let one = run(1, 0.5);
+        assert!(
+            one.iter()
+                .all(|&x| (x - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6)
+        );
+        let eight = run(8, 0.9);
+        assert!(eight.iter().all(|&x| x <= 0.8911), "{:?}", &eight[..4]);
+        assert!(eight.iter().all(|&x| x > 0.88));
+    }
+
     /// Décrochage détecté par l'horodatage de capture, sans fausse alerte sur des blocs
     /// livrés en rafale.
     #[test]
@@ -1629,6 +1697,8 @@ mod tests {
             monitor: None,
             sample_rate: 48000,
             last_capture: None,
+            mon_env: 0.0,
+            mon_release: mon_release(48000),
         };
         let t0 = cpal::StreamInstant::ZERO;
         let at = |frames: u64| {
@@ -1676,6 +1746,8 @@ mod tests {
             monitor: Some(mprod),
             sample_rate: 48000,
             last_capture: None,
+            mon_env: 0.0,
+            mon_release: mon_release(48000),
         };
         let (p1, _c1) = rtrb::RingBuffer::new(4096);
         let (p2, _c2) = rtrb::RingBuffer::new(1 << 20);

@@ -279,6 +279,36 @@ pub struct DiskSpace {
     backup: Option<Result<u64, ()>>,
 }
 
+/// `a` et `b` sont sur le même disque (volume). Windows : même lecteur ou même partage
+/// réseau ; ailleurs : même périphérique de stockage.
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        let vol = |p: &Path| match p.components().next() {
+            Some(Component::Prefix(x)) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
+            _ => None,
+        };
+        let (va, vb) = (vol(a), vol(b));
+        va.is_some() && va == vb
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = |p: &Path| {
+            let mut q = p;
+            loop {
+                if let Ok(m) = std::fs::metadata(q) {
+                    return Some(m.dev());
+                }
+                q = q.parent()?;
+            }
+        };
+        let (da, db) = (dev(a), dev(b));
+        da.is_some() && da == db
+    }
+}
+
 /// Place libre sur le disque qui contient (ou contiendra) `dir`.
 fn free_space(dir: &Path) -> Option<u64> {
     let mut p: &Path = dir;
@@ -898,7 +928,7 @@ impl App {
         self.backup_warn.clear();
         if self.backup_root.is_some() && backup.is_none() {
             self.notify(
-                "Copie de sécurité inactive pour cette session : elle est déjà sur le disque de secours",
+                "Copie de sécurité inactive pour cette session : elle est sur le même disque que la copie",
                 false,
             );
         }
@@ -1398,9 +1428,12 @@ impl App {
         else {
             return;
         };
-        if d.starts_with(&self.project.dir) || self.project.dir.starts_with(&d) {
+        let sessions = project::default_sessions_root();
+        if same_volume(&d, &self.project.dir) || same_volume(&d, &sessions) {
+            // Même disque : la copie ne protégerait de rien si ce disque lâche.
             self.notify(
-                "Choisissez un dossier sur un autre disque que celui de la session",
+                "La copie de sécurité doit être sur un AUTRE disque que celui des sessions \
+                 (clé USB, SSD externe, second disque interne)",
                 true,
             );
         } else {
@@ -1442,6 +1475,12 @@ impl App {
         let (r, d) = (norm(root), norm(&self.project.dir));
         let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
         if inside(&d, &r) || inside(&r, &d) {
+            return None;
+        }
+        // Session ouverte sur le disque de la copie (Windows : comparaison des lecteurs,
+        // sans accès disque) : pas de copie sur le même disque.
+        #[cfg(windows)]
+        if same_volume(root, &self.project.dir) {
             return None;
         }
         // FNV-1a : code stable d'une version à l'autre de l'application.
@@ -5036,6 +5075,24 @@ pub fn open_in_file_manager(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_volume_detects_same_disk() {
+        let t = std::env::temp_dir();
+        assert!(super::same_volume(&t, &t.join("a/b/pas-encore")));
+        #[cfg(windows)]
+        {
+            use std::path::Path;
+            assert!(super::same_volume(
+                Path::new(r"C:\Musique"),
+                Path::new(r"c:\Secours")
+            ));
+            assert!(!super::same_volume(
+                Path::new(r"C:\Musique"),
+                Path::new(r"E:\Secours")
+            ));
+        }
+    }
+
     /// Place libre mesurée sur le disque qui contiendra le dossier, même s'il n'existe pas
     /// encore (copie de sécurité jamais utilisée).
     #[test]
