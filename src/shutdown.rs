@@ -289,8 +289,8 @@ mod win {
     };
     use windows_sys::Win32::System::Threading::SetProcessShutdownParameters;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, DefWindowProcW, GWLP_WNDPROC, SetWindowLongPtrW, WM_ENDSESSION,
-        WM_QUERYENDSESSION, WNDPROC,
+        CallWindowProcW, DefWindowProcW, GWLP_WNDPROC, HTCAPTION, SetWindowLongPtrW,
+        WM_ENDSESSION, WM_NCLBUTTONDOWN, WM_QUERYENDSESSION, WNDPROC,
     };
 
     /// Fenêtre principale (0 = pas encore branchée).
@@ -387,6 +387,15 @@ mod win {
             && let Ok(Some(r)) = std::panic::catch_unwind(|| handle(hwnd, msg, wparam))
         {
             return r;
+        }
+        // Clic sur la barre de titre : winit simule un mouvement de souris pour éviter une
+        // pause de l'interface, ce qui fait démarrer un déplacement de la fenêtre au simple
+        // clic (FancyZones et l'ancrage Windows s'activent alors sans glisser). Windows
+        // traite le clic lui-même, comme pour toute autre application : le déplacement ne
+        // commence qu'au glisser. La prise et l'audio ne dépendent pas de l'interface.
+        if msg == WM_NCLBUTTONDOWN && wparam == HTCAPTION as WPARAM {
+            // SAFETY : traitement par défaut de Windows, sur le thread de la fenêtre.
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         let prev = PREV_PROC.load(Ordering::Acquire);
         // SAFETY : `prev` est la procédure d'origine renvoyée par SetWindowLongPtrW.
