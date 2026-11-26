@@ -2470,6 +2470,7 @@ impl App {
         let mut set_gain: Option<(usize, f32)> = None;
         let mut set_pan: Option<(usize, f32)> = None;
         let mut set_master: Option<f32> = None;
+        let mut reset_master = false;
         egui::ScrollArea::horizontal()
             .id_salt("bridge")
             .auto_shrink([false, false])
@@ -2619,6 +2620,11 @@ impl App {
                             vec2(38.0, 15.0),
                         );
                         w::peak_readout(p, pr, &m[0].merge(m[1]));
+                        // Clic sur la crête : remise à zéro (comme sur le grand master).
+                        reset_master = ui
+                            .interact(pr, ui.make_persistent_id("bmaster_pk"), Sense::click())
+                            .clicked();
+                        let p = ui.painter();
                         let mx = r.left() + 20.0;
                         for (k, mm) in m.iter().enumerate() {
                             let x = mx - 4.0 + k as f32 * 4.5;
@@ -2687,6 +2693,11 @@ impl App {
         {
             tr.pan = v;
             self.mix_changed();
+        }
+        if reset_master {
+            for m in &mut self.master_play {
+                m.reset();
+            }
         }
         if let Some(v) = set_master {
             // Master : appliqué à la sortie dès l'image suivante (`sync_monitoring`).
