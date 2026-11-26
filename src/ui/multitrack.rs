@@ -1148,12 +1148,11 @@ impl App {
             return;
         }
         let mut d = sample as i64 - drag.anchor as i64;
-        let exclude: HashSet<u64> = drag.origs.iter().map(|(_, c)| c.id).collect();
-        let points = if self.snap && !no_snap {
-            self.snap_points(&exclude)
-        } else {
-            Vec::new()
-        };
+        // Aimant : les prises se calent sur les cases de la grille, et seulement elles (des
+        // repères ou bords d'autres prises attireraient aussi, hors grille : des crans
+        // irréguliers). Maj enfoncée : déplacement libre.
+        let snapping = self.snap && !no_snap;
+        let points: &[u64] = &[];
         let main = drag
             .origs
             .iter()
@@ -1166,9 +1165,9 @@ impl App {
                     let min_start =
                         drag.origs.iter().map(|(_, c)| c.start).min().unwrap_or(0) as i64;
                     d = d.max(-min_start);
-                    if !points.is_empty() {
+                    if snapping {
                         let s = m.start as i64 + d;
-                        d += self.snap_delta(&[s, s + m.len as i64], &points);
+                        d += self.snap_delta(&[s], points);
                         d = d.max(-min_start);
                     }
                     for (_, o) in &drag.origs {
@@ -1188,8 +1187,8 @@ impl App {
                 DragMode::TrimLeft => {
                     let (lo, hi) = trim_left_range(&m);
                     let mut ns = (m.start as i64 + d).clamp(lo, hi);
-                    if !points.is_empty() {
-                        ns = (ns + self.snap_delta(&[ns], &points)).clamp(lo, hi);
+                    if snapping {
+                        ns = (ns + self.snap_delta(&[ns], points)).clamp(lo, hi);
                     }
                     if let Some((ti, _)) = self.project.find_clip(m.id)
                         && let Some(c) = self.project.tracks[ti]
@@ -1226,8 +1225,8 @@ impl App {
                 DragMode::TrimRight => {
                     let (lo, hi) = trim_right_range(&m);
                     let mut ne = (m.end() as i64 + d).clamp(lo, hi);
-                    if !points.is_empty() {
-                        ne = (ne + self.snap_delta(&[ne], &points)).clamp(lo, hi);
+                    if snapping {
+                        ne = (ne + self.snap_delta(&[ne], points)).clamp(lo, hi);
                     }
                     if let Some((ti, _)) = self.project.find_clip(m.id)
                         && let Some(c) = self.project.tracks[ti]
