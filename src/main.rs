@@ -3,6 +3,8 @@
 mod app;
 mod audio;
 mod decode;
+#[cfg(test)]
+mod demo;
 mod encode;
 mod export;
 #[cfg(test)]

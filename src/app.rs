@@ -1526,7 +1526,14 @@ impl App {
         let relaunched = crate::shutdown::relaunched();
         let interrupted = recovery::interrupted_sessions();
         let take_interrupted = !interrupted.is_empty();
-        let reopen = interrupted.first().cloned().or_else(|| {
+        // Session passée au lancement (fichier .tracksplus glissé sur l'icône, raccourci) :
+        // ouverte directement, sauf prise interrompue à récupérer (toujours prioritaire).
+        let arg_session = std::env::args_os().skip(1).map(PathBuf::from).find(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT))
+                && p.is_file()
+        });
+        let reopen = interrupted.first().cloned().or(arg_session).or_else(|| {
             if relaunched {
                 recovery::last_session()
             } else {
