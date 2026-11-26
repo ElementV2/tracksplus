@@ -1013,20 +1013,12 @@ impl App {
 
     // ---------------------------------------------------------------- montage
 
-    /// Points d'aimantation : tête de lecture, repères, sélection, bords des autres prises.
-    fn snap_points(&self, exclude: &HashSet<u64>) -> Vec<u64> {
-        let mut v = vec![0, self.playhead];
+    /// Aimant : trois choses attirent, partout (prises, tête, sélection), comme dans les
+    /// logiciels pro : les temps de la grille (voir `snap_offset`), les repères et la tête
+    /// de lecture. Ici, les deux derniers.
+    fn snap_points(&self) -> Vec<u64> {
+        let mut v = vec![self.playhead];
         v.extend(self.project.markers.iter().map(|m| m.pos));
-        if let Some((a, b)) = self.selection {
-            v.push(a);
-            v.push(b);
-        }
-        for tr in &self.project.tracks {
-            for c in tr.clips.iter().filter(|c| !exclude.contains(&c.id)) {
-                v.push(c.start);
-                v.push(c.end());
-            }
-        }
         v
     }
 
@@ -1051,7 +1043,7 @@ impl App {
         if !self.snap || no_snap {
             return s;
         }
-        let mut pts = self.snap_points(&HashSet::new());
+        let mut pts = self.snap_points();
         if moving_playhead {
             pts.retain(|&p| p != self.playhead);
         }
@@ -1148,11 +1140,12 @@ impl App {
             return;
         }
         let mut d = sample as i64 - drag.anchor as i64;
-        // Aimant : les prises se calent sur les cases de la grille, et seulement elles (des
-        // repères ou bords d'autres prises attireraient aussi, hors grille : des crans
-        // irréguliers). Maj enfoncée : déplacement libre.
+        // Aimant : temps de la grille (début de la prise), repères et tête de lecture (l'un
+        // ou l'autre bord). Les bords des autres prises n'attirent pas : ils semaient des
+        // crans irréguliers. Maj enfoncée : déplacement libre.
         let snapping = self.snap && !no_snap;
-        let points: &[u64] = &[];
+        let points_v = if snapping { self.snap_points() } else { Vec::new() };
+        let points: &[u64] = &points_v;
         let main = drag
             .origs
             .iter()
@@ -1167,7 +1160,7 @@ impl App {
                     d = d.max(-min_start);
                     if snapping {
                         let s = m.start as i64 + d;
-                        d += self.snap_delta(&[s], points);
+                        d += self.snap_delta(&[s, s + m.len as i64], points);
                         d = d.max(-min_start);
                     }
                     for (_, o) in &drag.origs {
