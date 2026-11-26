@@ -1,6 +1,6 @@
 [package]
 name = "tracksplus"
-version = "0.7.10"
+version = "0.7.11"
 edition = "2024"
 description = "Enregistreur multipiste et soundboard pour le live"
 
