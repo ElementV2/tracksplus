@@ -1088,8 +1088,13 @@ pub struct App {
     pub transport: Transport,
     pub playhead: u64,
     pub player: Option<Player>,
-    /// Position de la timeline où la lecture en cours a commencé (trame 0 du moteur).
+    /// Position de la timeline entendue à la trame `play_skew` du moteur (début de la
+    /// lecture, ou bascule sur un nouveau rendu), et boucle de ce rendu (`heard_at`).
     play_base: u64,
+    play_skew: u64,
+    play_loop: Option<(u64, u64)>,
+    /// Lecture en boucle sur la plage sélectionnée (bouton boucle, touche L).
+    pub loop_on: bool,
     /// Rendus remplacés (mute / solo) : gardés le temps que le moteur bascule.
     retired: Vec<(Player, f64)>,
     pub recorder: Option<Recorder>,
@@ -1368,6 +1373,9 @@ impl App {
             playhead: 0,
             player: None,
             play_base: 0,
+            play_skew: 0,
+            play_loop: None,
+            loop_on: false,
             retired: Vec::new(),
             track_meters: HashMap::new(),
             meters_pos: 0,
@@ -1790,7 +1798,15 @@ impl App {
         if self.playhead >= self.project.end() && self.project.end() > 0 {
             self.playhead = self.selection.map_or(0, |s| s.0);
         }
-        let (player, cons) = Player::start(&self.project, self.playhead, self.project.audible());
+        // Boucle : la lecture part du début de la plage si la tête est en dehors.
+        let lp = self.active_loop();
+        if let Some((a, b)) = lp
+            && (self.playhead < a || self.playhead >= b)
+        {
+            self.playhead = a;
+        }
+        let (player, cons) =
+            Player::start(&self.project, self.playhead, self.project.audible(), lp);
         if !self.engine.start_playback(cons) {
             // Jamais « lecture » à l'écran si le moteur n'a rien reçu.
             self.notify(OUTPUT_STALLED, true);
@@ -1798,6 +1814,8 @@ impl App {
         }
         self.player = Some(player);
         self.play_base = self.playhead;
+        self.play_skew = 0;
+        self.play_loop = lp;
         self.transport = Transport::Playing {
             start: self.playhead,
         };
@@ -1815,7 +1833,8 @@ impl App {
                     self.stop();
                     return;
                 }
-                let (player, cons) = Player::start(&self.project, pos, self.project.audible());
+                let lp = self.active_loop();
+                let (player, cons) = Player::start(&self.project, pos, self.project.audible(), lp);
                 if !self.engine.start_playback(cons) {
                     self.notify(OUTPUT_STALLED, true);
                     self.stop();
@@ -1823,6 +1842,8 @@ impl App {
                 }
                 self.player = Some(player);
                 self.play_base = pos;
+                self.play_skew = 0;
+                self.play_loop = lp;
                 self.transport = Transport::Playing { start: pos };
             }
             Transport::Recording { .. } => {}
@@ -1847,12 +1868,53 @@ impl App {
         }
         let margin = self.project.sample_rate as u64 / 5;
         let at = self.engine.shared.out_frames.load(Ordering::Relaxed) + margin;
-        let (player, cons) = Player::start_ahead(&self.project, self.play_base + at, audible);
+        // Position qui aurait été entendue à cette trame, et boucle du nouveau rendu
+        // (jamais pendant une prise).
+        let pos = self.heard_at(at);
+        let lp = if matches!(self.transport, Transport::Playing { .. }) {
+            self.active_loop()
+        } else {
+            None
+        };
+        let (player, cons) = Player::start_ahead(&self.project, pos, audible, lp);
         if self.engine.switch_playback(cons, at)
             && let Some(old) = self.player.replace(player)
         {
             self.retired.push((old, self.now + 5.0));
+            self.play_base = pos;
+            self.play_skew = at;
+            self.play_loop = lp;
         }
+    }
+
+    /// Plage de la boucle, si la boucle est active et qu'une plage (assez longue) est
+    /// sélectionnée.
+    pub fn active_loop(&self) -> Option<(u64, u64)> {
+        if !self.loop_on {
+            return None;
+        }
+        let (a, b) = self.selection?;
+        let (a, b) = (a.min(b), a.max(b));
+        (b - a >= (self.project.sample_rate as u64 / 20).max(1)).then_some((a, b))
+    }
+
+    /// Position de la timeline entendue à la trame `frames` du moteur (boucle comprise).
+    fn heard_at(&self, frames: u64) -> u64 {
+        let x = self.play_base + frames.saturating_sub(self.play_skew);
+        match self.play_loop {
+            Some((a, b)) if x >= b && b > a => a + (x - b) % (b - a),
+            _ => x,
+        }
+    }
+
+    /// Bouton boucle / touche L.
+    pub fn toggle_loop(&mut self) {
+        self.loop_on = !self.loop_on;
+        if self.loop_on && self.active_loop().is_none() {
+            self.notify("Boucle : sélectionnez une plage", false);
+        }
+        // En lecture : nouveau rendu, avec ou sans boucle (voir `flush_mix`).
+        self.mix_dirty = true;
     }
 
     /// La session a des bandes à une autre fréquence que la carte : message, sinon `None`.
@@ -2020,10 +2082,12 @@ impl App {
         }
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
-                Player::start(&self.project, self.playhead, self.project.audible());
+                Player::start(&self.project, self.playhead, self.project.audible(), None);
             if self.engine.start_playback(cons) {
                 self.player = Some(player);
                 self.play_base = self.playhead;
+                self.play_skew = 0;
+                self.play_loop = None;
                 self.rec_overdub = true;
                 self.rec_latency = self.engine.round_trip_latency() as u64;
             } else {
@@ -3955,8 +4019,8 @@ impl App {
     fn update_playhead(&mut self) {
         let sh = &self.engine.shared;
         match self.transport {
-            Transport::Playing { start } => {
-                self.playhead = start + sh.out_frames.load(Ordering::Relaxed)
+            Transport::Playing { .. } => {
+                self.playhead = self.heard_at(sh.out_frames.load(Ordering::Relaxed))
             }
             Transport::Recording { start } => {
                 self.playhead = start + sh.rec_frames.load(Ordering::Relaxed)
@@ -5272,6 +5336,12 @@ impl App {
     /// Mix changé pendant la lecture : nouveau rendu (comme mute / solo), au plus toutes
     /// les 0,12 s pendant qu'on bouge un fader (le disque n'est pas relu à chaque image).
     fn flush_mix(&mut self) {
+        // Boucle activée, coupée ou plage changée pendant la lecture : nouveau rendu.
+        if matches!(self.transport, Transport::Playing { .. })
+            && self.active_loop() != self.play_loop
+        {
+            self.mix_dirty = true;
+        }
         if self.mix_dirty && self.now - self.mix_switch_at >= MIX_SWITCH_EVERY {
             self.mix_dirty = false;
             self.mix_switch_at = self.now;

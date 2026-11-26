@@ -273,6 +273,8 @@ pub enum Icon {
     ClearRange,
     /// Cadenas (mode spectacle : édition verrouillée).
     Lock,
+    /// Boucle (lecture en boucle sur la plage).
+    Loop,
 }
 
 /// Glyphe Phosphor (police d'icônes pro, licence MIT) de chaque icône, et sa graisse :
@@ -301,6 +303,7 @@ fn icon_glyph(icon: Icon) -> (&'static str, bool) {
         Icon::Scissors => ("\u{EAE0}", false),       // scissors
         Icon::Trash => ("\u{E4A6}", false),          // trash
         Icon::ClearRange => ("\u{E21E}", false),     // eraser
+        Icon::Loop => ("\u{E3F6}", false),           // repeat
         Icon::Lock => ("\u{E308}", true),            // lock-simple
     }
 }

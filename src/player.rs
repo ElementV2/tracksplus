@@ -131,25 +131,50 @@ struct Mixer {
     audible: Arc<Vec<AtomicBool>>,
     meters: Arc<TrackMeters>,
     pos: u64,
+    /// Boucle (début, fin) : arrivé à la fin, le rendu reprend au début, sans trou.
+    lp: Option<(u64, u64)>,
     tbuf: Vec<f32>,
     mix: Vec<f32>,
     errors: crossbeam_channel::Sender<String>,
 }
 
 impl Mixer {
-    /// Rend un bloc stéréo entrelacé dans le producteur.
+    /// Rend un bloc stéréo entrelacé dans le producteur (en plusieurs morceaux s'il
+    /// traverse la fin de la boucle : la suite repart du début, à l'échantillon près).
     fn fill(&mut self, prod: &mut Producer<f32>) -> bool {
         if prod.slots() < BLOCK * 2 {
             return false;
         }
         self.mix.fill(0.0);
+        let mut done = 0;
+        while done < BLOCK {
+            let mut n = BLOCK - done;
+            if let Some((a, b)) = self.lp {
+                if self.pos >= b {
+                    self.pos = a;
+                }
+                n = n.min((b - self.pos) as usize);
+            }
+            self.render_part(done, n);
+            self.pos += n as u64;
+            done += n;
+        }
+        if let Ok(chunk) = prod.write_chunk_uninit(BLOCK * 2) {
+            chunk.fill_from_iter(self.mix.iter().copied());
+        }
+        true
+    }
+
+    /// Ajoute au mix (à partir de la trame `off`) `n` trames rendues depuis `self.pos`.
+    fn render_part(&mut self, off: usize, n: usize) {
+        let mix = &mut self.mix[off * 2..(off + n) * 2];
         for (i, t, [gl, gr], fader) in &mut self.tracks {
             if !self.audible[*i].load(Ordering::Relaxed) {
-                self.meters.store_silent(*i, self.pos, BLOCK);
+                self.meters.store_silent(*i, self.pos, n);
                 continue;
             }
             let ch = t.channels();
-            let buf = &mut self.tbuf[..BLOCK * ch];
+            let buf = &mut self.tbuf[..n * ch];
             t.render(self.pos, buf);
             for e in t.take_errors() {
                 let _ = self.errors.send(e);
@@ -161,7 +186,7 @@ impl Mixer {
                     f[1] *= *gr;
                 }
                 self.meters.store(*i, self.pos, buf, ch);
-                for (m, s) in self.mix.iter_mut().zip(buf.iter()) {
+                for (m, s) in mix.iter_mut().zip(buf.iter()) {
                     *m += *s;
                 }
             } else {
@@ -175,33 +200,47 @@ impl Mixer {
                 } else {
                     (0.0, 0.0)
                 };
-                for (m, s) in self.mix.as_chunks_mut::<2>().0.iter_mut().zip(buf.iter()) {
+                for (m, s) in mix.as_chunks_mut::<2>().0.iter_mut().zip(buf.iter()) {
                     m[0] += *s * pl;
                     m[1] += *s * pr;
                 }
             }
         }
-        if let Ok(chunk) = prod.write_chunk_uninit(BLOCK * 2) {
-            chunk.fill_from_iter(self.mix.iter().copied());
-        }
-        self.pos += BLOCK as u64;
-        true
     }
 }
 
 impl Player {
-    /// Prépare la lecture à partir de `pos`. Le consommateur est à donner au moteur.
-    pub fn start(project: &Project, pos: u64, audible: Vec<bool>) -> (Self, Consumer<f32>) {
-        Self::spawn(project, pos, audible, true)
+    /// Prépare la lecture à partir de `pos` (en boucle sur `lp` si donnée). Le consommateur
+    /// est à donner au moteur.
+    pub fn start(
+        project: &Project,
+        pos: u64,
+        audible: Vec<bool>,
+        lp: Option<(u64, u64)>,
+    ) -> (Self, Consumer<f32>) {
+        Self::spawn(project, pos, audible, lp, true)
     }
 
-    /// Nouveau rendu en avance sur la lecture en cours (mute / solo) : pas d'attente, le
-    /// moteur ne bascule que lorsqu'il a assez d'avance.
-    pub fn start_ahead(project: &Project, pos: u64, audible: Vec<bool>) -> (Self, Consumer<f32>) {
-        Self::spawn(project, pos, audible, false)
+    /// Nouveau rendu en avance sur la lecture en cours (mute / solo, mix, boucle) : pas
+    /// d'attente, le moteur ne bascule que lorsqu'il a assez d'avance.
+    pub fn start_ahead(
+        project: &Project,
+        pos: u64,
+        audible: Vec<bool>,
+        lp: Option<(u64, u64)>,
+    ) -> (Self, Consumer<f32>) {
+        Self::spawn(project, pos, audible, lp, false)
     }
 
-    fn spawn(project: &Project, pos: u64, audible: Vec<bool>, wait: bool) -> (Self, Consumer<f32>) {
+    fn spawn(
+        project: &Project,
+        pos: u64,
+        audible: Vec<bool>,
+        lp: Option<(u64, u64)>,
+        wait: bool,
+    ) -> (Self, Consumer<f32>) {
+        // Boucle vide ou inversée : pas de boucle.
+        let lp = lp.filter(|(a, b)| b > a);
         let sr = project.sample_rate as usize;
         let cap = (sr * RING_SECS).max(BLOCK * 4) * 2;
         let audible: Arc<Vec<AtomicBool>> =
@@ -215,7 +254,9 @@ impl Player {
             })
             .filter(|(_, t, _, _)| !t.is_empty())
             .collect();
-        let meters = Arc::new(TrackMeters::new(pos, project.tracks.len()));
+        // Mesures repérées depuis la position la plus en amont jouée (début de boucle).
+        let first = lp.map_or(pos, |(a, _)| a.min(pos));
+        let meters = Arc::new(TrackMeters::new(first, project.tracks.len()));
         let (err_tx, errors) = crossbeam_channel::unbounded();
         let mut mixer = Mixer {
             errors: err_tx,
@@ -223,6 +264,7 @@ impl Player {
             audible: audible.clone(),
             meters: meters.clone(),
             pos,
+            lp,
             tbuf: vec![0.0; BLOCK * 2],
             mix: vec![0.0; BLOCK * 2],
         };
@@ -305,5 +347,32 @@ mod tests {
         );
         // Piste inconnue : rien, sans panique.
         assert_eq!(m.peak(7, 1000, 2000), None);
+    }
+
+    /// Boucle : arrivé à la fin de la plage, le rendu reprend au début, à l'échantillon
+    /// près, même au milieu d'un bloc et pour une boucle plus courte qu'un bloc.
+    #[test]
+    fn loop_wraps_at_the_exact_sample() {
+        let meters = Arc::new(TrackMeters::new(0, 0));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut m = Mixer {
+            tracks: Vec::new(),
+            audible: Arc::new(Vec::new()),
+            meters,
+            pos: 900,
+            lp: Some((100, 1000)),
+            tbuf: vec![0.0; BLOCK * 2],
+            mix: vec![0.0; BLOCK * 2],
+            errors: tx,
+        };
+        let (mut prod, _cons) = RingBuffer::new(BLOCK * 8);
+        assert!(m.fill(&mut prod));
+        // 100 trames jusqu'à la fin, puis la suite depuis 100, sur 900 trames par tour.
+        let after = (BLOCK - 100) % 900;
+        assert_eq!(m.pos, 100 + after as u64);
+        m.lp = Some((0, 10));
+        m.pos = 5;
+        assert!(m.fill(&mut prod));
+        assert_eq!(m.pos, ((5 + BLOCK) % 10) as u64);
     }
 }

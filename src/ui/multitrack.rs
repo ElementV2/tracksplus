@@ -337,6 +337,9 @@ impl App {
         if mark_out {
             self.set_range_point(self.playhead, false);
         }
+        if ctx.input_mut(|i| i.consume_key(none, Key::L)) {
+            self.toggle_loop();
+        }
         let (space, rec, home, end, marker, fit, esc, all, left, right, split, del) = ctx
             .input_mut(|i| {
                 (
@@ -508,6 +511,12 @@ impl App {
                 self.selection = None;
                 self.ruler_anchor = None;
             }
+            if w::tool_icon(ui, Icon::Loop, self.loop_on, true)
+                .on_hover_text("Boucle sur la plage (L)")
+                .clicked()
+            {
+                self.toggle_loop();
+            }
             w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Scissors, false, !recording)
                 .on_hover_text("Couper (S)")
@@ -672,6 +681,14 @@ impl App {
                     0.0,
                     t::ACCENT.gamma_multiply(0.28),
                 );
+                // Boucle active : barre pleine en haut de la règle.
+                if self.loop_on {
+                    p.rect_filled(
+                        Rect::from_min_max(pos2(xa, rect.top()), pos2(xb, rect.top() + 4.0)),
+                        0.0,
+                        t::ACCENT,
+                    );
+                }
             }
         }
         // Point d'entrée ou de sortie posé seul (Ctrl / Alt + clic), en attente de l'autre.
