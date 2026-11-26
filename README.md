@@ -15,10 +15,10 @@ Fonctionne avec Dante Virtual Soundcard (64 entrées et plus), ASIO, WASAPI et C
 - Au premier lancement, Windows SmartScreen peut afficher « Windows a protégé votre
   ordinateur » → « Informations complémentaires » → « Exécuter quand même ».
 - Quand une nouvelle version est publiée, une pastille **« Version x.y.z »** apparaît en haut
-  à droite (et un point orange sur le menu ☰). Elle affiche les nouveautés et le bouton
+  à droite (et un point orange sur le menu ···). Elle affiche les nouveautés et le bouton
   **« Installer et redémarrer »** : TracksPlus se met à jour et se relance, réglages et
   sessions conservés. Indisponible pendant une prise.
-- « Ignorer cette version » ne la propose plus. Menu ☰ → « Rechercher des mises à jour »
+- « Ignorer cette version » ne la propose plus. Menu ··· → « Rechercher des mises à jour »
   pour vérifier à la main ; la recherche au lancement est désactivable. La version portable
   ouvre la page de téléchargement.
 - Fenêtre de 940 × 600 minimum (tient dans une moitié d’écran ancrée par Windows).
@@ -47,7 +47,7 @@ ou archiver d'un bloc :
 - Chaque session a son propre soundboard. Un son ajouté à un pad est copié dans `Sons\`.
 - Carte son, sorties, contrôleur MIDI, LED, disposition du soundboard et mises à jour sont
   communs à toutes les sessions.
-- Menu ☰ : Nouvelle session…, **Ouvrir une session…** (explorateur intégré, les dossiers de
+- Menu ··· : Nouvelle session…, **Ouvrir une session…** (explorateur intégré, les dossiers de
   session y apparaissent comme des sessions), Enregistrer (Ctrl+S), Enregistrer sous… (copie
   aussi le soundboard et ses sons, sans écraser une session existante), Afficher le dossier,
   Exporter… (Ctrl+E), format d'enregistrement, **Importer un soundboard…** (reprend les pads
@@ -62,7 +62,7 @@ ou archiver d'un bloc :
 - La flèche à gauche du nom déplie la piste : type, entrée (grille, entrées déjà utilisées
   signalées), couleur. Armement, **monitoring direct** (sortie « Monitoring multipiste »),
   **M**ute / **S**olo, renommage par double-clic.
-- Enregistrement en WAV 24 bits ou 32 bits flottant (menu ☰), sauvegarde à chaque stop,
+- Enregistrement en WAV 24 bits ou 32 bits flottant (menu ···), sauvegarde à chaque stop,
   temps restant sur le disque, écoute des pistes existantes pendant la prise.
 - **Vumètres** crête IEC 60268-18 : vert / jaune (−12 dB) / rouge (−3 dB), maintien, crête max
   en dB, voyant de saturation (clic pour remettre à zéro). Un par piste, un master stéréo, et
@@ -71,6 +71,8 @@ ou archiver d'un bloc :
   master. Double-clic : 0 dB ou centre ; Maj : réglage fin. Piste mono au centre à −3 dB
   de chaque côté, comme sur une console. Les prises ne sont jamais modifiées : les faders
   règlent l'écoute et le mix exporté (les fichiers de piste exportés restent bruts).
+
+![Bandeau de mixage](docs/mixage.png)
 
 ### Pistes audio (musique, sons)
 
@@ -115,6 +117,8 @@ ou archiver d'un bloc :
   renommer, supprimer, sélectionner jusqu'au suivant. ← / → et **1 à 9** pour y sauter.
 
 ## Export
+
+![Export](docs/export.png)
 
 Chaque option a une bulle d'aide avec un exemple.
 
@@ -208,7 +212,9 @@ Chaque option a une bulle d'aide avec un exemple.
 
 ## Réglages
 
-Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droite.
+Menu ··· → « Réglages… », ou la pastille de la carte son en haut à droite.
+
+![Réglages de la carte son](docs/reglages.png)
 
 - **Carte son** : pilote (ASIO / WASAPI, CoreAudio, ALSA / JACK), entrée, fréquence, buffer,
   et les sorties, dans l'ordre **Main multipiste**, **Monitoring multipiste**, **Soundboard** :
@@ -250,7 +256,7 @@ Menu ☰ → « Réglages… », ou la pastille de la carte son en haut à droit
    Virtual Soundcard**, à la même fréquence que le réseau Dante. La DVS doit être démarrée
    en mode **ASIO** (en mode WDM, ses canaux sont dans Windows : choisissez alors le pilote
    WASAPI). Tous les pilotes ASIO installés sont listés, même quand un autre est en service ;
-   « Actualiser la liste » relit les cartes après un changement de mode de la DVS.
+   « Actualiser » relit les cartes après un changement de mode de la DVS.
 2. Multipiste : bouton **+** pour chaque entrée (mono ou stéréo), renommez, armez, ⏺.
 3. Réglages → Carte son : sortie Soundboard sur la paire Dante dédiée aux pads.
 

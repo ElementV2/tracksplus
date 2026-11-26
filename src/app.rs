@@ -6180,15 +6180,10 @@ impl App {
                         if let Some(c) = pick {
                             dlg.select_card(c);
                         }
-                        // Carte branchée, Dante Virtual Soundcard passée en ASIO… après
-                        // l'ouverture des réglages. ASIO : tous les pilotes sont interrogés
-                        // (celui en service est fermé un instant).
+                        // Carte branchée, Dante Virtual Soundcard passée en ASIO, buffer changé
+                        // dans le panneau du pilote… : la carte est rouverte et la liste relue.
                         if ui.small_button("Actualiser").clicked() {
-                            if asio {
-                                dlg.probe = true;
-                            } else {
-                                dlg.refresh();
-                            }
+                            recheck = true;
                         }
                     });
                     ui.end_row();
@@ -6356,11 +6351,11 @@ impl App {
                     ui.end_row();
                     if wasapi && (fixed.is_some() || sizes.is_empty()) {
                         hints.push(
-                            "Buffer : en WASAPI, Windows le fixe lui-même. Pour une latence plus faible et réglable, passez en ASIO.",
+                            "Buffer fixé par Windows. ASIO pour le régler.",
                         );
                     } else if asio && fixed.is_some() {
                         hints.push(
-                            "Buffer : ce pilote n'accepte que la taille réglée dans son propre panneau. Changez-la là-bas, puis cliquez sur « Actualiser ».",
+                            "Buffer fixé dans le panneau du pilote, puis « Actualiser ».",
                         );
                     }
                     ui.end_row();
@@ -6418,20 +6413,25 @@ impl App {
                     ui.label(egui::RichText::new(e).font(t::medium(12.5)).color(t::REC));
                 }
                 ui.add_space((top + SETTINGS_H - 26.0 - ui.cursor().top()).max(14.0));
-                ui.horizontal(|ui| {
-                    if w::secondary_button(ui, "Actualiser").clicked() {
-                        dlg.refresh();
-                        recheck = true;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if w::primary_button(ui, None, "Appliquer", true).clicked() {
+                        apply = true;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if w::primary_button(ui, None, "Appliquer", true).clicked() {
-                            apply = true;
-                        }
-                    });
                 });
             });
         if recheck {
+            // Rouvre la carte (relit buffer et fréquence du pilote), puis relit la liste ;
+            // en ASIO, tous les pilotes sont interrogés (celui en service fermé un instant).
+            let before = self.prefs.clone();
             self.reload_audio();
+            if dlg.prefs == before {
+                dlg.prefs = self.prefs.clone();
+            }
+            if dlg.prefs.host.as_deref() == Some("ASIO") {
+                dlg.probe = true;
+            } else {
+                dlg.refresh();
+            }
         }
         if std::mem::take(&mut dlg.probe) {
             self.probe_asio(&mut dlg);
@@ -6957,7 +6957,7 @@ impl App {
                             ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} / {} cochée(s)",
+                                    "{} / {}",
                                     d.tracks.len(),
                                     with_audio.len()
                                 ))
