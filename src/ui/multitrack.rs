@@ -2477,6 +2477,13 @@ impl App {
                 self.selected_tracks.remove(id);
                 self.expanded_tracks.remove(id);
             }
+            // Couleur selon la position : figée avant la suppression, sinon les pistes
+            // suivantes changeraient de couleur en remontant.
+            for (i, t) in self.project.tracks.iter_mut().enumerate() {
+                if t.color.is_none() {
+                    t.color = Some(((i + 6) % t::PALETTE.len()) as u8);
+                }
+            }
             self.project.tracks.retain(|t| !ids.contains(&t.id));
             self.edited();
         }

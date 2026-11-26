@@ -55,6 +55,8 @@ pub const PALETTE: [Color32; 12] = [
     Color32::from_rgb(0x8a, 0x93, 0x9b),
 ];
 
+/// Couleur d'une piste selon sa position (voir aussi la suppression de pistes, qui fige
+/// cette couleur : même calcul).
 pub fn color(i: usize) -> Color32 {
     PALETTE[(i + 6) % PALETTE.len()]
 }
