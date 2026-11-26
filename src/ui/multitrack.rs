@@ -567,12 +567,20 @@ impl App {
         }
     }
 
+    /// Défilement affiché, calé au pixel entier : les formes d'onde sont dessinées en
+    /// colonnes de pixels ; avec un décalage fractionnaire, elles sautaient d'un pixel par
+    /// rapport à leur clip pendant le suivi de lecture (effet de tremblement). Calée ainsi,
+    /// toute la timeline avance d'un même nombre de pixels à chaque image.
+    fn draw_scroll(&self) -> f64 {
+        (self.view.scroll / self.view.spp).round() * self.view.spp
+    }
+
     fn x_of(&self, left: f32, sample: u64) -> f32 {
-        left + ((sample as f64 - self.view.scroll) / self.view.spp) as f32
+        left + ((sample as f64 - self.draw_scroll()) / self.view.spp) as f32
     }
 
     fn sample_at(&self, left: f32, x: f32) -> u64 {
-        (self.view.scroll + (x - left) as f64 * self.view.spp).max(0.0) as u64
+        (self.draw_scroll() + (x - left) as f64 * self.view.spp).max(0.0) as u64
     }
 
     fn follow_playhead(&mut self) {
