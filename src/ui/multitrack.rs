@@ -511,12 +511,6 @@ impl App {
                 self.selection = None;
                 self.ruler_anchor = None;
             }
-            if w::tool_icon(ui, Icon::Loop, self.loop_on, true)
-                .on_hover_text("Boucle sur la plage (L)")
-                .clicked()
-            {
-                self.toggle_loop();
-            }
             w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Scissors, false, !recording)
                 .on_hover_text("Couper (S)")

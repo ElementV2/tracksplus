@@ -93,12 +93,12 @@ ou archiver d'un bloc :
   défiler (sur la tête de lecture : la déplacer).
 - **Plage In/Out** : Ctrl + clic sur la règle = entrée, Alt + clic = sortie, ou **I** / **O**
   à la tête de lecture. Échap (ou la gomme de la barre d'outils) l'efface.
-- **Boucle** (bouton boucle ou **L**) : la lecture tourne en boucle sur la plage, sans trou
+- **Boucle** (bouton boucle du transport, ou **L**) : la lecture tourne en boucle sur la plage, sans trou
   au retour au début ; la plage s'affiche avec une barre orange sur la règle.
 - Glisser sur les pistes : rectangle de sélection (Ctrl / Maj pour ajouter). Double-clic sur
   une prise : sélectionner sa durée.
 - **Barre d'outils** (bulle d'aide avec le raccourci) : suivre la lecture, magnétisme ·
-  repère, entrée `[`, sortie `]`, effacer la plage, boucle · couper, supprimer · annuler,
+  repère, entrée `[`, sortie `]`, effacer la plage · couper, supprimer · annuler,
   rétablir · mixage et vumètres ; à droite, exporter.
 
 ### Montage et repères

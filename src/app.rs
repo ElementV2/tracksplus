@@ -5758,6 +5758,15 @@ impl App {
                 self.record();
             }
         }
+        // Boucle sur la plage sélectionnée.
+        let loop_style = if self.loop_on {
+            BtnStyle::Active(t::ACCENT)
+        } else {
+            BtnStyle::Ghost
+        };
+        if w::icon_button(ui, Icon::Loop, 30.0, loop_style, true, "Boucle (L)").clicked() {
+            self.toggle_loop();
+        }
         ui.add_space(10.0);
         let (rect, _) = ui.allocate_exact_size(vec2(168.0, 30.0), egui::Sense::hover());
         let p = ui.painter();
