@@ -198,6 +198,27 @@ pub struct ClipDrag {
     pub changed: bool,
 }
 
+/// Décalage qui aimante l'une des positions `edges` : priorité à l'objet le plus proche à
+/// moins de `tol` (repères, bords d'autres prises, tête, sélection), pour n'importe quel
+/// bord ; sinon la PREMIÈRE position (début de la prise) se cale sur la grille `grid`.
+/// Toujours le même bord sur la grille : des pas réguliers (sinon début et fin se
+/// relaient selon le plus proche, et les pas alternent entre petits et grands).
+fn snap_offset(edges: &[i64], points: &[u64], tol: i64, grid: i64) -> i64 {
+    let mut best: Option<i64> = None;
+    for &e in edges {
+        for &p in points {
+            let d = p as i64 - e;
+            if d.abs() <= tol && best.is_none_or(|b| d.abs() < b.abs()) {
+                best = Some(d);
+            }
+        }
+    }
+    best.unwrap_or_else(|| match edges.first() {
+        Some(&e) if grid > 0 => (e as f64 / grid as f64).round() as i64 * grid - e,
+        _ => 0,
+    })
+}
+
 /// Largeur du panneau de vumètre master (multipiste et soundboard).
 pub const MASTER_W: f32 = 100.0;
 
@@ -1017,30 +1038,11 @@ impl App {
             .max(1.0) as u64
     }
 
-    /// Décalage à appliquer pour aimanter l'une des positions `edges` (déjà décalées).
-    /// Priorité aux objets proches (repères, bords de prises, tête, sélection) ; sinon
-    /// la position se cale sur le cran de grille le plus proche.
+    /// Décalage à appliquer pour aimanter les positions `edges` (déjà décalées), voir
+    /// `snap_offset`.
     fn snap_delta(&self, edges: &[i64], points: &[u64]) -> i64 {
         let tol = (SNAP_PX as f64 * self.view.spp) as i64;
-        let mut best: Option<i64> = None;
-        for &e in edges {
-            for &p in points {
-                let d = p as i64 - e;
-                if d.abs() <= tol && best.is_none_or(|b| d.abs() < b.abs()) {
-                    best = Some(d);
-                }
-            }
-        }
-        if best.is_none() {
-            let g = self.grid_step() as i64;
-            for &e in edges {
-                let d = (e as f64 / g as f64).round() as i64 * g - e;
-                if best.is_none_or(|b| d.abs() < b.abs()) {
-                    best = Some(d);
-                }
-            }
-        }
-        best.unwrap_or(0)
+        snap_offset(edges, points, tol, self.grid_step() as i64)
     }
 
     /// Position aimantée (magnétisme actif et Maj relâchée). `moving_playhead` : la tête
@@ -3346,6 +3348,23 @@ fn fmt_ruler(tt: f64, step: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::fmt_ruler;
+
+    /// Prise de 1 300 glissée sur une grille de 1 000 : son début se cale toujours sur la
+    /// grille (pas réguliers), jamais sa fin ; un objet proche reste prioritaire.
+    #[test]
+    fn grid_snap_steps_are_even() {
+        use super::snap_offset;
+        let len = 1300;
+        let starts: Vec<i64> = (0..40)
+            .map(|k| {
+                let s = 2000 + k * 97;
+                s + snap_offset(&[s, s + len], &[], 50, 1000)
+            })
+            .collect();
+        assert!(starts.iter().all(|s| s % 1000 == 0), "{starts:?}");
+        // Fin de la prise près du début d'une autre (5 000) : collée à elle.
+        assert_eq!(snap_offset(&[3680, 3680 + len], &[5000], 50, 1000), 20);
+    }
 
     /// En lecture, une piste armée qui a des prises montre ce qu'on entend, pas son entrée.
     #[test]
