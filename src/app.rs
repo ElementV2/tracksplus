@@ -1605,9 +1605,11 @@ impl App {
             app.notify(launch_warnings.join(" · "), true);
         }
         if let Some(e) = err {
-            let mut d = SettingsDialog::new(&app.prefs, app.asio_in_use());
-            d.error = Some(e);
-            app.settings_dlg = Some(d);
+            // Comme les logiciels pro : jamais de fenêtre ouverte d'office au lancement. Un
+            // court message, le détail dans le journal ; la carte est réessayée seule
+            // (`schedule_reconnect`) et la pastille du haut ouvre les réglages.
+            crate::log_error("launch-audio", &format!("Carte son au lancement : {e}"));
+            app.notify_level("Carte son indisponible · nouvel essai…", Level::Device);
         }
         app
     }
