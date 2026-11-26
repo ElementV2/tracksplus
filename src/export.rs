@@ -415,6 +415,11 @@ struct Unit {
     part: PathBuf,
     /// Pistes mixées dans ce fichier (indices dans la liste des pistes exportées).
     tracks: Vec<usize>,
+    /// Gains (gauche, droite) de chaque piste de `tracks` : faders et panoramiques pour le
+    /// mix, 1 pour un fichier de piste (brut, comme la prise).
+    gains: Vec<[f32; 2]>,
+    /// Fader master (mix seulement).
+    master: f32,
     channels: usize,
     meta: FileMeta,
 }
@@ -571,7 +576,12 @@ pub fn run_export(
         title,
         time_reference,
     };
-    let unit = |name: String, file: String, tracks: Vec<usize>, channels: usize| {
+    let unit = |name: String,
+                file: String,
+                tracks: Vec<usize>,
+                gains: Vec<[f32; 2]>,
+                master: f32,
+                channels: usize| {
         let path = dir.join(format!("{file}.{ext}"));
         let part = dir.join(format!("{file}.{ext}.part"));
         Unit {
@@ -580,6 +590,8 @@ pub fn run_export(
             path,
             part,
             tracks,
+            gains,
+            master,
             channels,
         }
     };
@@ -592,15 +604,33 @@ pub fn run_export(
                 t.name.clone(),
                 format!("{:02} - {}", i + 1, file_stem(&t.name)),
                 vec![k],
+                vec![[1.0, 1.0]],
+                1.0,
                 t.channels(),
             ));
         }
     }
     if s.mix {
+        // Le mix exporté est celui qu'on entend : faders, panoramiques et master.
+        let gains = with_audio
+            .iter()
+            .map(|&i| {
+                let t = &project.tracks[i];
+                if s.mix_mono && !t.stereo {
+                    // Mix mono : le panoramique d'une piste mono ne compte pas.
+                    let g = crate::project::db_to_gain(t.gain_db);
+                    [g, g]
+                } else {
+                    t.mix_gains()
+                }
+            })
+            .collect();
         units.push(unit(
             "Mix".into(),
             format!("{} - Mix", file_stem(&project.name)),
             (0..with_audio.len()).collect(),
+            gains,
+            project.master_gain(),
             if s.mix_mono { 1 } else { 2 },
         ));
     }
@@ -1014,10 +1044,11 @@ fn render_all(
         }
         for (k, (u, c)) in units.iter().zip(&mut chains).enumerate() {
             c.begin(n);
-            for &t in &u.tracks {
+            for (j, &t) in u.tracks.iter().enumerate() {
                 let rc = renderers[t].channels();
-                c.add(&bufs[t][..n * rc], rc);
+                c.add(&bufs[t][..n * rc], rc, u.gains[j]);
             }
+            c.scale(u.master);
             c.process(&mut |b| sink(k, b))?;
         }
         pos += n as u64;
@@ -1084,28 +1115,48 @@ impl Chain {
         }
     }
 
-    /// Ajoute une piste rendue (entrelacée sur `rc` canaux) au bloc.
-    fn add(&mut self, buf: &[f32], rc: usize) {
+    /// Ajoute une piste rendue (entrelacée sur `rc` canaux) au bloc, avec ses gains
+    /// (gauche, droite).
+    fn add(&mut self, buf: &[f32], rc: usize, g: [f32; 2]) {
         match (rc, self.channels) {
-            // Mono : même signal sur chaque canal de sortie (au centre).
+            // Mono vers mono : le signal, au gain de la piste.
+            (1, 1) => {
+                for (d, s) in self.input[0].iter_mut().zip(buf) {
+                    *d += *s * g[0];
+                }
+            }
+            // Mono vers stéréo : placé par ses gains gauche / droite.
             (1, _) => {
-                for ch in &mut self.input {
+                for (j, ch) in self.input.iter_mut().enumerate() {
+                    let gj = g[j.min(1)];
                     for (d, s) in ch.iter_mut().zip(buf) {
-                        *d += *s;
+                        *d += *s * gj;
                     }
                 }
             }
             // Stéréo vers mono : moyenne des deux canaux.
             (_, 1) => {
                 for (d, s) in self.input[0].iter_mut().zip(buf.as_chunks::<2>().0) {
-                    *d += 0.5 * (s[0] + s[1]);
+                    *d += 0.5 * (s[0] * g[0] + s[1] * g[1]);
                 }
             }
             _ => {
                 for (j, ch) in self.input.iter_mut().enumerate() {
+                    let gj = g[j.min(1)];
                     for (d, s) in ch.iter_mut().zip(buf.as_chunks::<2>().0) {
-                        *d += s[j.min(1)];
+                        *d += s[j.min(1)] * gj;
                     }
+                }
+            }
+        }
+    }
+
+    /// Fader master du fichier.
+    fn scale(&mut self, g: f32) {
+        if g != 1.0 {
+            for ch in &mut self.input {
+                for d in ch.iter_mut() {
+                    *d *= g;
                 }
             }
         }
@@ -1416,9 +1467,11 @@ mod tests {
         let (rate, ch, v) = decode(&files[1]);
         assert_eq!((rate, ch), (96000, 2));
         assert_eq!(v.len() as u64, 2 * expected_frames(10100, 48000, 96000));
-        // Amplitude conservée (léger dépassement du filtre à l'attaque brusque du sinus).
+        // Amplitude conservée (léger dépassement du filtre à l'attaque brusque du sinus),
+        // piste mono au centre à −3 dB dans le mix stéréo.
         let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-        assert!((peak - 0.5).abs() < 0.05, "peak = {peak}");
+        let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((peak - want).abs() < 0.05, "peak = {peak}");
         std::fs::remove_dir_all(&p.dir).ok();
     }
 
@@ -1496,7 +1549,9 @@ mod tests {
                 let frames = v.len() / ch;
                 assert!((47000..52000).contains(&frames), "{format:?} : {frames}");
                 let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-                assert!((0.4..0.65).contains(&peak), "{format:?} : peak = {peak}");
+                // Mix stéréo : piste mono au centre à −3 dB ; mix mono : à son niveau.
+                let range = if mix_mono { 0.4..0.65 } else { 0.28..0.46 };
+                assert!(range.contains(&peak), "{format:?} : peak = {peak}");
             }
         }
         // Famille 44,1 kHz : 88,2 kHz demandés → 44,1 kHz.
@@ -1755,8 +1810,30 @@ mod range_tests {
         assert_eq!(v[0], 0.1);
         let (ch, v) = read(&files[2]);
         assert_eq!(ch, 2);
+        // Piste mono au centre : −3 dB de chaque côté (loi de panoramique d'une console).
+        let c = 0.1 * std::f32::consts::FRAC_1_SQRT_2;
         assert!(
-            (v[0] - 0.5).abs() < 1e-6 && (v[1] + 0.3).abs() < 1e-6,
+            (v[0] - (0.4 + c)).abs() < 1e-6 && (v[1] - (-0.4 + c)).abs() < 1e-6,
+            "{:?}",
+            &v[..2]
+        );
+        // Faders : synthé à −6 dB, voix tout à gauche, master à −6 dB. Le mix exporté
+        // est celui qu'on entend ; les fichiers de piste restent bruts.
+        let half = -20.0 * 2f32.log10();
+        p.track_mut(st).unwrap().gain_db = half;
+        p.track_mut(mo).unwrap().pan = -1.0;
+        p.master_db = half;
+        let s = ExportSettings {
+            dir: dir.join("Export2"),
+            ..s
+        };
+        let files = run(&p, &s, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        let (_, v) = read(&files[0]);
+        assert_eq!(&v[..2], &[0.4, -0.4], "fichier de piste brut");
+        let (_, v) = read(&files[2]);
+        let (l, r) = ((0.4 * 0.5 + 0.1) * 0.5, (-0.4 * 0.5) * 0.5);
+        assert!(
+            (v[0] - l).abs() < 1e-5 && (v[1] - r).abs() < 1e-5,
             "{:?}",
             &v[..2]
         );
@@ -2151,7 +2228,11 @@ mod safety_tests {
             .samples::<f32>()
             .map(|x| x.unwrap().abs())
             .fold(0f32, f32::max);
-        assert!((max - 1.5).abs() < 1e-3, "{max}");
+        // (Pistes mono au centre : −3 dB chacune dans le mix stéréo.)
+        assert!(
+            (max - 1.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3,
+            "{max}"
+        );
         // Avec la normalisation : plus de saturation, plus d'avertissement.
         let s = ExportSettings {
             normalize: Normalize::Peak(-1.0),
@@ -2196,7 +2277,13 @@ mod safety_tests {
         };
         assert_eq!(first(&files[0]), (1, 0.25, 48000));
         assert_eq!(first(&files[1]), (1, 0.25, 48000));
-        assert_eq!(first(&files[2]), (2, 0.5, 48000));
+        let (ch, v, len) = first(&files[2]);
+        // Deux pistes mono au centre : −3 dB chacune.
+        assert_eq!((ch, len), (2, 48000));
+        assert!(
+            (v - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+            "{v}"
+        );
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 }

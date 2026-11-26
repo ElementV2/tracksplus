@@ -126,7 +126,8 @@ pub struct Player {
 }
 
 struct Mixer {
-    tracks: Vec<(usize, TrackRenderer)>,
+    /// Piste, son rendu, gains (gauche, droite) dans le mix et gain de son fader seul.
+    tracks: Vec<(usize, TrackRenderer, [f32; 2], f32)>,
     audible: Arc<Vec<AtomicBool>>,
     meters: Arc<TrackMeters>,
     pos: u64,
@@ -142,7 +143,7 @@ impl Mixer {
             return false;
         }
         self.mix.fill(0.0);
-        for (i, t) in &mut self.tracks {
+        for (i, t, [gl, gr], fader) in &mut self.tracks {
             if !self.audible[*i].load(Ordering::Relaxed) {
                 self.meters.store_silent(*i, self.pos, BLOCK);
                 continue;
@@ -153,16 +154,30 @@ impl Mixer {
             for e in t.take_errors() {
                 let _ = self.errors.send(e);
             }
-            self.meters.store(*i, self.pos, buf, ch);
             if ch == 2 {
+                // Vumètre après le fader : ce qui part vraiment dans le master.
+                for f in buf.as_chunks_mut::<2>().0 {
+                    f[0] *= *gl;
+                    f[1] *= *gr;
+                }
+                self.meters.store(*i, self.pos, buf, ch);
                 for (m, s) in self.mix.iter_mut().zip(buf.iter()) {
                     *m += *s;
                 }
             } else {
-                // Piste mono : au centre (même niveau à gauche et à droite).
+                for x in buf.iter_mut() {
+                    *x *= *fader;
+                }
+                self.meters.store(*i, self.pos, buf, ch);
+                // Piste mono : placée par son panoramique (−3 dB de chaque côté au centre).
+                let (pl, pr) = if *fader > 0.0 {
+                    (*gl / *fader, *gr / *fader)
+                } else {
+                    (0.0, 0.0)
+                };
                 for (m, s) in self.mix.as_chunks_mut::<2>().0.iter_mut().zip(buf.iter()) {
-                    m[0] += *s;
-                    m[1] += *s;
+                    m[0] += *s * pl;
+                    m[1] += *s * pr;
                 }
             }
         }
@@ -193,8 +208,12 @@ impl Player {
             Arc::new(audible.into_iter().map(AtomicBool::new).collect());
         let (mut prod, cons) = RingBuffer::new(cap);
         let tracks: Vec<_> = (0..project.tracks.len())
-            .map(|i| (i, TrackRenderer::new(project, i)))
-            .filter(|(_, t)| !t.is_empty())
+            .map(|i| {
+                let tr = &project.tracks[i];
+                let fader = crate::project::db_to_gain(tr.gain_db);
+                (i, TrackRenderer::new(project, i), tr.mix_gains(), fader)
+            })
+            .filter(|(_, t, _, _)| !t.is_empty())
             .collect();
         let meters = Arc::new(TrackMeters::new(pos, project.tracks.len()));
         let (err_tx, errors) = crossbeam_channel::unbounded();

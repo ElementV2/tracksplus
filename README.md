@@ -66,8 +66,11 @@ ou archiver d'un bloc :
   temps restant sur le disque, écoute des pistes existantes pendant la prise.
 - **Vumètres** crête IEC 60268-18 : vert / jaune (−12 dB) / rouge (−3 dB), maintien, crête max
   en dB, voyant de saturation (clic pour remettre à zéro). Un par piste, un master stéréo, et
-  un bandeau de toutes les pistes (entrée pour les pistes d'enregistrement, lecture pour les
-  pistes audio).
+  un bandeau de toutes les pistes (entrée pour les pistes armées, lecture pour les autres).
+- **Mixage** (bandeau des vumètres) : un fader et un panoramique par piste, et un fader
+  master. Double-clic : 0 dB ou centre ; Maj : réglage fin. Piste mono au centre à −3 dB
+  de chaque côté, comme sur une console. Les prises ne sont jamais modifiées : les faders
+  règlent l'écoute et le mix exporté (les fichiers de piste exportés restent bruts).
 
 ### Pistes audio (musique, sons)
 

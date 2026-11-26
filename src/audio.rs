@@ -530,6 +530,9 @@ pub struct Shared {
     pub master_play: [AtomicU32; 2],
     /// Crêtes L/R du soundboard (bits f32).
     pub master_pad: [AtomicU32; 2],
+    /// Fader master de la lecture multipiste (gain linéaire, bits f32) : appliqué dans le
+    /// callback de sortie, donc entendu aussitôt (sans attendre le rendu en avance).
+    pub master_gain: AtomicU32,
     /// Crêtes L/R du monitoring direct des entrées (bits f32).
     pub master_mon: [AtomicU32; 2],
     /// Monitoring direct, par canal d'entrée : 0 = non écouté, 1 = au centre (piste mono),
@@ -588,6 +591,7 @@ impl Shared {
             stream_error: std::sync::atomic::AtomicU8::new(0),
             device_lost: std::sync::atomic::AtomicU8::new(0),
             master_play: [AtomicU32::new(0), AtomicU32::new(0)],
+            master_gain: AtomicU32::new(1f32.to_bits()),
             master_pad: [AtomicU32::new(0), AtomicU32::new(0)],
             master_mon: [AtomicU32::new(0), AtomicU32::new(0)],
             monitor: (0..MAX_INPUTS)
@@ -2634,6 +2638,8 @@ struct OutState {
     mon: Vec<f32>,
     /// Lecture interrompue par un trou : fondu d'entrée à la reprise.
     play_fade_in: bool,
+    /// Gain master appliqué au bloc précédent (rampe vers la nouvelle valeur : pas de clic).
+    master_cur: f32,
     /// Flux d'écoute principal : c'est lui qui mesure la latence de sortie.
     main: bool,
     sample_rate: u32,
@@ -2822,6 +2828,7 @@ impl OutState {
             monitor: None,
             mon: vec![0.0; MAX_BLOCK * 2],
             play_fade_in: false,
+            master_cur: 1.0,
             main: false,
             sample_rate: 0,
             slot: SLOT_MAIN,
@@ -3081,6 +3088,23 @@ impl OutState {
                 self.play_fade_in = true;
             }
             sh.out_frames.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        // Fader master : rampe linéaire sur le bloc vers la valeur demandée.
+        let target = f32::from_bits(sh.master_gain.load(Ordering::Relaxed));
+        let target = if target.is_finite() {
+            target.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        if target != 1.0 || self.master_cur != 1.0 {
+            let from = self.master_cur;
+            let step = (target - from) / frames.max(1) as f32;
+            for (f, x) in play.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let g = from + step * (f + 1) as f32;
+                x[0] *= g;
+                x[1] *= g;
+            }
+            self.master_cur = target;
         }
         let pads = &mut self.pads[..frames * 2];
         pads.fill(0.0);

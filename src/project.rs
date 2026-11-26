@@ -136,6 +136,14 @@ pub struct Track {
     /// Couleur choisie (indice dans la palette) ; `None` = couleur selon la position.
     #[serde(default)]
     pub color: Option<u8>,
+    /// Fader de la piste dans le mix (dB, `FADER_MIN_DB` = coupé) : écoute et mix exporté
+    /// seulement, les prises ne sont jamais modifiées.
+    #[serde(default, deserialize_with = "lenient_f32")]
+    pub gain_db: f32,
+    /// Panoramique (−1 = gauche, 0 = centre, 1 = droite). Piste mono : loi à −3 dB au
+    /// centre (comme une console) ; piste stéréo : balance.
+    #[serde(default, deserialize_with = "lenient_f32")]
+    pub pan: f32,
     /// Les prises récentes sont à la fin et passent au-dessus des anciennes.
     #[serde(default)]
     pub clips: Vec<Clip>,
@@ -152,6 +160,24 @@ impl Track {
     /// Nombre de canaux de la piste (1 = mono, 2 = stéréo).
     pub fn channels(&self) -> usize {
         if self.stereo { 2 } else { 1 }
+    }
+
+    /// Gains linéaires (gauche, droite) de la piste dans le mix : fader et panoramique.
+    pub fn mix_gains(&self) -> [f32; 2] {
+        let g = db_to_gain(self.gain_db);
+        let pan = if self.pan.is_finite() {
+            self.pan.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        if self.stereo {
+            // Balance : le côté opposé baisse, l'autre reste tel quel.
+            [g * (1.0 - pan).min(1.0), g * (1.0 + pan).min(1.0)]
+        } else {
+            // Puissance constante : −3 dB de chaque côté au centre.
+            let a = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            [g * a.cos(), g * a.sin()]
+        }
     }
 
     /// Canaux de la carte utilisés par la piste.
@@ -241,11 +267,27 @@ pub struct Project {
     /// écriture).
     #[serde(skip)]
     pub state_at: Option<i64>,
+    /// Fader master du mix (dB, `FADER_MIN_DB` = coupé) : écoute et mix exporté.
+    #[serde(default, deserialize_with = "lenient_f32")]
+    pub master_db: f32,
     /// Champs inconnus des prises (version plus récente), par identifiant de prise :
     /// réécrits tels quels (voir `parse_project`, `to_json`). Rangés à part pour que les
     /// prises restent de simples structures.
     #[serde(skip)]
     clip_extra: std::collections::HashMap<u64, Extra>,
+}
+
+/// Faders : de `FADER_MIN_DB` (coupé) à `FADER_MAX_DB`.
+pub const FADER_MIN_DB: f32 = -90.0;
+pub const FADER_MAX_DB: f32 = 6.0;
+
+/// dB → gain linéaire ; `FADER_MIN_DB` et en dessous : silence.
+pub fn db_to_gain(db: f32) -> f32 {
+    if !db.is_finite() || db <= FADER_MIN_DB {
+        0.0
+    } else {
+        10f32.powf(db.min(FADER_MAX_DB) / 20.0)
+    }
 }
 
 /// Fréquence par défaut (fichier sans fréquence ou fréquence nulle).
@@ -272,6 +314,7 @@ impl Project {
             owns_file: false,
             saved_at: 0,
             state_at: None,
+            master_db: 0.0,
             clip_extra: Default::default(),
         }
     }
@@ -314,6 +357,8 @@ impl Project {
             solo: false,
             monitor: false,
             color: None,
+            gain_db: 0.0,
+            pan: 0.0,
             clips: Vec::new(),
             extra: Extra::new(),
         });
@@ -333,6 +378,11 @@ impl Project {
 
     pub fn track_mut(&mut self, id: u64) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Gain linéaire du fader master.
+    pub fn master_gain(&self) -> f32 {
+        db_to_gain(self.master_db)
     }
 
     /// Pistes audibles en lecture (mute / solo).
@@ -2374,5 +2424,31 @@ mod tests {
         assert!(t.input_fits(6, 2), "WASAPI : paire 7+8");
         assert!(!t.input_fits(0, 2), "WASAPI : paire 1+2");
         assert_eq!(t.engine_input(8), None);
+    }
+
+    /// Faders et panoramique : piste mono au centre à −3 dB de chaque côté, tout à gauche
+    /// à 0 dB à gauche ; piste stéréo en balance ; fader en bas = silence.
+    #[test]
+    fn mix_gains_follow_fader_and_pan() {
+        let mut p = Project::new("M".into(), std::env::temp_dir(), 48000);
+        let mo = p.add_track(Some("Voix".into()), Some(0));
+        let st = p.add_track_ch(Some("Synthé".into()), Some(2), true);
+        let close =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5;
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let t = |p: &Project, id| p.tracks.iter().find(|t| t.id == id).unwrap().mix_gains();
+        assert!(close(t(&p, mo), [c, c]));
+        assert!(close(t(&p, st), [1.0, 1.0]));
+        p.track_mut(mo).unwrap().pan = -1.0;
+        p.track_mut(st).unwrap().pan = 0.5;
+        assert!(close(t(&p, mo), [1.0, 0.0]));
+        assert!(close(t(&p, st), [0.5, 1.0]));
+        p.track_mut(mo).unwrap().gain_db = FADER_MIN_DB;
+        assert_eq!(t(&p, mo), [0.0, 0.0]);
+        p.track_mut(st).unwrap().pan = f32::NAN;
+        assert!(close(t(&p, st), [1.0, 1.0]), "valeur abîmée : au centre");
+        assert!((db_to_gain(6.0) - 1.995).abs() < 1e-3);
+        assert_eq!(db_to_gain(f32::NAN), 0.0);
+        assert_eq!(db_to_gain(40.0), db_to_gain(FADER_MAX_DB));
     }
 }

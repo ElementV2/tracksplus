@@ -315,7 +315,7 @@ impl App {
         if self.show_bridge {
             egui::Panel::bottom("bridge")
                 .resizable(false)
-                .exact_size(210.0)
+                .exact_size(250.0)
                 .frame(egui::Frame::new().fill(t::SURFACE))
                 .show(ui, |ui| self.meter_bridge(ui));
         }
@@ -2427,9 +2427,11 @@ impl App {
         let full = ui.max_rect();
         let in_ch = self.engine.status.in_channels;
         let in_base = self.in_base();
+        let playing = matches!(self.transport, Transport::Playing { .. });
         let p = ui.painter().clone();
         w::hline(&p, full.left(), full.right(), full.top(), t::LINE);
-        let top = full.top() + 44.0;
+        // Zones : crête, panoramique, puis vumètre et fader côte à côte, puis noms.
+        let top = full.top() + 62.0;
         let bottom = full.bottom() - 34.0;
         p.text(
             pos2(full.left() + 12.0, full.top() + 12.0),
@@ -2448,13 +2450,16 @@ impl App {
         );
         let area = Rect::from_min_max(pos2(full.left() + 30.0, full.top() + 22.0), full.max);
         let mut child = ui.new_child(UiBuilder::new().max_rect(area));
+        let mut set_gain: Option<(usize, f32)> = None;
+        let mut set_pan: Option<(usize, f32)> = None;
+        let mut set_master: Option<f32> = None;
         egui::ScrollArea::horizontal()
             .id_salt("bridge")
             .auto_shrink([false, false])
             .show(&mut child, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 1.0;
-                    let col_w = 44.0;
+                    let col_w = BRIDGE_COL_W;
                     // Aucune allocation par image : on lit les pistes en place, et les
                     // colonnes hors de la zone visible ne sont pas dessinées.
                     let mut reset: Option<[Option<u16>; 2]> = None;
@@ -2468,6 +2473,7 @@ impl App {
                         }
                         let tr = &self.project.tracks[idx];
                         let (id, armed, color) = (tr.id, tr.armed, track_color(tr, idx));
+                        let (gain_db, pan) = (tr.gain_db, tr.pan);
                         let chans: [Option<u16>; 2] = match tr.input {
                             Some(i) if tr.stereo => [Some(i), Some(i + 1)],
                             Some(i) => [Some(i), None],
@@ -2479,8 +2485,9 @@ impl App {
                             }
                             _ => MeterState::default(),
                         };
-                        // Piste audio : niveau de lecture ; piste d'enregistrement : entrée.
-                        let audio_tr = tr.is_audio();
+                        // Niveau de lecture (après le fader) pour une piste audio, ou pour
+                        // une piste non armée pendant la lecture ; sinon, son entrée.
+                        let audio_tr = tr.is_audio() || (playing && !armed);
                         let (m0, m1, stereo) = if audio_tr {
                             let m = self.track_meters.get(&id).copied().unwrap_or_default();
                             (m[0], m[1], tr.stereo)
@@ -2498,20 +2505,36 @@ impl App {
                             vec2(38.0, 15.0),
                         );
                         w::peak_readout(p, pr, &merged);
+                        // Panoramique.
+                        let pan_r = Rect::from_center_size(
+                            pos2(r.center().x, r.top() + 29.0),
+                            vec2(col_w - 12.0, 12.0),
+                        );
+                        if let Some(v) = pan_control(ui, pan_r, pan, ("bpan", id)) {
+                            set_pan = Some((idx, v));
+                        }
+                        // Vumètre à gauche, fader à droite.
+                        let mx = r.left() + 16.0;
+                        let p = ui.painter();
                         if stereo {
-                            // Stéréo : deux barres côte à côte (gauche, droite).
                             for (k, m) in [m0, m1].iter().enumerate() {
-                                let x = r.center().x - 4.0 + k as f32 * 4.5;
+                                let x = mx - 4.0 + k as f32 * 4.5;
                                 let mr = Rect::from_min_max(pos2(x, top), pos2(x + 3.5, bottom));
                                 w::meter_v(p, mr, m);
                             }
                         } else {
-                            let mr = Rect::from_min_max(
-                                pos2(r.center().x - 4.0, top),
-                                pos2(r.center().x + 4.0, bottom),
-                            );
+                            let mr =
+                                Rect::from_min_max(pos2(mx - 4.0, top), pos2(mx + 4.0, bottom));
                             w::meter_v(p, mr, &merged);
                         }
+                        let fr = Rect::from_min_max(
+                            pos2(r.left() + 26.0, top - 4.0),
+                            pos2(r.right() - 4.0, bottom + 4.0),
+                        );
+                        if let Some(v) = fader(ui, fr, gain_db, ("bfader", id)) {
+                            set_gain = Some((idx, v));
+                        }
+                        let p = ui.painter();
                         p.rect_filled(
                             Rect::from_min_size(
                                 pos2(r.left() + 6.0, bottom + 6.0),
@@ -2521,16 +2544,23 @@ impl App {
                             color,
                         );
                         p.text(
-                            pos2(r.center().x, bottom + 16.0),
-                            Align2::CENTER_CENTER,
+                            pos2(r.left() + 7.0, bottom + 16.0),
+                            Align2::LEFT_CENTER,
                             format!("{}", idx + 1),
                             t::semibold(10.0),
                             if armed { t::REC } else { t::TEXT_2 },
                         );
                         p.text(
+                            pos2(r.right() - 5.0, bottom + 16.0),
+                            Align2::RIGHT_CENTER,
+                            fmt_fader(gain_db),
+                            t::regular(9.0),
+                            t::TEXT_3,
+                        );
+                        p.text(
                             pos2(r.center().x, bottom + 28.0),
                             Align2::CENTER_CENTER,
-                            short(&tr.name, 6),
+                            short(&tr.name, 8),
                             t::regular(9.0),
                             t::TEXT_3,
                         );
@@ -2538,7 +2568,7 @@ impl App {
                         let resp = resp.on_hover_ui(|ui| {
                             let tr = &self.project.tracks[idx];
                             let label = match tr.input {
-                                _ if tr.is_audio() => "piste audio, niveau de lecture".into(),
+                                _ if tr.is_audio() => "piste audio".into(),
                                 Some(i) if tr.stereo => format!("entrées {}-{}", i + 1, i + 2),
                                 Some(i) => format!("entrée {}", i + 1),
                                 None => "pas d'entrée".into(),
@@ -2559,9 +2589,62 @@ impl App {
                             }
                         }
                     }
+                    // Master : niveau envoyé à la sortie, et son fader.
+                    ui.add_space(8.0);
+                    let (r, _) =
+                        ui.allocate_exact_size(vec2(col_w + 8.0, area.height()), Sense::hover());
+                    if ui.is_rect_visible(r) {
+                        let p = ui.painter();
+                        w::vline(p, r.left() + 0.5, r.top(), r.bottom(), t::LINE);
+                        let m = self.master_play;
+                        let pr = Rect::from_center_size(
+                            pos2(r.center().x + 4.0, r.top() + 10.0),
+                            vec2(38.0, 15.0),
+                        );
+                        w::peak_readout(p, pr, &m[0].merge(m[1]));
+                        let mx = r.left() + 20.0;
+                        for (k, mm) in m.iter().enumerate() {
+                            let x = mx - 4.0 + k as f32 * 4.5;
+                            let mr = Rect::from_min_max(pos2(x, top), pos2(x + 3.5, bottom));
+                            w::meter_v(p, mr, mm);
+                        }
+                        let master_db = self.project.master_db;
+                        let fr = Rect::from_min_max(
+                            pos2(r.left() + 30.0, top - 4.0),
+                            pos2(r.right() - 4.0, bottom + 4.0),
+                        );
+                        if let Some(v) = fader(ui, fr, master_db, "bmaster") {
+                            set_master = Some(v);
+                        }
+                        let p = ui.painter();
+                        p.text(
+                            pos2(r.left() + 9.0, bottom + 16.0),
+                            Align2::LEFT_CENTER,
+                            "M",
+                            t::semibold(10.0),
+                            t::TEXT_2,
+                        );
+                        p.text(
+                            pos2(r.right() - 5.0, bottom + 16.0),
+                            Align2::RIGHT_CENTER,
+                            fmt_fader(master_db),
+                            t::regular(9.0),
+                            t::TEXT_3,
+                        );
+                        p.text(
+                            pos2(r.center().x + 4.0, bottom + 28.0),
+                            Align2::CENTER_CENTER,
+                            "MASTER",
+                            t::caps(9.0),
+                            t::TEXT_3,
+                        );
+                    }
                     if let Some(chans) = reset {
                         for i in chans.into_iter().flatten() {
-                            if let Some(mm) = self.in_meters.get_mut(i as usize) {
+                            if let Some(mm) = i
+                                .checked_sub(in_base)
+                                .and_then(|c| self.in_meters.get_mut(c as usize))
+                            {
                                 mm.reset();
                             }
                         }
@@ -2576,7 +2659,165 @@ impl App {
                     }
                 });
             });
+        if let Some((idx, v)) = set_gain
+            && let Some(tr) = self.project.tracks.get_mut(idx)
+        {
+            tr.gain_db = v;
+            self.mix_changed();
+        }
+        if let Some((idx, v)) = set_pan
+            && let Some(tr) = self.project.tracks.get_mut(idx)
+        {
+            tr.pan = v;
+            self.mix_changed();
+        }
+        if let Some(v) = set_master {
+            // Master : appliqué à la sortie dès l'image suivante (`sync_monitoring`).
+            self.project.master_db = v;
+            self.project.dirty = true;
+        }
     }
+}
+
+/// Largeur d'une colonne du panneau des vumètres (vumètre + fader).
+const BRIDGE_COL_W: f32 = 60.0;
+
+/// Position d'un fader (0 = bas, 1 = haut) pour un gain en dB : course plus fine autour
+/// de 0 dB, comme sur une console ; tout en bas = coupé.
+fn fader_pos(db: f32) -> f32 {
+    use crate::project::{FADER_MAX_DB, FADER_MIN_DB};
+    if !db.is_finite() || db <= FADER_MIN_DB {
+        return 0.0;
+    }
+    let x = ((db.max(-60.0) + 60.0) / (FADER_MAX_DB + 60.0)).clamp(0.0, 1.0);
+    x.powf(1.6)
+}
+
+/// Gain en dB d'une position de fader (inverse de `fader_pos`).
+fn fader_db(pos: f32) -> f32 {
+    use crate::project::{FADER_MAX_DB, FADER_MIN_DB};
+    if pos <= 0.002 {
+        return FADER_MIN_DB;
+    }
+    let db = pos.clamp(0.0, 1.0).powf(1.0 / 1.6) * (FADER_MAX_DB + 60.0) - 60.0;
+    // Petit cran à 0 dB.
+    if db.abs() < 0.25 {
+        0.0
+    } else {
+        (db * 10.0).round() / 10.0
+    }
+}
+
+/// Valeur d'un fader, lisible : « 0.0 », « -6.0 », « +3.0 », « -∞ ».
+pub fn fmt_fader(db: f32) -> String {
+    if !db.is_finite() || db <= crate::project::FADER_MIN_DB {
+        "-∞".into()
+    } else if db > 0.05 {
+        format!("+{db:.1}")
+    } else {
+        format!("{:.1}", db.min(0.0))
+    }
+}
+
+/// Fader vertical dans `rect` : glisser pour régler (Maj : réglage fin), double-clic :
+/// 0 dB. Renvoie la nouvelle valeur (dB) si elle a changé.
+fn fader(ui: &mut egui::Ui, rect: Rect, db: f32, id: impl egui::AsIdSalt) -> Option<f32> {
+    let resp = ui.interact(rect, ui.make_persistent_id(id), Sense::click_and_drag());
+    let travel = (rect.height() - 8.0).max(1.0);
+    let pos = fader_pos(db);
+    let mut out = None;
+    if resp.double_clicked() {
+        out = Some(0.0);
+    } else if resp.dragged() {
+        let fine = ui.input(|i| i.modifiers.shift);
+        let dy = resp.drag_delta().y / travel * if fine { 0.1 } else { 1.0 };
+        let v = fader_db((pos - dy).clamp(0.0, 1.0));
+        if v != db {
+            out = Some(v);
+        }
+    }
+    let p = ui.painter();
+    let cx = rect.center().x;
+    let y_of = |pos: f32| rect.bottom() - 4.0 - pos * travel;
+    // Rail, repère 0 dB, puis curseur.
+    p.rect_filled(
+        Rect::from_min_max(
+            pos2(cx - 1.0, rect.top() + 4.0),
+            pos2(cx + 1.0, rect.bottom() - 4.0),
+        ),
+        1.0,
+        t::INSET,
+    );
+    let y0 = y_of(fader_pos(0.0));
+    p.line_segment(
+        [pos2(cx - 6.0, y0), pos2(cx + 6.0, y0)],
+        egui::Stroke::new(1.0, t::TEXT_3),
+    );
+    let y = y_of(fader_pos(out.unwrap_or(db)));
+    let cap = Rect::from_center_size(pos2(cx, y), vec2(16.0, 9.0));
+    let active = resp.hovered() || resp.dragged();
+    p.rect_filled(cap, 2.0, if active { t::ACCENT } else { t::TEXT_2 });
+    p.line_segment(
+        [pos2(cap.left() + 3.0, y), pos2(cap.right() - 3.0, y)],
+        egui::Stroke::new(1.0, t::SURFACE),
+    );
+    if resp.dragged() || resp.hovered() {
+        resp.on_hover_text(fmt_fader(out.unwrap_or(db)));
+    }
+    out
+}
+
+/// Panoramique horizontal dans `rect` : glisser pour régler, double-clic : centre.
+/// Renvoie la nouvelle valeur (−1 … 1) si elle a changé.
+fn pan_control(ui: &mut egui::Ui, rect: Rect, pan: f32, id: impl egui::AsIdSalt) -> Option<f32> {
+    let resp = ui.interact(rect, ui.make_persistent_id(id), Sense::click_and_drag());
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut out = None;
+    if resp.double_clicked() {
+        out = Some(0.0);
+    } else if resp.dragged() {
+        let fine = ui.input(|i| i.modifiers.shift);
+        let dx = resp.drag_delta().x / (rect.width() / 2.0) * if fine { 0.1 } else { 1.0 };
+        let v = ((pan + dx).clamp(-1.0, 1.0) * 100.0).round() / 100.0;
+        // Cran au centre.
+        let v = if v.abs() < 0.03 { 0.0 } else { v };
+        if v != pan {
+            out = Some(v);
+        }
+    }
+    let v = out.unwrap_or(pan);
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, t::INSET);
+    let cx = rect.center().x;
+    let x = cx + v * (rect.width() / 2.0 - 2.0);
+    let active = resp.hovered() || resp.dragged();
+    p.rect_filled(
+        Rect::from_min_max(
+            pos2(cx.min(x), rect.top() + 2.0),
+            pos2(cx.max(x), rect.bottom() - 2.0),
+        ),
+        1.0,
+        if active { t::ACCENT } else { t::ACCENT_DIM },
+    );
+    p.line_segment(
+        [pos2(cx, rect.top()), pos2(cx, rect.bottom())],
+        egui::Stroke::new(1.0, t::TEXT_3),
+    );
+    if active {
+        let txt = if v.abs() < 0.005 {
+            "C".to_string()
+        } else if v < 0.0 {
+            format!("G {:.0}", -v * 100.0)
+        } else {
+            format!("D {:.0}", v * 100.0)
+        };
+        resp.on_hover_text(txt);
+    }
+    out
 }
 
 /// Rectangle de sélection des prises : point de départ en temps (échantillon) et en
@@ -3110,5 +3351,29 @@ mod tests {
         assert_eq!(fmt_ruler(1.25, 0.05), "0:01.25");
         assert_eq!(fmt_ruler(1.125, 0.005), "0:01.125");
         assert_eq!(fmt_ruler(125.0, 5.0), "2:05");
+    }
+}
+
+#[cfg(test)]
+mod fader_tests {
+    use super::*;
+
+    /// Course du fader : aller-retour position ↔ dB, cran à 0 dB, tout en bas = coupé.
+    #[test]
+    fn fader_travel_round_trips() {
+        use crate::project::{FADER_MAX_DB, FADER_MIN_DB};
+        assert_eq!(fader_pos(FADER_MIN_DB), 0.0);
+        assert_eq!(fader_db(0.0), FADER_MIN_DB);
+        assert!((fader_pos(FADER_MAX_DB) - 1.0).abs() < 1e-6);
+        for db in [-40.0f32, -12.0, -6.0, -3.0, 0.0, 3.0, 6.0] {
+            let back = fader_db(fader_pos(db));
+            assert!((back - db).abs() < 0.11, "{db} → {back}");
+        }
+        assert_eq!(fader_db(fader_pos(0.2)), 0.0, "cran à 0 dB");
+        assert!(fader_pos(0.0) > 0.8 && fader_pos(0.0) < 0.9);
+        assert_eq!(fmt_fader(FADER_MIN_DB), "-∞");
+        assert_eq!(fmt_fader(0.0), "0.0");
+        assert_eq!(fmt_fader(-6.0), "-6.0");
+        assert_eq!(fmt_fader(3.0), "+3.0");
     }
 }

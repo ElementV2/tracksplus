@@ -506,6 +506,9 @@ struct Toast {
     until: f64,
 }
 
+/// Délai minimal entre deux nouveaux rendus de la lecture quand on bouge un fader (s).
+const MIX_SWITCH_EVERY: f64 = 0.12;
+
 /// Lignes du journal des incidents affichées au plus (les plus récentes).
 const INCIDENTS_SHOWN: usize = 500;
 
@@ -1194,6 +1197,10 @@ pub struct App {
     last_reopen: Option<(f64, f64)>,
     /// La prise en cours a été coupée par un trou de l'entrée plus long que les tampons.
     take_split: bool,
+    /// Fader ou panoramique changé, pas encore appliqué à la lecture (`flush_mix`), et
+    /// dernier nouveau rendu pour cette raison.
+    mix_dirty: bool,
+    mix_switch_at: f64,
     /// Silence inséré dans la prise en cours déjà repéré (trames, voir `watch_take`), et
     /// nombre de trous déjà repérés.
     gap_seen: u64,
@@ -1450,6 +1457,8 @@ impl App {
             last_reopen: None,
             take_split: false,
             gap_seen: 0,
+            mix_dirty: false,
+            mix_switch_at: f64::NEG_INFINITY,
             gap_count_seen: 0,
             given_up: Vec::new(),
             stall_logged: false,
@@ -5246,6 +5255,28 @@ impl App {
             }
         }
         sh.monitor_on.store(any, Ordering::Relaxed);
+        // Fader master : lu par le callback de sortie, entendu aussitôt.
+        let master = self.project.master_gain().to_bits();
+        if sh.master_gain.load(Ordering::Relaxed) != master {
+            sh.master_gain.store(master, Ordering::Relaxed);
+        }
+    }
+
+    /// Fader ou panoramique d'une piste changé : la session est à sauvegarder, et la
+    /// lecture en cours prend le nouveau mix (voir `flush_mix`).
+    pub fn mix_changed(&mut self) {
+        self.project.dirty = true;
+        self.mix_dirty = true;
+    }
+
+    /// Mix changé pendant la lecture : nouveau rendu (comme mute / solo), au plus toutes
+    /// les 0,12 s pendant qu'on bouge un fader (le disque n'est pas relu à chaque image).
+    fn flush_mix(&mut self) {
+        if self.mix_dirty && self.now - self.mix_switch_at >= MIX_SWITCH_EVERY {
+            self.mix_dirty = false;
+            self.mix_switch_at = self.now;
+            self.update_audible();
+        }
     }
 
     /// Quelque chose bouge à l'écran : transport, prise, vumètres, pads, messages…
@@ -5308,7 +5339,8 @@ impl App {
         self.track_meters
             .retain(|id, _| self.project.tracks.iter().any(|t| t.id == *id));
         for (i, t) in self.project.tracks.iter().enumerate() {
-            if !t.is_audio() {
+            // Toute piste qui a des prises : niveau de lecture (après son fader).
+            if t.clips.is_empty() {
                 continue;
             }
             let v = self
@@ -7313,6 +7345,7 @@ impl eframe::App for App {
                 self.sb.midi_dirty = true;
             }
             self.update_playhead();
+            self.flush_mix();
             self.complete_journal();
             self.poll_finishing(None);
             self.poll_save_as();
