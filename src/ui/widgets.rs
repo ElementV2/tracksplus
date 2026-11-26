@@ -229,9 +229,20 @@ pub fn scale_v(p: &Painter, rect: Rect, align_right: bool) {
     }
 }
 
+/// Sous ce niveau, la valeur crête affiche −∞ : souffle propre d'une entrée sans rien de
+/// branché (vers −99 dB sur une carte pro), inaudible, qui sinon ferait clignoter des
+/// chiffres sur une piste muette.
+pub const READOUT_FLOOR_DB: f32 = -80.0;
+
+/// Niveau affiché par la valeur crête (dB) : −∞ (−140) sous `READOUT_FLOOR_DB`.
+pub fn readout_db(peak: f32) -> f32 {
+    let db = to_db(peak);
+    if db < READOUT_FLOOR_DB { -140.0 } else { db }
+}
+
 /// Valeur crête (dB, voir `MeterState::max`) ; fond rouge si saturation (jusqu'au clic).
 pub fn peak_readout(p: &Painter, rect: Rect, m: &MeterState) {
-    let db = to_db(m.max);
+    let db = readout_db(m.max);
     let (bg, fg) = if m.clip {
         (t::METER_RED, Color32::BLACK)
     } else {
@@ -1057,5 +1068,8 @@ mod tests {
         assert_eq!(deflection(0.0), 1.0);
         assert!((deflection(-20.0) - 0.5).abs() < 1e-6);
         assert_eq!(fmt_db(-6.04), "−6.0");
+        // Souffle d'une entrée vide (−99 dB) : −∞ ; signal faible mais réel : sa valeur.
+        assert_eq!(fmt_db(readout_db(10f32.powf(-99.1 / 20.0))), "−∞");
+        assert_eq!(fmt_db(readout_db(10f32.powf(-60.0 / 20.0))), "−60.0");
     }
 }
