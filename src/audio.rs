@@ -4265,3 +4265,56 @@ mod asio_list_tests {
         assert_eq!(asio_hint("WASAPI", dante), "");
     }
 }
+
+/// Essai sur matériel (lancé à la main) : `TP_WASAPI_DEV="Analog (7+8) (RME Fireface UC)"
+/// cargo test --release -- --ignored wasapi_monitor_on_hardware --nocapture`.
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn wasapi_monitor_on_hardware() {
+        let dev = std::env::var("TP_WASAPI_DEV").unwrap_or("Analog (7+8) (RME Fireface UC)".into());
+        let prefs = AudioPrefs {
+            host: Some("WASAPI".into()),
+            input: Some(dev.clone()),
+            output: Some(dev),
+            sample_rate: None,
+            buffer: None,
+            out_left: 0,
+            pad_output: None,
+            pad_left: 0,
+            monitor_output: None,
+            monitor_left: 0,
+            auto_restart: true,
+        };
+        let e = Engine::open(&prefs, &prefs.pad_out()).unwrap();
+        println!(
+            "ouverts {:#06b} manquants {:#06b} problèmes {:?}",
+            e.open_mask(),
+            e.missing(),
+            e.problems(0)
+        );
+        println!("statut {:?}", e.status);
+        let sh = e.shared.clone();
+        sh.monitor[0].store(1, Ordering::Relaxed);
+        sh.monitor_on.store(true, Ordering::Relaxed);
+        for t in 1..=4 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let hb: Vec<u64> = sh
+                .heartbeat
+                .iter()
+                .map(|h| h.load(Ordering::Relaxed))
+                .collect();
+            let mon = Shared::take_peak(&sh.master_mon[0]);
+            let inp = sh.take_meter(0);
+            println!(
+                "t={}ms battements {hb:?}  entrée {inp:.5}  retour {mon:.5}  perdu {:#06b}",
+                t * 500,
+                sh.device_lost.load(Ordering::Relaxed)
+            );
+        }
+        sh.monitor_on.store(false, Ordering::Relaxed);
+    }
+}

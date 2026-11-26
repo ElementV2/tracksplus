@@ -1931,13 +1931,18 @@ impl App {
             return;
         }
         let in_ch = self.engine.status.in_channels;
-        // (piste, nom, premier canal, stéréo)
+        // Entrées des pistes = numéros réels de la carte ; le flux ouvert commence à `base`.
+        let base = self.in_base();
+        // (piste, nom, premier canal du flux, stéréo)
         let armed: Vec<(u64, String, u16, bool)> = self
             .project
             .tracks
             .iter()
-            .filter(|t| t.armed && t.input_fits(in_ch))
-            .filter_map(|t| t.input.map(|i| (t.id, t.name.clone(), i, t.stereo)))
+            .filter(|t| t.armed && t.input_fits(base, in_ch))
+            .filter_map(|t| {
+                t.engine_input(base)
+                    .map(|i| (t.id, t.name.clone(), i, t.stereo))
+            })
             .collect();
         // Pistes armées dont l'entrée n'existe pas sur la carte (ex. Dante revenue avec
         // moins de canaux) : on enregistre les autres, mais on le signale clairement.
@@ -1945,7 +1950,7 @@ impl App {
             .project
             .tracks
             .iter()
-            .filter(|t| t.armed && !t.input_fits(in_ch))
+            .filter(|t| t.armed && !t.input_fits(base, in_ch))
             .map(|t| t.name.clone())
             .collect();
         if armed.is_empty() {
@@ -4801,10 +4806,11 @@ impl App {
             .flat_map(|t| t.inputs())
             .collect();
         let step = if stereo { 2 } else { 1 };
-        (0..self.engine.status.in_channels)
+        let (base, n) = (self.in_base(), self.engine.status.in_channels);
+        (base..base + n)
             .step_by(step)
             .find(|&i| (i..i + step as u16).all(|c| !used.contains(&c)))
-            .or((self.engine.status.in_channels > 0).then_some(0))
+            .or((n > 0).then_some(base))
     }
 
     /// Crée `count` pistes ; la k-ième prend l'entrée `first + k` (paires en stéréo).
@@ -5220,8 +5226,9 @@ impl App {
                 codes[c] = if codes[c] == 0 || codes[c] == v { v } else { 1 };
             }
         };
+        let base = self.in_base();
         for t in self.project.tracks.iter().filter(|t| t.monitor) {
-            if let Some(i) = t.input {
+            if let Some(i) = t.engine_input(base) {
                 let i = i as usize;
                 if t.stereo {
                     put(i, 2);
@@ -6605,7 +6612,7 @@ impl App {
                             ),
                             t::TEXT_2,
                         ));
-                        if last > in_ch as u32 {
+                        if last > (in_base + in_ch) as u32 {
                             lines.push((
                                 format!(
                                     "La carte actuelle n'a que {in_ch} entrée{} : les pistes au-delà n'enregistreront pas tant qu'elle n'en a pas assez.",

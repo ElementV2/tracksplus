@@ -1710,7 +1710,7 @@ impl App {
                 }
                 let input = track.input;
                 let stereo = track.stereo;
-                let label = track.input_label(in_base);
+                let label = track.input_label();
                 let chans: Vec<u16> = track.inputs().collect();
                 let ms: Vec<MeterState> = if is_audio {
                     // Piste audio : niveau de lecture, une barre par canal du fichier.
@@ -1719,12 +1719,11 @@ impl App {
                 } else {
                     chans
                         .iter()
-                        .map(|&i| {
-                            if (i as usize) < audio::MAX_INPUTS && i < in_ch {
-                                self.in_meters[i as usize]
-                            } else {
-                                MeterState::default()
+                        .map(|&i| match i.checked_sub(in_base) {
+                            Some(c) if (c as usize) < audio::MAX_INPUTS && c < in_ch => {
+                                self.in_meters[c as usize]
                             }
+                            _ => MeterState::default(),
                         })
                         .collect()
                 };
@@ -2427,6 +2426,7 @@ impl App {
     fn meter_bridge(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
         let in_ch = self.engine.status.in_channels;
+        let in_base = self.in_base();
         let p = ui.painter().clone();
         w::hline(&p, full.left(), full.right(), full.top(), t::LINE);
         let top = full.top() + 44.0;
@@ -2473,7 +2473,7 @@ impl App {
                             Some(i) => [Some(i), None],
                             None => [None, None],
                         };
-                        let meter = |c: Option<u16>| match c {
+                        let meter = |c: Option<u16>| match c.and_then(|i| i.checked_sub(in_base)) {
                             Some(i) if (i as usize) < audio::MAX_INPUTS && i < in_ch => {
                                 self.in_meters[i as usize]
                             }
@@ -2614,9 +2614,9 @@ pub fn input_combo(
     let step: u16 = if stereo { 2 } else { 1 };
     let label = |i: u16| {
         if stereo {
-            format!("Entrées {}-{}", base + i + 1, base + i + 2)
+            format!("Entrées {}-{}", i + 1, i + 2)
         } else {
-            format!("Entrée {}", base + i + 1)
+            format!("Entrée {}", i + 1)
         }
     };
     let cur = value.map_or("Aucune entrée".to_string(), label);
@@ -2636,8 +2636,9 @@ pub fn input_combo(
             if in_ch == 0 {
                 ui.label(egui::RichText::new("Aucune carte son").color(t::TEXT_3));
             }
-            let mut i = 0u16;
-            while i + step <= in_ch {
+            // Numéros réels de la carte : le flux ouvert va de `base` à `base + in_ch`.
+            let mut i = base;
+            while i + step <= base + in_ch {
                 let by: Vec<&str> = (i..i + step)
                     .flat_map(|c| users.get(&c).cloned().unwrap_or_default())
                     .collect();
@@ -2699,7 +2700,7 @@ fn input_picker(
         .spacing([2.0, 2.0])
         .show(ui, |ui| {
             for n in 0..count {
-                let i = n * step;
+                let i = base + n * step;
                 let sel = current == Some(i);
                 let is_used = (i..i + step).any(|c| used.contains(&c));
                 let (r, resp) = ui.allocate_exact_size(vec2(cell_w, 22.0), Sense::click());
@@ -2719,9 +2720,9 @@ fn input_picker(
                     t::TEXT
                 };
                 let text = if stereo {
-                    format!("{}-{}", base + i + 1, base + i + 2)
+                    format!("{}-{}", i + 1, i + 2)
                 } else {
-                    format!("{}", base + i + 1)
+                    format!("{}", i + 1)
                 };
                 ui.painter()
                     .text(r.center(), Align2::CENTER_CENTER, text, t::medium(10.5), fg);

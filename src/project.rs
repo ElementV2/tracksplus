@@ -161,18 +161,24 @@ impl Track {
             .flat_map(move |i| (0..self.channels() as u16).map(move |k| i.saturating_add(k)))
     }
 
-    /// L'entrée (ou la paire) existe sur une carte de `in_ch` canaux.
-    pub fn input_fits(&self, in_ch: u16) -> bool {
-        self.input
+    /// L'entrée (numéro réel sur la carte, à partir de 0 : « IN 7 » = 6) vue par le flux
+    /// ouvert, qui commence au canal `base` de la carte (WASAPI : Windows découpe la carte
+    /// en paires, « Analog (7+8) » commence à 6 ; ASIO : 0). `None` hors de ce flux.
+    pub fn engine_input(&self, base: u16) -> Option<u16> {
+        self.input.and_then(|i| i.checked_sub(base))
+    }
+
+    /// L'entrée (ou la paire) existe dans le flux ouvert (`in_ch` canaux à partir de `base`).
+    pub fn input_fits(&self, base: u16, in_ch: u16) -> bool {
+        self.engine_input(base)
             .is_some_and(|i| (i as usize) + self.channels() <= in_ch as usize)
     }
 
-    /// Libellé court de l'entrée : « IN 3 », « IN 3-4 » ou « IN — ». `base` : numéro de la
-    /// première entrée de la carte ouverte moins un (WASAPI : « Analog (5+6) » → 4).
-    pub fn input_label(&self, base: u16) -> String {
+    /// Libellé court de l'entrée : « IN 3 », « IN 3-4 » ou « IN — ».
+    pub fn input_label(&self) -> String {
         match self.input {
-            Some(i) if self.stereo => format!("IN {}-{}", base + i + 1, base + i + 2),
-            Some(i) => format!("IN {}", base + i + 1),
+            Some(i) if self.stereo => format!("IN {}-{}", i + 1, i + 2),
+            Some(i) => format!("IN {}", i + 1),
             None => "IN —".into(),
         }
     }
@@ -2351,5 +2357,22 @@ mod tests {
         assert!(redone.iter().all(|t| t.id != rec));
         let basse = merged.iter().find(|t| t.id == rec).unwrap();
         assert!(basse.clips.is_empty() && basse.input == Some(1));
+    }
+
+    /// Entrée d'une piste = numéro réel sur la carte : « IN 7 » marche en ASIO (carte
+    /// entière) comme en WASAPI sur la paire « Analog (7+8) » (flux qui commence à 6), et
+    /// pas sur la paire 1+2.
+    #[test]
+    fn track_input_is_the_real_card_channel() {
+        let mut p = Project::new("E".into(), std::env::temp_dir(), 48000);
+        let id = p.add_track_ch(Some("Micro".into()), Some(6), false);
+        let t = p.tracks.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(t.input_label(), "IN 7");
+        assert_eq!(t.engine_input(0), Some(6));
+        assert!(t.input_fits(0, 18), "ASIO : carte entière");
+        assert_eq!(t.engine_input(6), Some(0));
+        assert!(t.input_fits(6, 2), "WASAPI : paire 7+8");
+        assert!(!t.input_fits(0, 2), "WASAPI : paire 1+2");
+        assert_eq!(t.engine_input(8), None);
     }
 }
