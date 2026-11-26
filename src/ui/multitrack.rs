@@ -1395,6 +1395,9 @@ impl App {
         let mut clip_to_delete = None;
         let mut audible_changed = false;
         let stopped = self.is_stopped();
+        // Pendant une prise, une piste non armée peut être armée : elle rejoint la prise.
+        let recording = self.is_recording();
+        let mut late_arm = None;
         let editable = !self.editing_locked();
         let in_ch = self.engine.status.in_channels;
         let in_base = self.in_base();
@@ -1637,12 +1640,17 @@ impl App {
                     } else if w::arm_button(
                         ui,
                         track.armed,
-                        stopped && track.input.is_some(),
+                        (stopped || (recording && !track.armed)) && track.input.is_some(),
                         !rec_live || blink,
                     )
                     .clicked()
                     {
-                        track.armed = !track.armed;
+                        if recording {
+                            track.armed = true;
+                            late_arm = Some(tid);
+                        } else {
+                            track.armed = !track.armed;
+                        }
                         self.project.dirty = true;
                     }
                     ui.add_space(2.0);
@@ -1907,7 +1915,7 @@ impl App {
                             }
                             ui.label("");
                             ui.horizontal(|ui| {
-                                if w::tool_button(ui, Some(Icon::Record), "Armée", armed, stopped && input.is_some())
+                                if w::tool_button(ui, Some(Icon::Record), "Armée", armed, (stopped || (recording && !armed)) && input.is_some())
                                     .on_hover_text("Enregistrer cette piste à la prochaine prise")
                                     .clicked()
                                 {
@@ -1930,7 +1938,12 @@ impl App {
                 if arm_toggle || monitor_toggle {
                     let track = &mut self.project.tracks[idx];
                     if arm_toggle {
-                        track.armed = !track.armed;
+                        if recording {
+                            track.armed = true;
+                            late_arm = Some(tid);
+                        } else {
+                            track.armed = !track.armed;
+                        }
                     }
                     if monitor_toggle {
                         track.monitor = !track.monitor;
@@ -2044,6 +2057,8 @@ impl App {
                 if let Some((start, finishing)) = live_span
                     && let Some(l) = self.live.iter().find(|l| l.track_id == track.id)
                 {
+                    // Piste armée pendant la prise : elle commence plus loin.
+                    let start = start + l.offset;
                     let end = if finishing.is_some() {
                         start + (l.peaks.read().l0.len() * crate::render::PEAK_BLOCK) as u64
                     } else {
@@ -2434,6 +2449,12 @@ impl App {
             self.selected_tracks.remove(&id);
             self.project.tracks.remove(i);
             self.edited();
+        }
+        if let Some(tid) = late_arm
+            && !self.arm_during_take(tid)
+            && let Some(t) = self.project.tracks.iter_mut().find(|t| t.id == tid)
+        {
+            t.armed = false;
         }
         if clip_to_delete.is_some() {
             self.delete_selection();

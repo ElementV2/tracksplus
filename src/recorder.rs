@@ -2003,6 +2003,7 @@ mod tests {
             takes: vec![crate::recovery::JournalTake {
                 track_id: 1,
                 file: "e.wav".into(),
+                offset: 0,
             }],
         };
         let spec = |file: &str, cons| RecSpec {
@@ -2036,6 +2037,7 @@ mod tests {
         j2.takes.push(crate::recovery::JournalTake {
             track_id: 1,
             file: "e.wav".into(),
+            offset: 0,
         });
         rec.update_journal(dir.clone(), j2);
         drop(prod);

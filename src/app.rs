@@ -34,6 +34,21 @@ pub enum Transport {
 pub struct LiveTake {
     pub track_id: u64,
     pub peaks: Peaks,
+    /// Début dans la prise (trames) : non nul pour une piste armée pendant la prise.
+    pub offset: u64,
+}
+
+/// Piste armée pendant la prise : son propre thread d'écriture, alimenté par le même
+/// callback que les autres ; fusionnée avec la prise à l'arrêt, décalée de `offset`.
+struct LateTake {
+    recorder: Recorder,
+    track_id: u64,
+    file: String,
+    /// Numéro d'ajout attendu du callback (`rec_add_seq`).
+    seq: u64,
+    /// Trame de la prise où la piste a commencé (connue au premier bloc), sinon estimée.
+    offset: Option<u64>,
+    est: u64,
 }
 
 pub struct View {
@@ -1088,6 +1103,13 @@ pub struct App {
     pub prefs: AudioPrefs,
     pub transport: Transport,
     pub playhead: u64,
+    /// Pistes armées pendant la prise en cours (voir `arm_during_take`), et celles en
+    /// attente (un ajout à la fois).
+    late: Vec<LateTake>,
+    late_queue: Vec<u64>,
+    /// Noms de fichiers déjà pris dans le dossier Audio au début de la prise, et ceux de
+    /// la prise (minuscules) : une piste ajoutée en cours de prise n'en écrase aucun.
+    rec_names: HashSet<String>,
     /// Tête de lecture lissée (position, instant) : voir `update_playhead`.
     ph_smooth: Option<(f64, f64)>,
     pub player: Option<Player>,
@@ -1377,6 +1399,9 @@ impl App {
             prefs,
             transport: Transport::Stopped,
             playhead: 0,
+            late: Vec::new(),
+            late_queue: Vec::new(),
+            rec_names: HashSet::new(),
             ph_smooth: None,
             player: None,
             play_base: 0,
@@ -2080,7 +2105,11 @@ impl App {
                 .with_copy(copy),
             );
             conss.push((cons, peaks.clone()));
-            self.live.push(LiveTake { track_id, peaks });
+            self.live.push(LiveTake {
+                track_id,
+                peaks,
+                offset: 0,
+            });
         }
         // 2) La lecture des pistes existantes démarre AVANT la prise (son pré-remplissage,
         //    borné, peut prendre un peu de temps) ; le décalage réel entre les deux est
@@ -2194,6 +2223,9 @@ impl App {
                 channels: if stereo { 2 } else { 1 },
             });
         }
+        self.rec_names = existing.iter().chain(&used).map(|n| n.to_lowercase()).collect();
+        self.late.clear();
+        self.late_queue.clear();
         let journal = recovery::Journal {
             start: self.playhead,
             play_offset: 0,
@@ -2204,6 +2236,7 @@ impl App {
                 .map(|s| recovery::JournalTake {
                     track_id: s.track_id,
                     file: s.file.clone(),
+                    offset: 0,
                 })
                 .collect(),
             // Prises précédentes encore en attente (disque bloqué), et celles d'un journal
@@ -2540,6 +2573,14 @@ impl App {
                     }),
                 };
                 self.journal_pending = None;
+                // Pistes armées pendant la prise : leur départ est connu (le callback a
+                // traité l'ajout avant de rendre les cibles) ; elles finissent avec la prise.
+                self.poll_late();
+                self.late_queue.clear();
+                let late: Vec<(Recorder, u64)> = std::mem::take(&mut self.late)
+                    .into_iter()
+                    .map(|l| (l.recorder, l.offset.unwrap_or(l.est)))
+                    .collect();
                 match self.recorder.take() {
                     Some(rec) => {
                         take.backup_warn = rec
@@ -2554,7 +2595,7 @@ impl App {
                         let progress = rec.progress();
                         let (tx, rx) = std::sync::mpsc::channel();
                         std::thread::spawn(move || {
-                            let _ = tx.send(rec.finish());
+                            let _ = tx.send(merge_late(rec.finish(), late));
                         });
                         // Prise faite en écoutant : elle a commencé à cette position de lecture.
                         let offset = if std::mem::take(&mut self.rec_overdub) {
@@ -2572,12 +2613,185 @@ impl App {
                             slow_told: false,
                         });
                     }
-                    None => self.live_takes_to_clips(start, TakeOutcome::Lost, take),
+                    None => {
+                        for (r, _) in late {
+                            std::thread::spawn(move || {
+                                let _ = r.finish();
+                            });
+                        }
+                        self.live_takes_to_clips(start, TakeOutcome::Lost, take)
+                    }
                 }
             }
         }
         self.transport = Transport::Stopped;
         self.engine.shared.counting.store(false, Ordering::Relaxed);
+    }
+
+    /// Piste armée pendant la prise : elle est enregistrée à partir de maintenant, dans son
+    /// propre fichier (son propre thread d'écriture), à partir du même callback que les
+    /// autres ; sa position dans la prise est la trame exacte où le callback l'a prise en
+    /// charge. Notée tout de suite dans le journal de secours (position estimée, précisée
+    /// au bloc suivant) : rien n'est perdu même en cas de crash. Un ajout à la fois.
+    /// `false` si la piste n'a pas pu être ajoutée.
+    pub fn arm_during_take(&mut self, track_id: u64) -> bool {
+        if !self.is_recording() || self.recorder.is_none() {
+            return false;
+        }
+        if self.live.iter().any(|l| l.track_id == track_id) {
+            return true;
+        }
+        if self.late.iter().any(|l| l.offset.is_none()) {
+            if !self.late_queue.contains(&track_id) {
+                self.late_queue.push(track_id);
+            }
+            return true;
+        }
+        let base = self.in_base();
+        let in_ch = self.engine.status.in_channels;
+        let Some(t) = self.project.tracks.iter().find(|t| t.id == track_id) else {
+            return false;
+        };
+        let (name, stereo) = (t.name.clone(), t.stereo);
+        let input = match t.engine_input(base) {
+            Some(i) if t.input_fits(base, in_ch) => i,
+            _ => {
+                self.notify(format!("{name} : entrée absente"), true);
+                return false;
+            }
+        };
+        let sr = self.engine.status.sample_rate;
+        let width: u16 = if stereo { 2 } else { 1 };
+        let ring_secs = record_buffer_secs(sr, width as usize);
+        let (prod, cons) = rtrb::RingBuffer::new(sr as usize * ring_secs * width as usize);
+        let peaks: Peaks = Arc::new(RwLock::new(PeakData::default()));
+        let file = self
+            .project
+            .new_take_file_in(&name, &self.rec_names, &HashSet::new());
+        self.rec_names.insert(file.to_lowercase());
+        let spec = RecSpec {
+            track_id,
+            path: self.project.audio_dir().join(&file),
+            file: file.clone(),
+            peaks: peaks.clone(),
+            cons,
+            channels: width,
+        };
+        let recorder =
+            match Recorder::start_with_backup(vec![spec], sr, self.project.rec_format, None, None)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    self.notify(format!("Écriture disque impossible : {e}"), true);
+                    return false;
+                }
+            };
+        let target = if stereo {
+            RecTarget::stereo(input as usize, prod)
+        } else {
+            RecTarget::new(input as usize, prod)
+        };
+        let est = self.engine.shared.rec_frames.load(Ordering::Relaxed);
+        let seq = match self.engine.add_record(vec![target]) {
+            Ok(s) => s,
+            Err(e) => {
+                std::thread::spawn(move || {
+                    let _ = recorder.finish();
+                });
+                self.notify(format!("{e:#}"), true);
+                return false;
+            }
+        };
+        self.late.push(LateTake {
+            recorder,
+            track_id,
+            file: file.clone(),
+            seq,
+            offset: None,
+            est,
+        });
+        self.live.push(LiveTake {
+            track_id,
+            peaks,
+            offset: est,
+        });
+        self.journal_late_take(&file, track_id, Some(est));
+        self.incident(format!("« {name} » ajoutée à la prise"));
+        true
+    }
+
+    /// Ajouts en cours de prise : position exacte reçue du callback (ou ajout refusé), puis
+    /// ajout suivant en attente.
+    fn poll_late(&mut self) {
+        let sh = &self.engine.shared;
+        let seq_now = sh.rec_add_seq.load(Ordering::Acquire);
+        let at = sh.rec_add_at.load(Ordering::Relaxed);
+        let mut i = 0;
+        while i < self.late.len() {
+            let l = &mut self.late[i];
+            if l.offset.is_some() || l.seq > seq_now {
+                i += 1;
+                continue;
+            }
+            if at == u64::MAX {
+                let l = self.late.remove(i);
+                self.live.retain(|x| x.track_id != l.track_id);
+                self.journal_late_take(&l.file, l.track_id, None);
+                if let Some(t) = self.project.tracks.iter_mut().find(|t| t.id == l.track_id) {
+                    t.armed = false;
+                }
+                std::thread::spawn(move || {
+                    let _ = l.recorder.finish();
+                });
+                self.notify("Piste non ajoutée à la prise", true);
+                continue;
+            }
+            l.offset = Some(at);
+            let (tid, file) = (l.track_id, l.file.clone());
+            if let Some(x) = self.live.iter_mut().find(|x| x.track_id == tid) {
+                x.offset = at;
+            }
+            self.journal_late_take(&file, tid, Some(at));
+            i += 1;
+        }
+        if self.is_recording()
+            && !self.late.iter().any(|l| l.offset.is_none())
+            && !self.late_queue.is_empty()
+        {
+            let tid = self.late_queue.remove(0);
+            if !self.arm_during_take(tid)
+                && let Some(t) = self.project.tracks.iter_mut().find(|t| t.id == tid)
+            {
+                t.armed = false;
+            }
+        }
+    }
+
+    /// Journal de secours de la prise : piste ajoutée en cours de prise (avec sa position),
+    /// position précisée, ou retirée (`None`).
+    fn journal_late_take(&mut self, file: &str, track_id: u64, offset: Option<u64>) {
+        let upd = |j: &mut recovery::Journal| match offset {
+            Some(offset) => match j.takes.iter_mut().find(|t| t.file == file) {
+                Some(t) => t.offset = offset,
+                None => j.takes.push(recovery::JournalTake {
+                    track_id,
+                    file: file.to_string(),
+                    offset,
+                }),
+            },
+            None => j.takes.retain(|t| t.file != file),
+        };
+        if let Some(j) = &mut self.journal_pending {
+            upd(j);
+        }
+        let Some(j) = &mut self.rec_journal else {
+            return;
+        };
+        upd(j);
+        let j = j.clone();
+        if let Some(r) = &self.recorder {
+            r.update_journal(self.project.dir.clone(), j);
+        }
     }
 
     /// Prise faite en écoutant : dès qu'elle a commencé, le journal de secours reçoit le
@@ -2830,20 +3044,23 @@ impl App {
                 }
                 continue;
             }
-            if let Some(p) = live
+            if let Some((p, off)) = live
                 .iter()
                 .find(|l| l.track_id == track_id)
-                .map(|l| &l.peaks)
+                .map(|l| (&l.peaks, l.offset))
             {
+                // Forme d'onde en direct d'une piste armée pendant la prise : elle commence
+                // à sa position dans la prise, pas au début de la prise.
+                let seg_start = seg.start.saturating_sub(off);
                 let take_len = results
                     .iter()
                     .find(|r| r.track_id == track_id)
-                    .map_or(0, |r| r.frames());
+                    .map_or(0, |r| r.frames().saturating_sub(off));
                 let whole = results
                     .iter()
                     .find(|r| r.track_id == track_id)
                     .is_some_and(|r| r.segments.len() == 1)
-                    && seg.start == 0
+                    && seg_start == 0
                     && seg.frames == take_len;
                 let block = render::PEAK_BLOCK as u64;
                 if whole {
@@ -2851,12 +3068,12 @@ impl App {
                     // en cache en arrière-plan (pas de gel au Stop d'une longue prise).
                     render::store_peaks_later(path, p.clone());
                     self.peaks.insert(clip.id, p.clone());
-                } else if seg.start % block == 0 {
+                } else if seg_start % block == 0 {
                     // Fichier d'une prise longue, commençant sur un point de la forme
                     // d'onde en direct : sa part en est découpée, sans relire l'audio.
                     let pk: Peaks = Arc::new(RwLock::new(PeakData::default()));
-                    let a = (seg.start / block) as usize;
-                    let b = (seg.start + seg.frames).div_ceil(block) as usize;
+                    let a = (seg_start / block) as usize;
+                    let b = (seg_start + seg.frames).div_ceil(block) as usize;
                     render::slice_peaks_later(p.clone(), a, b, path, pk.clone());
                     self.peaks.insert(clip.id, pk);
                 } else {
@@ -3210,6 +3427,7 @@ impl App {
             self.rec_watch = (0, self.now);
             return;
         }
+        self.poll_late();
         let sh = &self.engine.shared;
         let frames = sh.rec_frames.load(Ordering::Relaxed);
         // Suivi ici aussi (et pas seulement dans l'affichage) : fonctionne fenêtre réduite.
@@ -8107,6 +8325,32 @@ fn natural_order(mut v: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
 /// Carte son d'un périphérique. ASIO : le pilote lui-même. Ailleurs (WASAPI…) : le nom
 /// entre parenthèses à la fin, comme Windows nomme ses périphériques (« DVS Receive 1-2
 /// (Dante Virtual Soundcard) », « Haut-parleurs (Realtek(R) Audio) »), sinon le nom.
+/// Fin de prise : les pistes armées pendant la prise rejoignent ses résultats, chacune
+/// décalée de sa position dans la prise. Une écriture en échec fait passer toute la prise
+/// par le journal de secours (qui connaît aussi ces pistes et leur position).
+fn merge_late(mut f: Finished, late: Vec<(Recorder, u64)>) -> Finished {
+    for (r, off) in late {
+        match r.finish().main {
+            Ok(v) => {
+                if let Ok(main) = &mut f.main {
+                    main.extend(v.into_iter().map(|mut rr| {
+                        for s in &mut rr.segments {
+                            s.start += off;
+                        }
+                        rr
+                    }));
+                }
+            }
+            Err(e) => {
+                if f.main.is_ok() {
+                    f.main = Err(e);
+                }
+            }
+        }
+    }
+    f
+}
+
 /// Un pas de la tête lissée (voir `App::update_playhead`) : `prev` = (position, instant)
 /// de l'image précédente, `raw` = position donnée par la carte.
 fn smooth_playhead(prev: Option<(f64, f64)>, raw: f64, now: f64, sr: f64) -> f64 {
@@ -8499,6 +8743,7 @@ mod take_tests {
                     .map(|f| recovery::JournalTake {
                         track_id: 1,
                         file: (*f).into(),
+                        offset: 0,
                     })
                     .collect(),
                 // Une prise bloquée plus ancienne portée par celle-ci : jamais dupliquée.
@@ -8810,6 +9055,55 @@ mod tests {
             ..ok
         };
         assert_eq!(resume_step(&blocked), ResumeStep::Blocked);
+    }
+
+    /// Piste armée pendant la prise : à l'arrêt, son fichier rejoint la prise, décalé de sa
+    /// position, et la latence est retirée comme pour les autres pistes.
+    #[test]
+    fn late_track_joins_take_at_its_offset() {
+        use crate::project::RecFormat;
+        use crate::recorder::{RecSpec, Recorder};
+        let dir = std::env::temp_dir().join(format!("tp-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let start_rec = |track_id: u64, file: &str, frames: usize| {
+            let (mut prod, cons) = rtrb::RingBuffer::new(frames + 16);
+            let rec = Recorder::start(
+                vec![RecSpec {
+                    track_id,
+                    file: file.into(),
+                    path: dir.join(file),
+                    peaks: Arc::new(RwLock::new(PeakData::default())),
+                    cons,
+                    channels: 1,
+                }],
+                48000,
+                RecFormat::default(),
+            )
+            .unwrap();
+            for _ in 0..frames {
+                prod.push(0.5).unwrap();
+            }
+            drop(prod);
+            rec
+        };
+        let main = start_rec(1, "Voix_001.wav", 9600);
+        let late = start_rec(2, "Guitare_001.wav", 2000);
+        let f = merge_late(main.finish(), vec![(late, 4800)]);
+        let results = f.main.expect("prise terminée");
+        let mut next = 100;
+        let layout = layout_take(&results, 1000, 100, &mut || {
+            next += 1;
+            next
+        });
+        let mut got: Vec<(u64, u64, u64)> = layout
+            .clips
+            .iter()
+            .map(|(t, c, _)| (*t, c.start, c.len))
+            .collect();
+        got.sort();
+        assert_eq!(got, [(1, 1000, 9500), (2, 1000 + 4800 - 100, 2000)]);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

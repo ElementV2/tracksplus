@@ -20,6 +20,13 @@ pub const JOURNAL: &str = ".recording.json";
 pub struct JournalTake {
     pub track_id: u64,
     pub file: String,
+    /// Piste armée pendant la prise : début de son fichier dans la prise (trames).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -370,7 +377,9 @@ pub fn apply_journal(
             .start
             .saturating_add(j.play_offset)
             .min(crate::project::MAX_POS);
-        let mut seg_start = 0u64;
+        // Piste armée pendant la prise : ses fichiers commencent plus loin dans la prise.
+        let late = take.offset.min(crate::project::MAX_POS);
+        let mut seg_start = late;
         for file in take_segments(&base, &names) {
             let path = project.audio_dir().join(&file);
             // Réparation de l'en-tête ; sur un support en lecture seule, on lit la durée
@@ -394,7 +403,7 @@ pub fn apply_journal(
                 .ok()
                 .and_then(|t| t.trim().parse::<u64>().ok())
             {
-                seg_start = s.min(crate::project::MAX_POS);
+                seg_start = late.saturating_add(s).min(crate::project::MAX_POS);
             }
             sidecars.push(side);
             if frames == 0 {
@@ -641,10 +650,12 @@ mod tests {
                     JournalTake {
                         track_id: t,
                         file: "Voix_001.wav".into(),
+                        offset: 0,
                     },
                     JournalTake {
                         track_id: 999,
                         file: "Absent.wav".into(),
+                        offset: 0,
                     },
                 ],
             },
@@ -691,6 +702,7 @@ mod tests {
                 takes: vec![JournalTake {
                     track_id: t,
                     file: "Voix_001.wav".into(),
+                    offset: 0,
                 }],
             },
         )
@@ -764,6 +776,7 @@ mod tests {
             takes: vec![JournalTake {
                 track_id: t,
                 file: "Voix_001.wav".into(),
+                offset: 0,
             }],
         };
         write_journal(&dir, &j).unwrap();
@@ -780,6 +793,77 @@ mod tests {
             c,
             [("Voix_001.wav", 0, 4800), ("Voix_001_p4.wav", 9000, 1000)]
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Piste armée pendant la prise, puis crash : sa prise est posée à sa position dans la
+    /// prise (latence retirée comme pour les autres), y compris un second fichier repris
+    /// après une erreur d'écriture.
+    #[test]
+    fn recover_track_armed_during_take_at_its_offset() {
+        let dir = std::env::temp_dir().join(format!("tp-recover-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Project::new("L".into(), dir.clone(), 48000);
+        p.ensure_dirs().unwrap();
+        let voix = p.add_track(Some("Voix".into()), Some(0));
+        let gtr = p.add_track(Some("Guitare".into()), Some(1));
+        p.save().unwrap();
+        write_wav(&p.audio_dir().join("Voix_001.wav"), 9600);
+        write_wav(&p.audio_dir().join("Guitare_001.wav"), 2000);
+        write_wav(&p.audio_dir().join("Guitare_001_p2.wav"), 500);
+        std::fs::write(
+            p.audio_dir()
+                .join(crate::recorder::start_sidecar("Guitare_001_p2.wav")),
+            "3000",
+        )
+        .unwrap();
+        let j = Journal {
+            start: 1000,
+            play_offset: 0,
+            latency: 100,
+            sample_rate: 48000,
+            extra: Vec::new(),
+            takes: vec![
+                JournalTake {
+                    track_id: voix,
+                    file: "Voix_001.wav".into(),
+                    offset: 0,
+                },
+                JournalTake {
+                    track_id: gtr,
+                    file: "Guitare_001.wav".into(),
+                    offset: 4800,
+                },
+            ],
+        };
+        write_journal(&dir, &j).unwrap();
+        let mut q = Project::load(&p.file_path()).unwrap();
+        let r = recover(&mut q).unwrap();
+        assert_eq!(r.takes, 3);
+        let clips = |t: u64| -> Vec<(String, u64, u64)> {
+            q.tracks
+                .iter()
+                .find(|x| x.id == t)
+                .unwrap()
+                .clips
+                .iter()
+                .map(|c| (c.file.clone(), c.start, c.len))
+                .collect()
+        };
+        assert_eq!(clips(voix), [("Voix_001.wav".to_string(), 1000, 9500)]);
+        assert_eq!(
+            clips(gtr),
+            [
+                ("Guitare_001.wav".to_string(), 1000 + 4800 - 100, 2000),
+                ("Guitare_001_p2.wav".to_string(), 1000 + 4800 + 3000 - 100, 500),
+            ]
+        );
+        // Ancien journal (sans position) : toujours lu, piste au début de la prise.
+        let old: Journal = serde_json::from_str(
+            r#"{"start":0,"sample_rate":48000,"takes":[{"track_id":1,"file":"a.wav"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.takes[0].offset, 0);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -811,6 +895,7 @@ mod tests {
         let take = |file: &str| JournalTake {
             track_id: t,
             file: file.into(),
+            offset: 0,
         };
         let old = Journal {
             start: 100,
@@ -878,6 +963,7 @@ mod tests {
             takes: vec![JournalTake {
                 track_id: t,
                 file: file.into(),
+                offset: 0,
             }],
             extra: Vec::new(),
         };
@@ -929,6 +1015,7 @@ mod tests {
             takes: vec![JournalTake {
                 track_id: t,
                 file: "Voix_001.wav".into(),
+                offset: 0,
             }],
         };
         write_journal(&dir, &j).unwrap();

@@ -526,6 +526,10 @@ pub struct Shared {
     pub meters: Vec<AtomicU32>,
     /// Trames enregistrées depuis le début de la prise.
     pub rec_frames: AtomicU64,
+    /// Ajouts de pistes en cours de prise traités par le callback (compteur), et trame de
+    /// la prise où le dernier a commencé (`u64::MAX` : refusé).
+    pub rec_add_seq: AtomicU64,
+    pub rec_add_at: AtomicU64,
     /// Trames jouées depuis le début de la lecture.
     pub out_frames: AtomicU64,
     /// Position de lecture (trames depuis son début) au moment où la prise a vraiment
@@ -607,6 +611,8 @@ impl Shared {
         Self {
             meters: (0..MAX_INPUTS).map(|_| AtomicU32::new(0)).collect(),
             rec_frames: AtomicU64::new(0),
+            rec_add_seq: AtomicU64::new(0),
+            rec_add_at: AtomicU64::new(0),
             out_frames: AtomicU64::new(0),
             rec_play_offset: AtomicU64::new(0),
             out_cb_frames: AtomicU64::new(0),
@@ -848,6 +854,9 @@ impl RecTarget {
 
 enum InCmd {
     Record(Vec<RecTarget>),
+    /// Pistes armées pendant la prise : ajoutées aux cibles en cours, à partir du bloc
+    /// suivant (trame notée dans `rec_add_at`).
+    Add(Vec<RecTarget>),
     Stop,
     /// Nouveau tampon de monitoring (la sortie qui le joue a été rouverte).
     Monitor(Producer<f32>),
@@ -858,6 +867,9 @@ enum InCmd {
 #[allow(dead_code)]
 enum InGarbage {
     Targets(Vec<RecTarget>),
+    /// Liste d'un ajout en cours de prise (vide, ou refusée) : jamais prise pour les
+    /// cibles rendues à l'arrêt.
+    Added(Vec<RecTarget>),
     Monitor(Producer<f32>),
 }
 
@@ -2080,11 +2092,14 @@ impl Engine {
         self.out_tx[SLOT_MAIN].is_some()
     }
 
-    pub fn start_record(&self, targets: Vec<RecTarget>) -> Result<()> {
+    pub fn start_record(&self, mut targets: Vec<RecTarget>) -> Result<()> {
         let tx = self
             .in_tx
             .as_ref()
             .ok_or_else(|| anyhow!("Aucune entrée audio"))?;
+        // Place pour les pistes armées pendant la prise : le callback les ajoute sans
+        // jamais allouer.
+        targets.reserve(MAX_INPUTS.saturating_sub(targets.len()));
         self.shared.rec_frames.store(0, Ordering::Relaxed);
         self.shared.rec_gap_frames.store(0, Ordering::Relaxed);
         self.shared.rec_gap_count.store(0, Ordering::Relaxed);
@@ -2101,6 +2116,20 @@ impl Engine {
         self.shared.counting.store(true, Ordering::Relaxed);
         tx.try_send(InCmd::Record(targets))
             .map_err(|_| anyhow!("Moteur audio occupé"))
+    }
+
+    /// Piste armée pendant la prise : ses cibles rejoignent la prise au bloc suivant.
+    /// Rend le numéro d'ajout à attendre dans `rec_add_seq` (la trame de départ est alors
+    /// dans `rec_add_at`).
+    pub fn add_record(&self, targets: Vec<RecTarget>) -> Result<u64> {
+        let tx = self
+            .in_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Aucune entrée audio"))?;
+        let seq = self.shared.rec_add_seq.load(Ordering::Acquire) + 1;
+        tx.try_send(InCmd::Add(targets))
+            .map_err(|_| anyhow!("Moteur audio occupé"))?;
+        Ok(seq)
     }
 
     /// Demande l'arrêt de l'enregistrement et attend que le callback rende les cibles
@@ -2125,7 +2154,7 @@ impl Engine {
                 // Liste vide = celle remplacée au démarrage ; on attend celle de la prise.
                 Ok(InGarbage::Targets(v)) if v.is_empty() => continue,
                 Ok(InGarbage::Targets(_)) => return true,
-                Ok(InGarbage::Monitor(_)) => continue,
+                Ok(InGarbage::Added(_) | InGarbage::Monitor(_)) => continue,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     if std::time::Instant::now() > deadline {
@@ -2449,6 +2478,25 @@ impl InState {
                     let old = std::mem::replace(&mut st.targets, t);
                     st.dispose(old);
                     st.halted = false;
+                }
+                InCmd::Add(mut t) => {
+                    // Seulement pendant une prise, et dans la place réservée au départ :
+                    // aucune allocation ici. Les cibles commencent avec ce bloc.
+                    let fits = !st.targets.is_empty()
+                        && st.targets.len() + t.len() <= st.targets.capacity();
+                    let at = if fits {
+                        changed = true;
+                        let at = st.shared.rec_frames.load(Ordering::Relaxed);
+                        st.targets.append(&mut t);
+                        at
+                    } else {
+                        u64::MAX
+                    };
+                    st.shared.rec_add_at.store(at, Ordering::Relaxed);
+                    st.shared.rec_add_seq.fetch_add(1, Ordering::Release);
+                    if let Err(e) = st.garbage.try_send(InGarbage::Added(t)) {
+                        std::mem::forget(e.into_inner());
+                    }
                 }
                 InCmd::Stop => {
                     changed = true;
@@ -3668,6 +3716,79 @@ mod tests {
         assert!(got[..7 * 480].iter().all(|&x| x == 0.5));
         assert!(got[7 * 480..7 * 480 + 24000].iter().all(|&x| x == 0.0));
         assert!(got[7 * 480 + 24000..].iter().all(|&x| x == 0.5));
+    }
+
+    /// Piste armée pendant la prise : ses cibles commencent au bloc où le callback les
+    /// prend, à une trame notée exactement ; sans place réservée (ou hors prise), l'ajout
+    /// est refusé sans allouer.
+    #[test]
+    fn track_armed_during_take_starts_at_exact_frame() {
+        let shared = Arc::new(Shared::new());
+        let (tx, rx) = bounded::<InCmd>(4);
+        let (gtx, grx) = bounded::<InGarbage>(16);
+        let mut st = InState {
+            channels: 2,
+            rx,
+            targets: Vec::new(),
+            garbage: gtx,
+            shared: shared.clone(),
+            monitor: None,
+            sample_rate: 48000,
+            last_capture: None,
+            mon_env: 0.0,
+            mon_release: mon_release(48000),
+            faulted: false,
+            halted: false,
+        };
+        // Hors prise : refusé.
+        let (p0, _c0) = rtrb::RingBuffer::new(4800);
+        tx.send(InCmd::Add(vec![RecTarget::new(1, p0)])).unwrap();
+        let data: Vec<f32> = (0..480).flat_map(|_| [0.25f32, 0.75]).collect();
+        st.process(&data);
+        assert_eq!(shared.rec_add_seq.load(Ordering::Acquire), 1);
+        assert_eq!(shared.rec_add_at.load(Ordering::Relaxed), u64::MAX);
+        // Prise avec de la place pour un ajout.
+        let (pa, mut ca) = rtrb::RingBuffer::new(48000);
+        let mut t = Vec::with_capacity(4);
+        t.push(RecTarget::new(0, pa));
+        tx.send(InCmd::Record(t)).unwrap();
+        for _ in 0..3 {
+            st.process(&data);
+        }
+        let (pb, mut cb) = rtrb::RingBuffer::new(48000);
+        tx.send(InCmd::Add(vec![RecTarget::new(1, pb)])).unwrap();
+        for _ in 0..2 {
+            st.process(&data);
+        }
+        assert_eq!(shared.rec_add_seq.load(Ordering::Acquire), 2);
+        assert_eq!(shared.rec_add_at.load(Ordering::Relaxed), 3 * 480);
+        let drain = |c: &mut rtrb::Consumer<f32>| {
+            let mut v = Vec::new();
+            while let Ok(x) = c.pop() {
+                v.push(x);
+            }
+            v
+        };
+        let a = drain(&mut ca);
+        let b = drain(&mut cb);
+        assert_eq!(a.len(), 5 * 480);
+        assert!(a.iter().all(|&x| x == 0.25));
+        assert_eq!(b.len(), 2 * 480);
+        assert!(b.iter().all(|&x| x == 0.75));
+        // Plus de place : refusé, la prise continue.
+        let full: Vec<RecTarget> = (0..4)
+            .map(|_| RecTarget::new(1, rtrb::RingBuffer::new(16).0))
+            .collect();
+        tx.send(InCmd::Add(full)).unwrap();
+        st.process(&data);
+        assert_eq!(shared.rec_add_at.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(drain(&mut ca).len(), 480);
+        // Les listes d'ajout sont rendues à part : jamais prises pour la fin de la prise.
+        let added = grx
+            .try_iter()
+            .filter(|g| matches!(g, InGarbage::Added(_)))
+            .count();
+        assert_eq!(added, 3);
     }
 
     /// Trou de l'entrée plus long que la place libre des tampons : rien n'est inséré, la
