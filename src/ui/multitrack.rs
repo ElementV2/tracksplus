@@ -1546,16 +1546,6 @@ impl App {
                 );
                 w::hline(&p, row.left(), row.right(), row.bottom() - 1.0, t::LINE);
                 w::vline(&p, header.right() - 1.0, row.top(), row.bottom(), t::LINE);
-                if let Some(d) = &self.clip_drag
-                    && d.target == Some(idx)
-                {
-                    p.rect_stroke(
-                        lane.shrink(1.0),
-                        0.0,
-                        Stroke::new(1.0, t::ACCENT.gamma_multiply(0.6)),
-                        StrokeKind::Inside,
-                    );
-                }
 
                 let hresp =
                     ui.interact(header, ui.make_persistent_id(("hdr", tid)), Sense::click());
@@ -2010,7 +2000,21 @@ impl App {
                 let track = &self.project.tracks[idx];
                 let mut hovered_clip: Option<(Clip, DragMode)> = None;
                 let mut pressed_clip: Option<(Clip, DragMode)> = None;
+                // Prise glissée vers une autre piste : dessinée en direct sur la piste visée
+                // (à sa place, à sa couleur), plus sur la sienne.
+                let moved = self
+                    .clip_drag
+                    .as_ref()
+                    .filter(|d| d.mode == DragMode::Move && d.origs.len() == 1)
+                    .and_then(|d| {
+                        let to = d.target?;
+                        let from = d.origs[0].0;
+                        (self.project.tracks.get(to)?.id != from).then_some((d.main, to))
+                    });
                 for c in &track.clips {
+                    if moved.is_some_and(|(id, _)| id == c.id) {
+                        continue;
+                    }
                     let x0 = self.x_of(lane.left(), c.start);
                     let x1 = self.x_of(lane.left(), c.end());
                     if x1 < lane.left() || x0 > lane.right() {
@@ -2072,6 +2076,30 @@ impl App {
                     if let Some(h) = press_origin.and_then(hit) {
                         pressed_clip = Some(h);
                     }
+                }
+                if let Some((id, to)) = moved
+                    && to == idx
+                    && let Some((_, c)) = self.project.find_clip(id)
+                {
+                    let x0 = self.x_of(lane.left(), c.start);
+                    let x1 = self.x_of(lane.left(), c.end());
+                    let crect = Rect::from_min_max(
+                        pos2(x0, inner.top()),
+                        pos2(x1.max(x0 + 2.0), inner.bottom()),
+                    );
+                    draw_clip(
+                        &lp,
+                        crect,
+                        lane,
+                        ccol,
+                        self.peaks.get(&c.id),
+                        c.offset,
+                        self.view.spp,
+                        Some(&c.file),
+                        true,
+                        (c.fade_in, c.fade_out),
+                        false,
+                    );
                 }
                 // Prise en cours, ou en finalisation (fichiers en train d'être fermés) : elle
                 // reste affichée jusqu'à son intégration à la session.
