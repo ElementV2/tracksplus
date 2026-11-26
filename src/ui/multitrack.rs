@@ -1404,7 +1404,7 @@ impl App {
         );
         let mut child = ui.new_child(UiBuilder::new().max_rect(body));
         let track_h = self.view.track_h;
-        let mut to_delete = None;
+        let mut to_delete: Option<Vec<u64>> = None;
         let mut clip_to_delete = None;
         let mut audible_changed = false;
         let stopped = self.is_stopped();
@@ -1605,11 +1605,20 @@ impl App {
                             .collect();
                         ui.close();
                     }
-                    if ui
-                        .add_enabled(stopped, egui::Button::new("Supprimer la piste"))
-                        .clicked()
-                    {
-                        to_delete = Some(idx);
+                    // Clic droit sur une piste d'une sélection de plusieurs : toutes supprimées.
+                    let group = self.selected_tracks.len() > 1
+                        && self.selected_tracks.contains(&tid);
+                    let label = if group {
+                        format!("Supprimer les {} pistes", self.selected_tracks.len())
+                    } else {
+                        "Supprimer la piste".to_string()
+                    };
+                    if ui.add_enabled(stopped, egui::Button::new(label)).clicked() {
+                        to_delete = Some(if group {
+                            self.selected_tracks.iter().copied().collect()
+                        } else {
+                            vec![tid]
+                        });
                         ui.close();
                     }
                 });
@@ -2462,11 +2471,13 @@ impl App {
             self.project.dirty = true;
             self.update_audible();
         }
-        if let Some(i) = to_delete {
+        if let Some(ids) = to_delete {
             self.checkpoint();
-            let id = self.project.tracks[i].id;
-            self.selected_tracks.remove(&id);
-            self.project.tracks.remove(i);
+            for id in &ids {
+                self.selected_tracks.remove(id);
+                self.expanded_tracks.remove(id);
+            }
+            self.project.tracks.retain(|t| !ids.contains(&t.id));
             self.edited();
         }
         if let Some(tid) = late_arm

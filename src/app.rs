@@ -4570,8 +4570,9 @@ impl App {
         }
     }
 
-    /// Coupe à la tête de lecture : les prises sélectionnées, sinon celles des pistes
-    /// sélectionnées, sinon toutes celles sous la tête.
+    /// Coupe à la tête de lecture : les prises sélectionnées, sinon toutes celles sous la
+    /// tête (la piste sélectionnée à gauche ne compte pas : aucune prise sélectionnée, c'est
+    /// tout le monde).
     pub fn split_at_playhead(&mut self) {
         if self.editing_locked() {
             return;
@@ -4581,9 +4582,6 @@ impl App {
         let pairs = if !self.sel_clips.is_empty() {
             let sel = self.sel_clips.clone();
             self.project.split_at(pos, None, Some(&sel))
-        } else if !self.selected_tracks.is_empty() {
-            let tr = self.selected_tracks.clone();
-            self.project.split_at(pos, Some(&tr), None)
         } else {
             self.project.split_at(pos, None, None)
         };
