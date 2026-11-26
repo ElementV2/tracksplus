@@ -121,6 +121,20 @@ impl App {
         );
         let mut pui = ui.new_child(egui::UiBuilder::new().max_rect(panel));
         Self::welcome_body(&mut pui, panel, &mut wl, &mut action);
+        // Mise à jour disponible : la même pastille que dans la barre du haut, en bas de la
+        // colonne de gauche (visible sans ouvrir de session).
+        if self.update_offered() {
+            let r = Rect::from_min_size(
+                pos2(panel.left() + 24.0, panel.bottom() - 48.0),
+                vec2(242.0, 24.0),
+            );
+            let mut uui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(r)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            self.update_pill(&mut uui);
+        }
         self.welcome_action(wl, action);
     }
 
