@@ -1088,6 +1088,8 @@ pub struct App {
     pub prefs: AudioPrefs,
     pub transport: Transport,
     pub playhead: u64,
+    /// Tête de lecture lissée (position, instant) : voir `update_playhead`.
+    ph_smooth: Option<(f64, f64)>,
     pub player: Option<Player>,
     /// Position de la timeline entendue à la trame `play_skew` du moteur (début de la
     /// lecture, ou bascule sur un nouveau rendu), et boucle de ce rendu (`heard_at`).
@@ -1375,6 +1377,7 @@ impl App {
             prefs,
             transport: Transport::Stopped,
             playhead: 0,
+            ph_smooth: None,
             player: None,
             play_base: 0,
             play_skew: 0,
@@ -4029,17 +4032,27 @@ impl App {
         alerts
     }
 
+    /// La carte ne donne sa position qu'à chaque bloc (1024 échantillons = 21 ms) : lue
+    /// telle quelle, la tête avance par à-coups (une image sur deux sans bouger, puis un
+    /// double pas) et le suivi de lecture saccade. Comme dans les stations pro, la tête
+    /// avance à la vitesse de l'horloge et se recale en douceur sur la carte : jamais en
+    /// arrière, jamais loin devant ; un vrai saut (clic sur la règle, boucle) est suivi
+    /// aussitôt.
     fn update_playhead(&mut self) {
         let sh = &self.engine.shared;
-        match self.transport {
-            Transport::Playing { .. } => {
-                self.playhead = self.heard_at(sh.out_frames.load(Ordering::Relaxed))
+        let raw = match self.transport {
+            Transport::Playing { .. } => self.heard_at(sh.out_frames.load(Ordering::Relaxed)),
+            Transport::Recording { start } => start + sh.rec_frames.load(Ordering::Relaxed),
+            Transport::Stopped => {
+                self.ph_smooth = None;
+                return;
             }
-            Transport::Recording { start } => {
-                self.playhead = start + sh.rec_frames.load(Ordering::Relaxed)
-            }
-            Transport::Stopped => {}
-        }
+        };
+        let sr = self.sr() as f64;
+        let now = self.now;
+        let p = smooth_playhead(self.ph_smooth, raw as f64, now, sr);
+        self.ph_smooth = Some((p, now));
+        self.playhead = p.max(0.0) as u64;
     }
 
     /// Fait défiler verticalement si aucune piste en cours d'enregistrement n'est visible.
@@ -8094,6 +8107,22 @@ fn natural_order(mut v: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
 /// Carte son d'un périphérique. ASIO : le pilote lui-même. Ailleurs (WASAPI…) : le nom
 /// entre parenthèses à la fin, comme Windows nomme ses périphériques (« DVS Receive 1-2
 /// (Dante Virtual Soundcard) », « Haut-parleurs (Realtek(R) Audio) »), sinon le nom.
+/// Un pas de la tête lissée (voir `App::update_playhead`) : `prev` = (position, instant)
+/// de l'image précédente, `raw` = position donnée par la carte.
+fn smooth_playhead(prev: Option<(f64, f64)>, raw: f64, now: f64, sr: f64) -> f64 {
+    let Some((pos, at)) = prev else {
+        return raw;
+    };
+    let dt = (now - at).clamp(0.0, 0.1);
+    let p = pos + dt * sr;
+    let err = raw - p;
+    if err.abs() > sr * 0.25 {
+        return raw;
+    }
+    // Recalage en ~150 ms ; au plus 50 ms d'avance sur la carte ; jamais de recul.
+    (p + err * (dt * 6.0).min(1.0)).min(raw + sr * 0.05).max(pos)
+}
+
 fn card_of(device: &str, asio: bool) -> String {
     let name = device.trim();
     if asio || !name.ends_with(')') {
@@ -8781,6 +8810,29 @@ mod tests {
             ..ok
         };
         assert_eq!(resume_step(&blocked), ResumeStep::Blocked);
+    }
+
+    #[test]
+    fn playhead_moves_evenly_between_card_blocks() {
+        // Carte : position par blocs de 1024 à 48 kHz ; écran : 60 images/s.
+        let (sr, block) = (48_000.0, 1024.0);
+        let mut prev = None;
+        let mut out = Vec::new();
+        for i in 0..240 {
+            let now = i as f64 / 60.0;
+            let raw = ((now * sr) / block).floor() * block;
+            let p = smooth_playhead(prev, raw, now, sr);
+            prev = Some((p, now));
+            out.push(p);
+        }
+        let steps: Vec<f64> = out.windows(2).skip(60).map(|w| w[1] - w[0]).collect();
+        let ideal = sr / 60.0;
+        // Jamais en arrière, et chaque pas proche de l'idéal (la carte seule donne 0 ou 2048).
+        assert!(steps.iter().all(|&d| d >= 0.0));
+        assert!(steps.iter().all(|&d| (d - ideal).abs() < ideal * 0.35), "{steps:?}");
+        // Un saut (clic sur la règle) est suivi aussitôt.
+        let p = smooth_playhead(prev, 10.0 * sr, 4.0, sr);
+        assert_eq!(p, 10.0 * sr);
     }
 
     /// Chien de garde : flux muet signalé après `STREAM_STALL` (l'entrée en prise après
