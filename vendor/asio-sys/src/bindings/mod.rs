@@ -992,19 +992,40 @@ impl DriverState {
     }
 
     fn destroy(&mut self) -> Result<(), AsioError> {
+        // TracksPlus : le pilote est toujours relâché jusqu'au bout (ASIOExit puis
+        // removeCurrentDriver), même si l'arrêt ou la libération des tampons échoue
+        // (carte débranchée, Dante Virtual Soundcard sans horloge) : sinon il resterait
+        // chargé et son application verrouillée. La première erreur est rendue ensuite.
+        let mut first: Option<AsioError> = None;
         if let DriverState::Running = *self {
-            self.stop()?;
+            if let Err(e) = self.stop() {
+                first.get_or_insert(e);
+            }
         }
-        if let DriverState::Prepared = *self {
-            self.dispose_buffers()?;
+        match *self {
+            DriverState::Prepared => {
+                if let Err(e) = self.dispose_buffers() {
+                    first.get_or_insert(e);
+                }
+            }
+            // Arrêt refusé : tampons libérés quand même.
+            DriverState::Running => unsafe {
+                let _ = asio_result!(ai::ASIODisposeBuffers());
+            },
+            _ => {}
         }
         unsafe {
-            // TracksPlus : le pilote est relâché même si ASIOExit signale une erreur.
             let exit = asio_result!(ai::ASIOExit());
             ai::remove_current_driver();
-            exit?;
+            if let Err(e) = exit {
+                first.get_or_insert(e);
+            }
         }
-        Ok(())
+        *self = DriverState::Initialized;
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 

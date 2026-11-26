@@ -47,11 +47,27 @@ fn single_instance() -> Option<std::fs::File> {
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(std::fs::TryLockError::WouldBlock) => {
+            // Session passée (double-clic sur un .tracksplus) : confiée à la fenêtre déjà
+            // lancée, qui l'ouvre (voir `App::poll_open_request`).
+            let session = std::env::args_os()
+                .skip(1)
+                .map(std::path::PathBuf::from)
+                .find(|p| {
+                    p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case(project::PROJECT_EXT))
+                });
+            let sent = session.is_some_and(|p| {
+                std::fs::write(dir.join(app::OPEN_REQUEST), p.to_string_lossy().as_bytes())
+                    .is_ok()
+            });
+            let text = if sent {
+                "TracksPlus est déjà ouvert.\n\nLa session va s'y ouvrir."
+            } else {
+                "TracksPlus est déjà ouvert.\n\nLa fenêtre déjà lancée va être affichée."
+            };
             rfd::MessageDialog::new()
                 .set_title("TracksPlus")
-                .set_description(
-                    "TracksPlus est déjà ouvert.\n\nLa fenêtre déjà lancée va être affichée.",
-                )
+                .set_description(text)
                 .set_level(rfd::MessageLevel::Info)
                 .set_buttons(rfd::MessageButtons::Ok)
                 .show();

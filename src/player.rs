@@ -138,6 +138,36 @@ struct Mixer {
     errors: crossbeam_channel::Sender<String>,
 }
 
+/// Fondus aux bords d'une boucle (trames) : le son ne saute jamais d'un coup de la fin au
+/// début (plage coupée au milieu d'une note), donc aucun clic à chaque tour.
+const LOOP_EDGE: u64 = 128;
+
+/// Fondu de sortie avant la fin de la boucle et d'entrée après son début, sur `buf`
+/// (stéréo entrelacé) qui commence à la position `start`. Boucles trop courtes : rien.
+fn loop_edges(buf: &mut [f32], start: u64, a: u64, b: u64) {
+    if b <= a || b - a < 4 * LOOP_EDGE {
+        return;
+    }
+    for (j, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let p = start + j as u64;
+        let ga = if p < a + LOOP_EDGE {
+            (p.saturating_sub(a) + 1) as f32 / (LOOP_EDGE + 1) as f32
+        } else {
+            1.0
+        };
+        let gb = if p + LOOP_EDGE >= b {
+            b.saturating_sub(p) as f32 / (LOOP_EDGE + 1) as f32
+        } else {
+            1.0
+        };
+        let g = ga.min(gb);
+        if g < 1.0 {
+            f[0] *= g;
+            f[1] *= g;
+        }
+    }
+}
+
 impl Mixer {
     /// Rend un bloc stéréo entrelacé dans le producteur (en plusieurs morceaux s'il
     /// traverse la fin de la boucle : la suite repart du début, à l'échantillon près).
@@ -155,7 +185,11 @@ impl Mixer {
                 }
                 n = n.min((b - self.pos) as usize);
             }
+            let start = self.pos;
             self.render_part(done, n);
+            if let Some((a, b)) = self.lp {
+                loop_edges(&mut self.mix[done * 2..(done + n) * 2], start, a, b);
+            }
             self.pos += n as u64;
             done += n;
         }
@@ -347,6 +381,30 @@ mod tests {
         );
         // Piste inconnue : rien, sans panique.
         assert_eq!(m.peak(7, 1000, 2000), None);
+    }
+
+    /// Bords de boucle : fondu de sortie avant la fin, d'entrée après le début.
+    #[test]
+    fn loop_edges_fade_out_then_in() {
+        let (a, b) = (1000u64, 3000u64);
+        // Fin de boucle : 256 trames avant b, niveau qui descend jusqu'à presque 0.
+        let mut end = vec![1.0f32; 256 * 2];
+        loop_edges(&mut end, b - 256, a, b);
+        assert_eq!(end[0], 1.0);
+        assert!(end[255 * 2] < 0.01 && end[255 * 2] > 0.0);
+        assert!(end.windows(2).step_by(2).all(|w| w[1] <= w[0] + 1e-6));
+        // Début de boucle : remonte depuis presque 0.
+        let mut head = vec![1.0f32; 256 * 2];
+        loop_edges(&mut head, a, a, b);
+        assert!(head[0] < 0.01);
+        assert_eq!(head[255 * 2], 1.0);
+        // Milieu de boucle, et boucle trop courte : intact.
+        let mut mid = vec![1.0f32; 64];
+        loop_edges(&mut mid, 2000, a, b);
+        assert!(mid.iter().all(|&x| x == 1.0));
+        let mut short = vec![1.0f32; 64];
+        loop_edges(&mut short, 1000, 1000, 1100);
+        assert!(short.iter().all(|&x| x == 1.0));
     }
 
     /// Boucle : arrivé à la fin de la plage, le rendu reprend au début, à l'échantillon

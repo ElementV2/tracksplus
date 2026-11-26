@@ -408,10 +408,13 @@ fn add_unlisted_asio(
         seen.push(entry);
     }
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-    let note = |known: bool| match (in_use, known) {
+    let note = |known: bool, name: &str| match (in_use, known) {
         (Some(cur), true) => format!("disponible · ferme « {cur} »"),
         (Some(cur), false) => format!("non vérifié · ferme « {cur} »"),
-        (None, _) => "ne répond pas · DVS en mode ASIO ?".to_string(),
+        (None, _) if name.to_lowercase().contains("dante") => {
+            "ne répond pas · DVS en mode ASIO ?".to_string()
+        }
+        (None, _) => "ne répond pas".to_string(),
     };
     for name in registered {
         if listed.iter().any(|l| same(l, name)) {
@@ -428,18 +431,47 @@ fn add_unlisted_asio(
             buffer: None,
             note: None,
         };
-        let note = note(known.is_some());
+        // Le pilote en service n'a pas pu être interrogé (un seul à la fois) mais il
+        // tourne : aucune note.
+        let open = in_use.is_some_and(|c| same(c, name));
+        let note = (!open).then(|| note(known.is_some(), name));
         let (i, o) = match known {
             Some((i, o)) => (i.clone(), o.clone()),
             None => (Some(blank()), Some(blank())),
         };
         for (list, d) in [(&mut *ins, i), (&mut *outs, o)] {
             if let Some(mut d) = d {
-                d.note = Some(note.clone());
+                d.note = note.clone();
                 list.push(d);
             }
         }
     }
+}
+
+/// Pilote ASIO ouvert par le moteur : ses canaux et sa fréquence sont retenus, pour le
+/// montrer dans les réglages même quand il ne peut pas être interrogé (il est en service)
+/// et qu'il n'a jamais été listé (lancement). Ne remplace pas ce qui a été vraiment lu.
+fn remember_asio(name: &str, ins: u16, outs: u16, rate: u32) {
+    let mut seen = ASIO_SEEN.lock();
+    let known = seen.iter().any(|e| {
+        e.0.as_ref()
+            .or(e.1.as_ref())
+            .is_some_and(|d| d.name.eq_ignore_ascii_case(name))
+    });
+    if known {
+        return;
+    }
+    let info = |channels: u16| {
+        (channels > 0).then(|| DeviceInfo {
+            name: name.to_string(),
+            channels,
+            rates: vec![rate],
+            default_rate: Some(rate),
+            buffer: None,
+            note: None,
+        })
+    };
+    seen.push((info(ins), info(outs)));
 }
 
 /// Pilotes ASIO déclarés dans Windows (`HKLM\SOFTWARE\ASIO`), dans l'ordre du registre,
@@ -448,8 +480,8 @@ fn add_unlisted_asio(
 #[cfg(all(windows, feature = "asio"))]
 fn asio_driver_names() -> Vec<String> {
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW,
-        RegGetValueW, RegOpenKeyExW,
+        HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_EXPAND_SZ,
+        RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
     };
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
     // Valeur texte `value` de la sous-clé `sub` (terminée par un zéro).
@@ -463,7 +495,7 @@ fn asio_driver_names() -> Vec<String> {
                 key,
                 sub.as_ptr(),
                 value.as_ptr(),
-                RRF_RT_REG_SZ,
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
                 std::ptr::null_mut(),
                 buf.as_mut_ptr().cast(),
                 &mut bytes,
@@ -505,14 +537,39 @@ fn asio_driver_names() -> Vec<String> {
         }
         let sub_name = String::from_utf16_lossy(&buf[..len as usize]);
         let sub = wide(&sub_name);
-        if read(key, &sub, "CLSID").is_none() {
+        // Comme le SDK : pilote retenu seulement si sa DLL est déclarée (désinstallé sinon).
+        let Some(clsid) = read(key, &sub, "CLSID") else {
+            continue;
+        };
+        let server = wide(&format!(r"CLSID\{clsid}\InprocServer32"));
+        if read(HKEY_CLASSES_ROOT, &server, "").is_none() {
             continue;
         }
-        names.push(read(key, &sub, "Description").unwrap_or(sub_name));
+        let name = read(key, &sub, "Description").unwrap_or(sub_name);
+        names.push(sdk_driver_name(&name));
     }
     // SAFETY : clé ouverte ci-dessus.
     unsafe { RegCloseKey(key) };
     names
+}
+
+/// Nom d'un pilote tel que le SDK ASIO (donc cpal) le donne : lu en ANSI (lettres
+/// accentuées rendues par « � »), et coupé à 28 caractères suivis de « ... » au-delà de
+/// 31. Sinon un pilote au nom long ou accentué apparaîtrait deux fois, et le choisir sous
+/// son nom complet ne l'ouvrirait jamais.
+#[cfg_attr(not(all(windows, feature = "asio")), allow(dead_code))]
+fn sdk_driver_name(name: &str) -> String {
+    let chars: Vec<char> = name
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '\u{FFFD}' })
+        .collect();
+    if chars.len() < 32 {
+        chars.into_iter().collect()
+    } else {
+        let mut s: String = chars[..28].iter().collect();
+        s.push_str("...");
+        s
+    }
 }
 
 #[cfg(not(all(windows, feature = "asio")))]
@@ -530,6 +587,10 @@ pub struct Shared {
     /// la prise où le dernier a commencé (`u64::MAX` : refusé).
     pub rec_add_seq: AtomicU64,
     pub rec_add_at: AtomicU64,
+    /// Trame de la dernière bascule de lecture réellement faite par le moteur (mute, solo,
+    /// fader, boucle) : l'interface n'en demande pas d'autre avant, et ne libère l'ancien
+    /// rendu qu'après. `u64::MAX` : aucune.
+    pub switch_done: AtomicU64,
     /// Trames jouées depuis le début de la lecture.
     pub out_frames: AtomicU64,
     /// Position de lecture (trames depuis son début) au moment où la prise a vraiment
@@ -612,6 +673,7 @@ impl Shared {
             meters: (0..MAX_INPUTS).map(|_| AtomicU32::new(0)).collect(),
             rec_frames: AtomicU64::new(0),
             rec_add_seq: AtomicU64::new(0),
+            switch_done: AtomicU64::new(u64::MAX),
             rec_add_at: AtomicU64::new(0),
             out_frames: AtomicU64::new(0),
             rec_play_offset: AtomicU64::new(0),
@@ -855,8 +917,8 @@ impl RecTarget {
 enum InCmd {
     Record(Vec<RecTarget>),
     /// Pistes armées pendant la prise : ajoutées aux cibles en cours, à partir du bloc
-    /// suivant (trame notée dans `rec_add_at`).
-    Add(Vec<RecTarget>),
+    /// suivant (trame notée dans `rec_add_at`, numéro d'ajout publié dans `rec_add_seq`).
+    Add(u64, Vec<RecTarget>),
     Stop,
     /// Nouveau tampon de monitoring (la sortie qui le joue a été rouverte).
     Monitor(Producer<f32>),
@@ -1857,6 +1919,13 @@ impl Engine {
             self.out_tx[s] = None;
             self.streams[s] = None;
         }
+        // Pilote relâché pour libérer son application : sa DLL quitte aussi le processus
+        // (seulement ici, jamais à chaque énumération des pilotes).
+        #[cfg(windows)]
+        // SAFETY : appel COM sans argument, sur le thread qui a chargé les pilotes.
+        unsafe {
+            windows_sys::Win32::System::Com::CoFreeUnusedLibrariesEx(0, 0);
+        }
         self.refresh_status();
     }
 
@@ -2076,6 +2145,12 @@ impl Engine {
         };
         st.monitor_output = name(SLOT_MON);
         st.monitor_ok = self.opened[self.plan.mon_on].is_some();
+        if st.host == "ASIO"
+            && let (Some(i), Some(o)) = (&st.input, &st.output)
+            && i == o
+        {
+            remember_asio(i, st.in_channels, st.out_channels, st.sample_rate);
+        }
         let mut errs: Vec<String> =
             merge_slots(self.failed.iter().flatten().map(|f| f.0.clone()).collect());
         if self.pads_folded() {
@@ -2121,15 +2196,13 @@ impl Engine {
     /// Piste armée pendant la prise : ses cibles rejoignent la prise au bloc suivant.
     /// Rend le numéro d'ajout à attendre dans `rec_add_seq` (la trame de départ est alors
     /// dans `rec_add_at`).
-    pub fn add_record(&self, targets: Vec<RecTarget>) -> Result<u64> {
+    pub fn add_record(&self, id: u64, targets: Vec<RecTarget>) -> Result<()> {
         let tx = self
             .in_tx
             .as_ref()
             .ok_or_else(|| anyhow!("Aucune entrée audio"))?;
-        let seq = self.shared.rec_add_seq.load(Ordering::Acquire) + 1;
-        tx.try_send(InCmd::Add(targets))
-            .map_err(|_| anyhow!("Moteur audio occupé"))?;
-        Ok(seq)
+        tx.try_send(InCmd::Add(id, targets))
+            .map_err(|_| anyhow!("Moteur audio occupé"))
     }
 
     /// Demande l'arrêt de l'enregistrement et attend que le callback rende les cibles
@@ -2479,13 +2552,14 @@ impl InState {
                     st.dispose(old);
                     st.halted = false;
                 }
-                InCmd::Add(mut t) => {
+                InCmd::Add(id, mut t) => {
                     // Seulement pendant une prise, et dans la place réservée au départ :
-                    // aucune allocation ici. Les cibles commencent avec ce bloc.
+                    // aucune allocation ici. Les cibles commencent avec ce bloc. Ce n'est
+                    // pas une nouvelle prise (`changed` reste faux) : un trou de l'entrée
+                    // dans ce bloc est comblé comme d'habitude, nouvelle piste comprise.
                     let fits = !st.targets.is_empty()
                         && st.targets.len() + t.len() <= st.targets.capacity();
                     let at = if fits {
-                        changed = true;
                         let at = st.shared.rec_frames.load(Ordering::Relaxed);
                         st.targets.append(&mut t);
                         at
@@ -2493,7 +2567,7 @@ impl InState {
                         u64::MAX
                     };
                     st.shared.rec_add_at.store(at, Ordering::Relaxed);
-                    st.shared.rec_add_seq.fetch_add(1, Ordering::Release);
+                    st.shared.rec_add_seq.store(id, Ordering::Release);
                     if let Err(e) = st.garbage.try_send(InGarbage::Added(t)) {
                         std::mem::forget(e.into_inner());
                     }
@@ -2718,8 +2792,13 @@ struct OutState {
     mon: Vec<f32>,
     /// Lecture interrompue par un trou : fondu d'entrée à la reprise.
     play_fade_in: bool,
-    /// Gain master appliqué au bloc précédent (rampe vers la nouvelle valeur : pas de clic).
+    /// Ancien rendu encore en fondu après une bascule (consommateur, trames déjà fondues) :
+    /// le fondu enchaîné dure `SWITCH_FADE` trames, sur plusieurs blocs si besoin.
+    xold: Option<(Consumer<f32>, usize)>,
+    /// Gain master appliqué à la dernière trame, et rampe en cours vers la valeur demandée
+    /// (cible, pas par trame, trames restantes) : ~10 ms quel que soit le buffer.
     master_cur: f32,
+    master_ramp: (f32, f32, usize),
     /// Flux d'écoute principal : c'est lui qui mesure la latence de sortie.
     main: bool,
     sample_rate: u32,
@@ -2779,6 +2858,9 @@ struct MonitorOut {
 
 /// Fondu appliqué autour d'un trou de monitoring (trames).
 const MON_FADE: usize = 64;
+/// Fondu enchaîné d'une bascule de lecture (mute, solo, fader, boucle) et rampe du fader
+/// master : ~10 ms, assez pour ne jamais claquer, assez court pour paraître immédiat.
+const SWITCH_FADE: usize = 480;
 
 impl MonitorOut {
     fn new(cons: Consumer<f32>, left: usize) -> Self {
@@ -2908,7 +2990,9 @@ impl OutState {
             monitor: None,
             mon: vec![0.0; MAX_BLOCK * 2],
             play_fade_in: false,
+            xold: None,
             master_cur: 1.0,
+            master_ramp: (1.0, 0.0, 0),
             main: false,
             sample_rate: 0,
             slot: SLOT_MAIN,
@@ -2946,6 +3030,9 @@ impl OutState {
     fn release(&mut self) {
         if let Some(c) = self.cons.take() {
             // Le ring buffer est libéré par l'interface, jamais par le thread audio.
+            self.dispose(OutGarbage::Play(c));
+        }
+        if let Some((c, _)) = self.xold.take() {
             self.dispose(OutGarbage::Play(c));
         }
         self.release_next();
@@ -3097,9 +3184,13 @@ impl OutState {
             return false;
         }
         let (mut ncons, _) = self.next.take().unwrap();
+        // Fondu précédent pas fini (bascules rapprochées) : coupé là.
+        if let Some((c, _)) = self.xold.take() {
+            self.dispose(OutGarbage::Play(c));
+        }
         let play = &mut self.play[..frames * 2];
         play.fill(0.0);
-        let xf = MON_FADE.min(want);
+        let xf = SWITCH_FADE.min(want);
         let mut old_n = 0;
         if let Some(c) = self.cons.as_mut() {
             old_n = (k + xf).min(c.slots() / 2);
@@ -3113,8 +3204,8 @@ impl OutState {
         let nb = &mut self.nbuf[..want * 2];
         read_into(&mut ncons, nb);
         for i in 0..want {
-            let g = if i < xf {
-                (i + 1) as f32 / (xf + 1) as f32
+            let g = if i < SWITCH_FADE {
+                (i + 1) as f32 / (SWITCH_FADE + 1) as f32
             } else {
                 1.0
             };
@@ -3125,14 +3216,47 @@ impl OutState {
             }
         }
         if let Some(c) = self.cons.take() {
-            self.dispose(OutGarbage::Play(c));
+            if xf < SWITCH_FADE && old_n == k + xf {
+                // Fondu à finir aux blocs suivants (petit buffer).
+                self.xold = Some((c, xf));
+            } else {
+                self.dispose(OutGarbage::Play(c));
+            }
         }
         self.cons = Some(ncons);
         self.play_fade_in = false;
         self.shared
             .out_frames
             .fetch_add(frames as u64, Ordering::Relaxed);
+        self.shared.switch_done.store(at, Ordering::Release);
         true
+    }
+
+    /// Suite du fondu enchaîné d'une bascule sur `play[..frames]` (nouveau rendu déjà en
+    /// place) : l'ancien rendu s'efface jusqu'à `SWITCH_FADE` trames, puis est rendu.
+    fn continue_xfade(&mut self, frames: usize) {
+        let Some((c, done)) = self.xold.as_mut() else {
+            return;
+        };
+        let want = (SWITCH_FADE - *done).min(frames);
+        let m = want.min(c.slots() / 2);
+        let ob = &mut self.nbuf[..m * 2];
+        read_into(c, ob);
+        let play = &mut self.play[..frames * 2];
+        for i in 0..m {
+            let g = (*done + i + 1) as f32 / (SWITCH_FADE + 1) as f32;
+            for ch in 0..2 {
+                let idx = i * 2 + ch;
+                play[idx] = ob[idx] * (1.0 - g) + play[idx] * g;
+            }
+        }
+        *done += m;
+        // Fini, ou ancien rendu épuisé : rendu à l'interface.
+        if (*done >= SWITCH_FADE || m < want)
+            && let Some((c, _)) = self.xold.take()
+        {
+            self.dispose(OutGarbage::Play(c));
+        }
     }
 
     /// Calcule `frames` trames (≤ MAX_BLOCK) dans `self.mix`.
@@ -3169,22 +3293,36 @@ impl OutState {
             }
             sh.out_frames.fetch_add(n as u64, Ordering::Relaxed);
         }
-        // Fader master : rampe linéaire sur le bloc vers la valeur demandée.
+        if !switched {
+            self.continue_xfade(frames);
+        }
+        let sh = &*self.shared;
+        let play = &mut self.play[..frames * 2];
+        // Fader master : rampe de `SWITCH_FADE` trames vers la valeur demandée, poursuivie
+        // d'un bloc à l'autre (un saut de -inf à 0 dB ne claque pas, même à 32 trames).
         let target = f32::from_bits(sh.master_gain.load(Ordering::Relaxed));
         let target = if target.is_finite() {
             target.clamp(0.0, 4.0)
         } else {
             1.0
         };
-        if target != 1.0 || self.master_cur != 1.0 {
-            let from = self.master_cur;
-            let step = (target - from) / frames.max(1) as f32;
-            for (f, x) in play.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                let g = from + step * (f + 1) as f32;
+        if target != self.master_ramp.0 {
+            let step = (target - self.master_cur) / SWITCH_FADE as f32;
+            self.master_ramp = (target, step, SWITCH_FADE);
+        }
+        if self.master_ramp.2 > 0 || self.master_cur != 1.0 {
+            let (target, step, mut left) = self.master_ramp;
+            let mut g = self.master_cur;
+            for x in play.as_chunks_mut::<2>().0.iter_mut() {
+                if left > 0 {
+                    left -= 1;
+                    g = if left == 0 { target } else { g + step };
+                }
                 x[0] *= g;
                 x[1] *= g;
             }
-            self.master_cur = target;
+            self.master_cur = g;
+            self.master_ramp.2 = left;
         }
         let pads = &mut self.pads[..frames * 2];
         pads.fill(0.0);
@@ -3285,6 +3423,16 @@ where
 mod tests {
     /// Monitoring : entrée mono au centre à -3 dB ; beaucoup d'entrées écoutées ensemble
     /// ne dépassent jamais -1 dBFS (limiteur), sans toucher aux prises.
+    #[test]
+    fn registry_driver_names_match_the_sdk() {
+        assert_eq!(sdk_driver_name("ASIO Fireface USB"), "ASIO Fireface USB");
+        assert_eq!(sdk_driver_name("Carte Réseau"), "Carte R\u{FFFD}seau");
+        let long = "Yamaha Steinberg USB ASIO Driver x64";
+        assert_eq!(sdk_driver_name(long), "Yamaha Steinberg USB ASIO Dr...");
+        assert_eq!(sdk_driver_name(&"a".repeat(31)), "a".repeat(31));
+        assert_eq!(sdk_driver_name(&"a".repeat(32)).chars().count(), 31);
+    }
+
     #[test]
     fn asio_keeps_input_and_outputs_on_one_card() {
         let rme = "ASIO Fireface USB".to_string();
@@ -3742,7 +3890,7 @@ mod tests {
         };
         // Hors prise : refusé.
         let (p0, _c0) = rtrb::RingBuffer::new(4800);
-        tx.send(InCmd::Add(vec![RecTarget::new(1, p0)])).unwrap();
+        tx.send(InCmd::Add(1, vec![RecTarget::new(1, p0)])).unwrap();
         let data: Vec<f32> = (0..480).flat_map(|_| [0.25f32, 0.75]).collect();
         st.process(&data);
         assert_eq!(shared.rec_add_seq.load(Ordering::Acquire), 1);
@@ -3756,7 +3904,7 @@ mod tests {
             st.process(&data);
         }
         let (pb, mut cb) = rtrb::RingBuffer::new(48000);
-        tx.send(InCmd::Add(vec![RecTarget::new(1, pb)])).unwrap();
+        tx.send(InCmd::Add(2, vec![RecTarget::new(1, pb)])).unwrap();
         for _ in 0..2 {
             st.process(&data);
         }
@@ -3779,7 +3927,7 @@ mod tests {
         let full: Vec<RecTarget> = (0..4)
             .map(|_| RecTarget::new(1, rtrb::RingBuffer::new(16).0))
             .collect();
-        tx.send(InCmd::Add(full)).unwrap();
+        tx.send(InCmd::Add(3, full)).unwrap();
         st.process(&data);
         assert_eq!(shared.rec_add_at.load(Ordering::Relaxed), u64::MAX);
         assert_eq!(drain(&mut ca).len(), 480);
@@ -4315,12 +4463,26 @@ mod tests {
         }
         st.process(100);
         assert!(st.next.is_none(), "bascule faite");
-        // Trames 400 à 499 : le retard (300 → 400) a été sauté, fondu puis nouveau rendu.
-        assert_eq!(st.mix[99 * 2], -499.0);
-        assert!(st.mix[0] > -400.0 && st.mix[0] < 400.0, "fondu enchaîné");
+        assert_eq!(st.shared.switch_done.load(Ordering::Relaxed), 300);
+        // Trames 400 à 499 : le retard (300 → 400) a été sauté ; fondu enchaîné de
+        // `SWITCH_FADE` trames, qui se poursuit sur les blocs suivants.
+        let xf = |i: usize, n: f32| {
+            let g = (i + 1) as f32 / (SWITCH_FADE + 1) as f32;
+            n * (1.0 - g) - n * g
+        };
+        assert!((st.mix[0] - xf(0, 400.0)).abs() < 1e-3, "{}", st.mix[0]);
+        assert!((st.mix[99 * 2] - xf(99, 499.0)).abs() < 1e-3, "{}", st.mix[99 * 2]);
         assert_eq!(st.shared.out_frames.load(Ordering::Relaxed), 500);
         st.process(100);
-        assert_eq!(st.mix[0], -500.0);
+        assert!((st.mix[0] - xf(100, 500.0)).abs() < 1e-2, "fondu poursuivi");
+        for _ in 0..3 {
+            st.process(100);
+        }
+        // Fondu fini à la trame 400 + SWITCH_FADE : nouveau rendu seul, ancien rendu libéré.
+        assert_eq!(st.mix[80 * 2], -880.0);
+        assert!(st.xold.is_none());
+        st.process(100);
+        assert_eq!(st.mix[0], -900.0);
     }
 
     /// Une erreur du pilote ne bloque jamais le flux, même si l'interface tient le verrou.

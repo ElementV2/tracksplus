@@ -1640,11 +1640,13 @@ impl App {
                     } else if w::arm_button(
                         ui,
                         track.armed,
-                        (stopped || (recording && !track.armed)) && track.input.is_some(),
+                        (stopped || (recording && !rec_live)) && track.input.is_some(),
                         !rec_live || blink,
                     )
                     .clicked()
                     {
+                        // Pendant une prise : la piste (non armée, ou armée mais écartée au
+                        // départ faute d'entrée) rejoint la prise.
                         if recording {
                             track.armed = true;
                             late_arm = Some(tid);
@@ -1915,7 +1917,7 @@ impl App {
                             }
                             ui.label("");
                             ui.horizontal(|ui| {
-                                if w::tool_button(ui, Some(Icon::Record), "Armée", armed, (stopped || (recording && !armed)) && input.is_some())
+                                if w::tool_button(ui, Some(Icon::Record), "Armée", armed, (stopped || (recording && !rec_live)) && input.is_some())
                                     .on_hover_text("Enregistrer cette piste à la prochaine prise")
                                     .clicked()
                                 {
@@ -2780,9 +2782,19 @@ fn fader(ui: &mut egui::Ui, rect: Rect, db: f32, id: impl egui::AsIdSalt) -> Opt
     if resp.double_clicked() {
         out = Some(0.0);
     } else if resp.dragged() {
+        // Position suivie depuis le début du geste (pas depuis la valeur arrondie) : le
+        // réglage fin (Maj) avance même par petits pas, et quitte le cran de 0 dB.
         let fine = ui.input(|i| i.modifiers.shift);
         let dy = resp.drag_delta().y / travel * if fine { 0.1 } else { 1.0 };
-        let v = fader_db((pos - dy).clamp(0.0, 1.0));
+        let key = resp.id.with("pos");
+        let start = if resp.drag_started() {
+            pos
+        } else {
+            ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(pos)
+        };
+        let p = (start - dy).clamp(0.0, 1.0);
+        ui.data_mut(|d| d.insert_temp(key, p));
+        let v = fader_db(p);
         if v != db {
             out = Some(v);
         }
@@ -2831,9 +2843,18 @@ fn pan_control(ui: &mut egui::Ui, rect: Rect, pan: f32, id: impl egui::AsIdSalt)
     if resp.double_clicked() {
         out = Some(0.0);
     } else if resp.dragged() {
+        // Comme le fader : position suivie depuis le début du geste.
         let fine = ui.input(|i| i.modifiers.shift);
         let dx = resp.drag_delta().x / (rect.width() / 2.0) * if fine { 0.1 } else { 1.0 };
-        let v = ((pan + dx).clamp(-1.0, 1.0) * 100.0).round() / 100.0;
+        let key = resp.id.with("pan");
+        let start = if resp.drag_started() {
+            pan
+        } else {
+            ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(pan)
+        };
+        let raw = (start + dx).clamp(-1.0, 1.0);
+        ui.data_mut(|d| d.insert_temp(key, raw));
+        let v = (raw * 100.0).round() / 100.0;
         // Cran au centre.
         let v = if v.abs() < 0.03 { 0.0 } else { v };
         if v != pan {

@@ -617,8 +617,10 @@ pub fn run_export(
             .map(|&i| {
                 let t = &project.tracks[i];
                 if s.mix_mono && !t.stereo {
-                    // Mix mono : le panoramique d'une piste mono ne compte pas.
-                    let g = crate::project::db_to_gain(t.gain_db);
+                    // Mix mono : repli du mix stéréo entendu (moyenne gauche / droite), comme
+                    // pour les pistes stéréo : même équilibre entre pistes mono et stéréo.
+                    let [gl, gr] = t.mix_gains();
+                    let g = 0.5 * (gl + gr);
                     [g, g]
                 } else {
                     t.mix_gains()
@@ -1549,8 +1551,9 @@ mod tests {
                 let frames = v.len() / ch;
                 assert!((47000..52000).contains(&frames), "{format:?} : {frames}");
                 let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-                // Mix stéréo : piste mono au centre à −3 dB ; mix mono : à son niveau.
-                let range = if mix_mono { 0.4..0.65 } else { 0.28..0.46 };
+                // Piste mono au centre à −3 dB, en stéréo comme en mix mono (repli du mix
+                // stéréo entendu).
+                let range = 0.28..0.46;
                 assert!(range.contains(&peak), "{format:?} : peak = {peak}");
             }
         }
@@ -1901,7 +1904,8 @@ mod big_tests {
     }
 
     /// Vérifie un WAV/BWF exporté : en-tête RF64 cohérent avec la taille réelle, et un vrai
-    /// signal (sinus à 0,5) dans les dernières secondes, au-delà de 4 Gio.
+    /// signal dans les dernières secondes, au-delà de 4 Gio : sinus à 0,5 sur une piste mono
+    /// au centre, donc 0,5 × 0,707 de chaque côté dans le mix (loi de panoramique à −3 dB).
     fn check_rf64(path: &Path, bwf: bool, channels: u64, frames: u64) {
         let len = std::fs::metadata(path).unwrap().len();
         assert!(len > u32::MAX as u64, "{} : {len} octets", path.display());
@@ -1954,9 +1958,10 @@ mod big_tests {
             .iter()
             .map(|c| f32::from_le_bytes(*c).abs())
             .fold(0f32, f32::max);
+        let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
         assert!(
-            (0.45..=0.55).contains(&peak),
-            "fin du fichier : crête {peak} (attendu ≈ 0,5)"
+            (want - 0.02..=want + 0.02).contains(&peak),
+            "fin du fichier : crête {peak} (attendu ≈ {want})"
         );
         assert!(
             len - tail > u32::MAX as u64,
@@ -2054,7 +2059,12 @@ mod big_tests {
             let peak = samples[samples.len() - 2 * rate as usize * ch..]
                 .iter()
                 .fold(0f32, |m, x| m.max(x.abs()));
-            assert!((0.4..=0.6).contains(&peak), "{fmt:?} : crête finale {peak}");
+            // Mono au centre : 0,5 × 0,707 de chaque côté (codecs avec perte : marge).
+            let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+            assert!(
+                (want - 0.05..=want + 0.05).contains(&peak),
+                "{fmt:?} : crête finale {peak} (attendu ≈ {want})"
+            );
             std::fs::remove_file(&files[0]).unwrap();
         }
         let _ = std::fs::remove_dir_all(&p.dir);

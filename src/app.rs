@@ -44,6 +44,7 @@ struct LateTake {
     recorder: Recorder,
     track_id: u64,
     file: String,
+    path: PathBuf,
     /// Numéro d'ajout attendu du callback (`rec_add_seq`).
     seq: u64,
     /// Trame de la prise où la piste a commencé (connue au premier bloc), sinon estimée.
@@ -179,6 +180,23 @@ impl SettingsDialog {
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// Sorties proposées pour le soundboard et le monitoring : celles de la carte, puis hors
+    /// ASIO celles des autres périphériques (pads sur une autre interface, casque sur la
+    /// sortie de l'ordinateur) : le moteur ouvre alors un flux à part.
+    fn side_outs(&self) -> Vec<DeviceInfo> {
+        let mut v = self.card_outs();
+        if !self.asio() && self.card.is_some() {
+            v.extend(natural_order(
+                self.outs
+                    .iter()
+                    .filter(|d| !self.on_card(d))
+                    .cloned()
+                    .collect(),
+            ));
+        }
+        v
     }
 
     /// Choix de la carte son : entrée et sortie principale prises sur elle, soundboard et
@@ -1107,11 +1125,19 @@ pub struct App {
     /// attente (un ajout à la fois).
     late: Vec<LateTake>,
     late_queue: Vec<u64>,
+    /// Numéro du dernier ajout envoyé au callback (croissant, jamais réutilisé).
+    late_id: u64,
+    /// Dernier coup d'œil à une session demandée par un second lancement.
+    open_request_at: f64,
+    /// Bascule de lecture envoyée au moteur, pas encore faite (une seule à la fois) :
+    /// nouveau rendu, trame de la bascule, position et boucle à partir de là, envoi.
+    switch_pending: Option<PendingSwitch>,
     /// Noms de fichiers déjà pris dans le dossier Audio au début de la prise, et ceux de
     /// la prise (minuscules) : une piste ajoutée en cours de prise n'en écrase aucun.
     rec_names: HashSet<String>,
-    /// Tête de lecture lissée (position, instant) : voir `update_playhead`.
-    ph_smooth: Option<(f64, f64)>,
+    /// Tête de lecture lissée (position, instant, position donnée par la carte) : voir
+    /// `update_playhead`.
+    ph_smooth: Option<(f64, f64, f64)>,
     pub player: Option<Player>,
     /// Position de la timeline entendue à la trame `play_skew` du moteur (début de la
     /// lecture, ou bascule sur un nouveau rendu), et boucle de ce rendu (`heard_at`).
@@ -1353,21 +1379,28 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         t::apply(&cc.egui_ctx);
         let mut prefs = AudioPrefs::load();
-        if prefs.align_asio_card() {
-            prefs.save();
-        }
         // Réglages du contrôleur (communs) ; les pads viennent de la session ouverte.
-        let board = Board::load_devices();
+        let mut board = Board::load_devices();
         // Reprise : la sortie du soundboard était enregistrée avec le soundboard ; elle est
-        // désormais dans les réglages audio, avec les autres sorties.
-        if prefs.pad_output.is_none()
-            && prefs.pad_left == 0
-            && (board.out_device.is_some() || board.out_left != 0)
-        {
-            prefs.pad_output = board.out_device.clone().or_else(|| prefs.output.clone());
-            prefs.pad_left = board.out_left;
-            prefs.save();
+        // désormais dans les réglages audio, avec les autres sorties. Faite une seule fois :
+        // l'ancien réglage est ensuite effacé (sinon « Comme le main » serait écrasé à chaque
+        // lancement).
+        if board.out_device.is_some() || board.out_left != 0 {
+            if prefs.pad_output.is_none() && prefs.pad_left == 0 {
+                prefs.pad_output = board.out_device.clone().or_else(|| prefs.output.clone());
+                prefs.pad_left = board.out_left;
+                prefs.save();
+            }
+            board.out_device = None;
+            board.out_left = 0;
+            let _ = board.save_devices();
         }
+        // ASIO : un seul pilote, donc une seule carte pour tout (ancien réglage mélangé
+        // réparé, et signalé).
+        let aligned = prefs.align_asio_card().then(|| {
+            prefs.save();
+            prefs.output.clone().unwrap_or_default()
+        });
         // Un flux qui ne s'ouvre pas n'empêche jamais les autres : une carte absente au
         // démarrage (rack Dante encore éteint) est reprise dès qu'elle apparaît
         // (`watch_device`) ; un réglage refusé ouvre les réglages avec l'erreur.
@@ -1387,8 +1420,15 @@ impl App {
         let prefs_notice = crate::sessions::check_startup_prefs();
         let mut project = Project::untitled(engine.status.sample_rate);
         let n = engine.status.in_channels.clamp(1, 2);
+        // Entrées réelles de la carte : en WASAPI, la paire ouverte (« Analog (5+6) » → 5
+        // et 6), pas 1 et 2 qui n'y seraient pas.
+        let base = if engine.status.host == "ASIO" {
+            0
+        } else {
+            engine.status.input.as_deref().map_or(0, audio::channel_base)
+        };
         for i in 0..n {
-            project.add_track(None, Some(i));
+            project.add_track(None, Some(base + i));
         }
         project.dirty = false;
         let cache = SampleCache::new(engine.status.sample_rate);
@@ -1401,6 +1441,9 @@ impl App {
             playhead: 0,
             late: Vec::new(),
             late_queue: Vec::new(),
+            late_id: 0,
+            switch_pending: None,
+            open_request_at: 0.0,
             rec_names: HashSet::new(),
             ph_smooth: None,
             player: None,
@@ -1623,6 +1666,9 @@ impl App {
             let opened = app.take_toast_text();
             launch_warnings.push(relaunch_message(take_interrupted, opened.as_deref()));
         }
+        if let Some(card) = aligned {
+            launch_warnings.push(format!("ASIO : tout sur « {card} »"));
+        }
         launch_warnings.extend(
             app.backup_prefs_error
                 .iter()
@@ -1641,7 +1687,7 @@ impl App {
             // court message, le détail dans le journal ; la carte est réessayée seule
             // (`schedule_reconnect`) et la pastille du haut ouvre les réglages.
             crate::log_error("launch-audio", &format!("Carte son au lancement : {e}"));
-            app.notify_level("Carte son indisponible · nouvel essai…", Level::Device);
+            app.notify_level("Carte son refusée · nouvel essai…", Level::Device);
         }
         app
     }
@@ -1854,6 +1900,8 @@ impl App {
             return;
         }
         self.player = Some(player);
+        self.drop_switch();
+        self.ph_smooth = None;
         self.play_base = self.playhead;
         self.play_skew = 0;
         self.play_loop = lp;
@@ -1868,13 +1916,18 @@ impl App {
         match self.transport {
             Transport::Stopped => self.playhead = pos,
             Transport::Playing { .. } => {
+                // Boucle active : au-delà de sa fin, la lecture repart de son début (comme
+                // le rendu) ; la tête affichée suit le son.
+                let lp = self.active_loop();
+                let pos = loop_start(pos, lp);
                 self.playhead = pos;
+                self.ph_smooth = None;
                 if let Some(msg) = self.rate_mismatch().or_else(|| self.output_reopening()) {
                     self.notify(msg, true);
                     self.stop();
                     return;
                 }
-                let lp = self.active_loop();
+                self.drop_switch();
                 let (player, cons) = Player::start(&self.project, pos, self.project.audible(), lp);
                 if !self.engine.start_playback(cons) {
                     self.notify(OUTPUT_STALLED, true);
@@ -1900,31 +1953,71 @@ impl App {
         let Some(p) = &self.player else {
             return;
         };
-        // Repli : l'ancien rendu applique aussi le changement (au-delà de son avance).
-        for (a, v) in p.audible.iter().zip(&audible) {
-            a.store(*v, Ordering::Relaxed);
+        // Repli : le rendu joué (et celui qui attend sa bascule) appliquent aussi le
+        // changement, au-delà de leur avance.
+        let pending = self.switch_pending.as_ref().map(|s| &s.0);
+        for q in std::iter::once(p).chain(pending) {
+            for (a, v) in q.audible.iter().zip(&audible) {
+                a.store(*v, Ordering::Relaxed);
+            }
         }
         if self.is_stopped() {
+            return;
+        }
+        // Une bascule à la fois : la suivante part dès que le moteur a fait celle-ci (un
+        // fader qu'on bouge sans s'arrêter s'entend donc pendant le geste). Bascule restée
+        // en attente trop longtemps (rendu trop lent) : remplacée.
+        if self
+            .switch_pending
+            .as_ref()
+            .is_some_and(|s| self.now - s.4 < 2.0)
+        {
+            self.mix_dirty = true;
             return;
         }
         let margin = self.project.sample_rate as u64 / 5;
         let at = self.engine.shared.out_frames.load(Ordering::Relaxed) + margin;
         // Position qui aurait été entendue à cette trame, et boucle du nouveau rendu
         // (jamais pendant une prise).
-        let pos = self.heard_at(at);
         let lp = if matches!(self.transport, Transport::Playing { .. }) {
             self.active_loop()
         } else {
             None
         };
+        let pos = loop_start(self.heard_at(at), lp);
         let (player, cons) = Player::start_ahead(&self.project, pos, audible, lp);
-        if self.engine.switch_playback(cons, at)
-            && let Some(old) = self.player.replace(player)
-        {
-            self.retired.push((old, self.now + 5.0));
-            self.play_base = pos;
-            self.play_skew = at;
-            self.play_loop = lp;
+        if self.engine.switch_playback(cons, at) {
+            self.drop_switch();
+            self.switch_pending = Some((player, at, pos, lp, self.now));
+        } else {
+            // File du moteur pleine : réessayé à l'image suivante, rien n'est perdu.
+            self.mix_dirty = true;
+        }
+    }
+
+    /// Bascule faite par le moteur : le nouveau rendu devient celui qu'on entend (la tête
+    /// suit la nouvelle correspondance à partir de cette trame), l'ancien est libéré.
+    fn poll_switch(&mut self) {
+        let Some((_, at, ..)) = &self.switch_pending else {
+            return;
+        };
+        if self.engine.shared.switch_done.load(Ordering::Acquire) != *at {
+            return;
+        }
+        let (player, at, pos, lp, _) = self.switch_pending.take().expect("bascule");
+        if let Some(old) = self.player.replace(player) {
+            // Gardé un instant pour ses vumètres (repli), puis libéré.
+            self.retired.push((old, self.now + 1.0));
+        }
+        self.play_base = pos;
+        self.play_skew = at;
+        self.play_loop = lp;
+    }
+
+    /// Bascule en attente abandonnée (nouvelle lecture, arrêt) : son rendu est libéré.
+    fn drop_switch(&mut self) {
+        if let Some((p, ..)) = self.switch_pending.take() {
+            self.retired.push((p, self.now + 1.0));
         }
     }
 
@@ -1941,8 +2034,12 @@ impl App {
 
     /// Position de la timeline entendue à la trame `frames` du moteur (boucle comprise).
     fn heard_at(&self, frames: u64) -> u64 {
-        let x = self.play_base + frames.saturating_sub(self.play_skew);
-        match self.play_loop {
+        let (base, skew, lp) = match &self.switch_pending {
+            Some((_, at, pos, lp, _)) if frames >= *at => (*pos, *at, *lp),
+            _ => (self.play_base, self.play_skew, self.play_loop),
+        };
+        let x = base + frames.saturating_sub(skew);
+        match lp {
             Some((a, b)) if x >= b && b > a => a + (x - b) % (b - a),
             _ => x,
         }
@@ -2535,6 +2632,7 @@ impl App {
             Transport::Playing { .. } => {
                 self.engine.stop_playback();
                 self.player = None;
+                self.drop_switch();
             }
             Transport::Recording { start } => {
                 let len = self.engine.shared.rec_frames.load(Ordering::Relaxed);
@@ -2549,6 +2647,12 @@ impl App {
                     .stop_record(std::time::Duration::from_millis(1500));
                 self.engine.stop_playback();
                 self.player = None;
+                self.drop_switch();
+                // Pistes armées pendant la prise : plus aucun ajout (file vidée), puis leur
+                // position exacte relevée (le callback a traité les ajouts avant de rendre
+                // les cibles) avant de figer la forme d'onde et le journal de la prise.
+                self.late_queue.clear();
+                self.poll_late();
                 // 2) Le thread disque écrit tout ce qui reste puis ferme les fichiers, dans
                 //    un thread : l'interface ne se fige pas, même si le disque est lent.
                 self.awake = None;
@@ -2573,13 +2677,16 @@ impl App {
                     }),
                 };
                 self.journal_pending = None;
-                // Pistes armées pendant la prise : leur départ est connu (le callback a
-                // traité l'ajout avant de rendre les cibles) ; elles finissent avec la prise.
-                self.poll_late();
-                self.late_queue.clear();
-                let late: Vec<(Recorder, u64)> = std::mem::take(&mut self.late)
+                // Elles finissent avec la prise.
+                let late: Vec<LateEnd> = std::mem::take(&mut self.late)
                     .into_iter()
-                    .map(|l| (l.recorder, l.offset.unwrap_or(l.est)))
+                    .map(|l| LateEnd {
+                        offset: l.offset.unwrap_or(l.est),
+                        track_id: l.track_id,
+                        file: l.file,
+                        path: l.path,
+                        recorder: l.recorder,
+                    })
                     .collect();
                 match self.recorder.take() {
                     Some(rec) => {
@@ -2614,9 +2721,9 @@ impl App {
                         });
                     }
                     None => {
-                        for (r, _) in late {
+                        for l in late {
                             std::thread::spawn(move || {
-                                let _ = r.finish();
+                                let _ = l.recorder.finish();
                             });
                         }
                         self.live_takes_to_clips(start, TakeOutcome::Lost, take)
@@ -2626,6 +2733,43 @@ impl App {
         }
         self.transport = Transport::Stopped;
         self.engine.shared.counting.store(false, Ordering::Relaxed);
+    }
+
+    /// Session ouverte par un second lancement (voir `OPEN_REQUEST`) : regardé une fois par
+    /// seconde. Jamais pendant une prise ou une finalisation : la demande est alors refusée.
+    fn poll_open_request(&mut self) {
+        if self.now - self.open_request_at < 1.0 {
+            return;
+        }
+        self.open_request_at = self.now;
+        let Some(file) = dirs::config_dir().map(|d| d.join("TracksPlus").join(OPEN_REQUEST))
+        else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&file);
+        let path = PathBuf::from(text.trim());
+        if !path.is_file()
+            || !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT))
+        {
+            return;
+        }
+        if self.editing_locked() {
+            self.notify("Prise en cours · session non ouverte", true);
+            return;
+        }
+        if path == self.project.file_path() && !self.start_screen {
+            return;
+        }
+        self.stop();
+        if self.save_before_leaving() {
+            self.welcome = None;
+            self.load_session(&path);
+        }
     }
 
     /// Piste armée pendant la prise : elle est enregistrée à partir de maintenant, dans son
@@ -2669,16 +2813,30 @@ impl App {
             .project
             .new_take_file_in(&name, &self.rec_names, &HashSet::new());
         self.rec_names.insert(file.to_lowercase());
+        let path = self.project.audio_dir().join(&file);
         let spec = RecSpec {
             track_id,
-            path: self.project.audio_dir().join(&file),
+            path: path.clone(),
             file: file.clone(),
             peaks: peaks.clone(),
             cons,
             channels: width,
         };
+        // Copie de sécurité sur le second disque, comme les autres pistes de la prise.
+        let backup = if self.rec_has_backup && !crate::recorder::backup_busy() {
+            self.backup_session_dir().map(|d| {
+                let (p, c) = rtrb::RingBuffer::new(sr as usize * ring_secs * width as usize);
+                (d.join(project::AUDIO_DIR), p, c)
+            })
+        } else {
+            None
+        };
+        let (backup, copy) = match backup {
+            Some((d, p, c)) => (Some((d, vec![c])), Some(p)),
+            None => (None, None),
+        };
         let recorder =
-            match Recorder::start_with_backup(vec![spec], sr, self.project.rec_format, None, None)
+            match Recorder::start_with_backup(vec![spec], sr, self.project.rec_format, backup, None)
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -2690,22 +2848,21 @@ impl App {
             RecTarget::stereo(input as usize, prod)
         } else {
             RecTarget::new(input as usize, prod)
-        };
+        }
+        .with_copy(copy);
         let est = self.engine.shared.rec_frames.load(Ordering::Relaxed);
-        let seq = match self.engine.add_record(vec![target]) {
-            Ok(s) => s,
-            Err(e) => {
-                std::thread::spawn(move || {
-                    let _ = recorder.finish();
-                });
-                self.notify(format!("{e:#}"), true);
-                return false;
-            }
-        };
+        self.late_id += 1;
+        let seq = self.late_id;
+        if let Err(e) = self.engine.add_record(seq, vec![target]) {
+            finish_discarded(recorder, self.project.audio_dir());
+            self.notify(format!("{e:#}"), true);
+            return false;
+        }
         self.late.push(LateTake {
             recorder,
             track_id,
             file: file.clone(),
+            path,
             seq,
             offset: None,
             est,
@@ -2740,9 +2897,8 @@ impl App {
                 if let Some(t) = self.project.tracks.iter_mut().find(|t| t.id == l.track_id) {
                     t.armed = false;
                 }
-                std::thread::spawn(move || {
-                    let _ = l.recorder.finish();
-                });
+                let dir = l.path.parent().map(Path::to_path_buf).unwrap_or_default();
+                finish_discarded(l.recorder, dir);
                 self.notify("Piste non ajoutée à la prise", true);
                 continue;
             }
@@ -3675,11 +3831,17 @@ impl App {
         let pads_busy = self.pads_status().0 > 0 && pads_bit != 0 && lost & pads_bit == 0;
         if asio {
             // ASIO : un seul pilote pour tout, rouvert d'un coup, sur ce thread (objets COM).
-            if lost == 0 && self.engine.open_mask() != 0 {
-                // Rien de mort, seulement un flux refusé : on ne coupe pas ce qui marche.
+            // Rien de mort, seulement un réglage refusé : on ne coupe pas ce qui marche ; et
+            // si tout est refusé, on arrête de recharger le pilote après quelques essais
+            // espacés (fréquence ou buffer que la carte n'accepte pas : le réglage est à
+            // changer, la pastille du haut ouvre les réglages).
+            let all_refused = self.engine.open_mask() == 0
+                && self.engine.refused() != 0
+                && delay >= RECONNECT_MAX_ASIO;
+            if lost == 0 && (self.engine.open_mask() != 0 || all_refused) {
                 self.reconnect = Some((f64::INFINITY, delay));
                 let what = self.engine.problems(0).join(" · ");
-                self.device_notice(format!("{what} · voir Réglages audio"));
+                self.device_notice(format!("{what} · voir Réglages"));
                 return;
             }
             if !self.is_stopped() || pads_busy {
@@ -4168,6 +4330,16 @@ impl App {
         if self.recorder.as_ref().is_some_and(|r| !r.is_alive()) {
             alerts.push("Écriture disque arrêtée · arrêtez la prise".into());
         }
+        // Pistes armées pendant la prise : leur écriture est surveillée elle aussi.
+        for l in self.late.iter().filter(|l| !l.recorder.is_alive()) {
+            let name = self
+                .project
+                .tracks
+                .iter()
+                .find(|t| t.id == l.track_id)
+                .map_or("?", |t| t.name.as_str());
+            alerts.push(format!("Écriture arrêtée : {name}"));
+        }
         let frames = self.engine.shared.rec_frames.load(Ordering::Relaxed);
         if frames != self.rec_watch.0 {
             self.rec_watch = (frames, self.now);
@@ -4229,9 +4401,15 @@ impl App {
         // Erreurs de fichiers en dernier, regroupées : recalculées seulement quand elles
         // changent (jamais une liste reformatée à chaque image).
         if let Some(r) = &self.recorder {
-            let g = r.errors_gen();
+            let g = self.late.iter().fold(r.errors_gen(), |(a, b, d), l| {
+                let (x, y, z) = l.recorder.errors_gen();
+                (a + x, b + y, d || z)
+            });
             if self.disk_err_cache.as_ref().is_none_or(|(k, _)| *k != g) {
-                let errs = r.errors();
+                let mut errs = r.errors();
+                for l in &self.late {
+                    errs.extend(l.recorder.errors());
+                }
                 let txt = match errs.len() {
                     0 => None,
                     1 => Some(format!("Erreur disque : {}", errs[0])),
@@ -4257,6 +4435,7 @@ impl App {
     /// arrière, jamais loin devant ; un vrai saut (clic sur la règle, boucle) est suivi
     /// aussitôt.
     fn update_playhead(&mut self) {
+        self.poll_switch();
         let sh = &self.engine.shared;
         let raw = match self.transport {
             Transport::Playing { .. } => self.heard_at(sh.out_frames.load(Ordering::Relaxed)),
@@ -4269,7 +4448,7 @@ impl App {
         let sr = self.sr() as f64;
         let now = self.now;
         let p = smooth_playhead(self.ph_smooth, raw as f64, now, sr);
-        self.ph_smooth = Some((p, now));
+        self.ph_smooth = Some((p, now, raw as f64));
         self.playhead = p.max(0.0) as u64;
     }
 
@@ -5216,8 +5395,8 @@ impl App {
 
     /// « Actualiser » : rouvre la carte son pour relire les réglages du pilote. Beaucoup de
     /// pilotes (RME notamment) ne donnent un buffer ou une fréquence changés dans leur
-    /// panneau qu'à la réouverture. En ASIO, le panneau du pilote fait foi : buffer et
-    /// fréquence repassent en « Auto ».
+    /// panneau qu'à la réouverture. En ASIO, le buffer suit le panneau du pilote (« Auto ») ;
+    /// la fréquence choisie reste.
     fn reload_audio(&mut self) {
         if self.is_recording() {
             self.notify("Arrêtez la prise d'abord", true);
@@ -5226,8 +5405,9 @@ impl App {
         let before = self.prefs.clone();
         let mut prefs = before.clone();
         if prefs.host.as_deref() == Some("ASIO") {
+            // Le buffer suit le panneau du pilote ; la fréquence choisie reste (celle de la
+            // session).
             prefs.buffer = None;
-            prefs.sample_rate = None;
         }
         match self.apply_audio(prefs) {
             Ok(()) => {
@@ -5252,7 +5432,14 @@ impl App {
     /// Interroge tous les pilotes ASIO (nombre de canaux, paires de sorties, fréquences) :
     /// le pilote en service est fermé le temps de la lecture (une application n'en charge
     /// qu'un à la fois), puis la carte est rouverte avec les réglages en cours.
-    fn probe_asio(&mut self, dlg: &mut SettingsDialog) {
+    /// `force` : demandé (« Actualiser ») ; sinon automatique (carte choisie dans la liste),
+    /// jamais pendant la lecture ni pendant les pads (le son ne se coupe pas pour ça : la
+    /// carte reste « non vérifiée »).
+    fn probe_asio(&mut self, dlg: &mut SettingsDialog, force: bool) {
+        if !force && (!self.is_stopped() || self.pads_status().0 > 0) {
+            dlg.refresh();
+            return;
+        }
         if dlg.prefs.host.as_deref() != Some("ASIO") || self.asio_in_use().is_none() {
             // Hors ASIO, ou aucun pilote ASIO en service : tous répondent déjà.
             dlg.asio_in_use = None;
@@ -6393,6 +6580,14 @@ impl App {
                         dlg.refresh();
                     }
                     let asio = dlg.asio();
+                    // ASIO sans carte (pilote qu'on vient de choisir) : la première carte de
+                    // la liste, plutôt qu'un pilote pris au hasard à l'ouverture.
+                    if asio
+                        && dlg.card.is_none()
+                        && let Some(c) = dlg.cards().into_iter().next()
+                    {
+                        dlg.select_card(Some(c));
+                    }
 
                     // ---- Carte son : celles du pilote (en ASIO, chaque pilote est une carte ;
                     // en WASAPI, les périphériques de Windows sont regroupés par carte). Entrée
@@ -6415,7 +6610,10 @@ impl App {
                                     }
                                 }
                             });
-                        if let Some(c) = pick {
+                        // Recliquer la carte déjà choisie ne remet rien à zéro.
+                        if let Some(c) = pick
+                            && c != dlg.card
+                        {
                             dlg.select_card(c);
                         }
                         // Carte branchée, Dante Virtual Soundcard passée en ASIO, buffer changé
@@ -6484,11 +6682,12 @@ impl App {
                     ui.end_row();
                     ui.label(egui::RichText::new("Monitoring multipiste").color(t::TEXT_2))
                         .on_hover_text("Écoute en direct des entrées (bouton casque des pistes)");
-                    dlg.probe |= dest_combo(ui, "out_mon", combo_w, &outs, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, Some("Comme le main multipiste"), "Comme le main multipiste");
+                    let side = dlg.side_outs();
+                    dlg.probe |= dest_combo(ui, "out_mon", combo_w, &side, &mut dlg.prefs.monitor_output, &mut dlg.prefs.monitor_left, Some("Comme le main multipiste"), "Comme le main multipiste");
                     ui.end_row();
                     ui.label(egui::RichText::new("Soundboard").color(t::TEXT_2))
                         .on_hover_text("Lecture des pads");
-                    dlg.probe |= dest_combo(ui, "out_pads", combo_w, &outs, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, Some("Comme le main multipiste"), "Comme le main multipiste");
+                    dlg.probe |= dest_combo(ui, "out_pads", combo_w, &side, &mut dlg.prefs.pad_output, &mut dlg.prefs.pad_left, Some("Comme le main multipiste"), "Comme le main multipiste");
                     ui.end_row();
                     ui.add_space(4.0);
                     ui.label("");
@@ -6532,15 +6731,11 @@ impl App {
                         let others = [dlg.prefs.pad_output.clone(), dlg.prefs.monitor_output.clone()];
                         let differs = |o: &Option<String>| o.is_some() && input.is_some() && *o != input;
                         if differs(&main) || others.iter().any(differs) {
-                            hints.push(
-                                "ASIO : un seul pilote à la fois. Choisissez l'entrée et les sorties sur la même carte, sinon l'ouverture échouera.",
-                            );
+                            hints.push("ASIO : une seule carte pour tout.");
                         }
                     }
                     if wasapi && rates.len() <= 1 {
-                        hints.push(
-                            "Fréquence : en WASAPI, Windows impose celle réglée dans ses paramètres son (Propriétés de l'appareil → Format avancé). En ASIO, toutes les fréquences de la carte sont proposées.",
-                        );
+                        hints.push("Fréquence fixée par Windows.");
                     }
 
                     // ---- Buffer : tailles acceptées par le pilote, avec la latence en ms.
@@ -6658,21 +6853,36 @@ impl App {
                 });
             });
         if recheck {
-            // Rouvre la carte (relit buffer et fréquence du pilote), puis relit la liste ;
-            // en ASIO, tous les pilotes sont interrogés (celui en service fermé un instant).
+            // Rouvre la carte (relit le buffer du pilote), puis relit la liste. En ASIO avec
+            // un pilote en service : une seule réouverture, qui interroge au passage tous les
+            // pilotes (celui en service fermé un instant).
             let before = self.prefs.clone();
-            self.reload_audio();
+            let asio = self.prefs.host.as_deref() == Some("ASIO");
+            if asio && self.asio_in_use().is_some() && !self.is_recording() {
+                self.prefs.buffer = None;
+                self.prefs.save();
+                self.probe_asio(&mut dlg, true);
+                if dlg.error.is_none() {
+                    let msg = format!(
+                        "Carte son relancée · {} kHz",
+                        fmt_khz(self.engine.status.sample_rate)
+                    );
+                    self.notify(msg, false);
+                }
+            } else {
+                self.reload_audio();
+                dlg.refresh();
+            }
             if dlg.prefs == before {
                 dlg.prefs = self.prefs.clone();
             }
-            if dlg.prefs.host.as_deref() == Some("ASIO") {
-                dlg.probe = true;
-            } else {
-                dlg.refresh();
-            }
         }
         if std::mem::take(&mut dlg.probe) {
-            self.probe_asio(&mut dlg);
+            self.probe_asio(&mut dlg, false);
+        }
+        if apply && dlg.asio() && dlg.card.is_none() {
+            apply = false;
+            dlg.error = Some("Choisissez une carte".into());
         }
         if apply {
             match self.apply_audio(dlg.prefs.clone()) {
@@ -7677,6 +7887,7 @@ impl eframe::App for App {
                 self.notify(m, true);
             }
             self.poll_play_errors();
+            self.poll_open_request();
             self.watch_device();
             self.watch_midi();
             self.poll_import();
@@ -8325,38 +8536,116 @@ fn natural_order(mut v: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
 /// Carte son d'un périphérique. ASIO : le pilote lui-même. Ailleurs (WASAPI…) : le nom
 /// entre parenthèses à la fin, comme Windows nomme ses périphériques (« DVS Receive 1-2
 /// (Dante Virtual Soundcard) », « Haut-parleurs (Realtek(R) Audio) »), sinon le nom.
+/// Session demandée par un second lancement (double-clic sur un .tracksplus pendant que
+/// TracksPlus tourne), dans le dossier de configuration.
+pub const OPEN_REQUEST: &str = "open_request.txt";
+
 /// Fin de prise : les pistes armées pendant la prise rejoignent ses résultats, chacune
 /// décalée de sa position dans la prise. Une écriture en échec fait passer toute la prise
 /// par le journal de secours (qui connaît aussi ces pistes et leur position).
-fn merge_late(mut f: Finished, late: Vec<(Recorder, u64)>) -> Finished {
-    for (r, off) in late {
-        match r.finish().main {
-            Ok(v) => {
-                if let Ok(main) = &mut f.main {
-                    main.extend(v.into_iter().map(|mut rr| {
-                        for s in &mut rr.segments {
-                            s.start += off;
-                        }
-                        rr
-                    }));
-                }
+fn merge_late(mut f: Finished, late: Vec<LateEnd>) -> Finished {
+    let shift = |v: Vec<RecResult>, off: u64| {
+        v.into_iter().map(move |mut rr| {
+            for s in &mut rr.segments {
+                s.start += off;
             }
-            Err(e) => {
-                if f.main.is_ok() {
-                    f.main = Err(e);
-                }
-            }
+            rr
+        })
+    };
+    let mut backups = Vec::new();
+    for l in late {
+        let fin = l.recorder.finish();
+        if let Some(b) = fin.backup {
+            backups.push((b, l.offset));
         }
+        let res = match fin.main {
+            Ok(v) => v,
+            // Thread d'écriture de cette piste tombé : son fichier (en-tête réparé) est
+            // posé quand même, les autres pistes de la prise ne sont pas touchées.
+            Err(_) => {
+                let frames = crate::recovery::repair_wav(&l.path).unwrap_or(0);
+                vec![RecResult {
+                    track_id: l.track_id,
+                    segments: vec![crate::recorder::Segment {
+                        file: l.file,
+                        frames,
+                        start: 0,
+                    }],
+                    error: Some("écriture interrompue".into()),
+                }]
+            }
+        };
+        if let Ok(main) = &mut f.main {
+            main.extend(shift(res, l.offset));
+        }
+    }
+    // Copies de sécurité des pistes ajoutées : réunies à celle de la prise.
+    if !backups.is_empty()
+        && let Some(main_b) = f.backup.take()
+    {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let mut r = main_b
+                .rx
+                .recv()
+                .unwrap_or(Err(crate::recorder::FinishError::Panicked));
+            for (b, off) in backups {
+                if let (Ok(Ok(v)), Ok(m)) = (b.rx.recv(), &mut r) {
+                    m.extend(shift(v, off));
+                }
+            }
+            let _ = tx.send(r);
+        });
+        f.backup = Some(crate::recorder::BackupFinish { rx });
     }
     f
 }
 
+/// Bascule de lecture en attente : nouveau rendu, trame de la bascule, position et boucle
+/// à partir de là, instant de l'envoi.
+type PendingSwitch = (Player, u64, u64, Option<(u64, u64)>, f64);
+
+/// Piste armée pendant la prise, à finir avec elle.
+struct LateEnd {
+    recorder: Recorder,
+    offset: u64,
+    track_id: u64,
+    file: String,
+    path: PathBuf,
+}
+
+/// Écriture d'une piste dont l'ajout a échoué : terminée en arrière-plan, et ses fichiers
+/// (vides) supprimés.
+fn finish_discarded(recorder: Recorder, dir: PathBuf) {
+    std::thread::spawn(move || {
+        let fin = recorder.finish();
+        if let Ok(v) = fin.main {
+            for s in v.iter().flat_map(|r| &r.segments).filter(|s| s.frames == 0) {
+                let _ = std::fs::remove_file(dir.join(&s.file));
+            }
+        }
+    });
+}
+
+/// Boucle active : une position au-delà de sa fin repart de son début (comme le rendu).
+fn loop_start(pos: u64, lp: Option<(u64, u64)>) -> u64 {
+    match lp {
+        Some((a, b)) if pos >= b => a,
+        _ => pos,
+    }
+}
+
 /// Un pas de la tête lissée (voir `App::update_playhead`) : `prev` = (position, instant)
 /// de l'image précédente, `raw` = position donnée par la carte.
-fn smooth_playhead(prev: Option<(f64, f64)>, raw: f64, now: f64, sr: f64) -> f64 {
-    let Some((pos, at)) = prev else {
+fn smooth_playhead(prev: Option<(f64, f64, f64)>, raw: f64, now: f64, sr: f64) -> f64 {
+    let Some((pos, at, prev_raw)) = prev else {
         return raw;
     };
+    // La carte ne recule jamais d'elle-même : un recul est un saut (tour de boucle, même
+    // courte, ou déplacement), suivi aussitôt.
+    if raw < prev_raw {
+        return raw;
+    }
     let dt = (now - at).clamp(0.0, 0.1);
     let p = pos + dt * sr;
     let err = raw - p;
@@ -9089,7 +9378,16 @@ mod tests {
         };
         let main = start_rec(1, "Voix_001.wav", 9600);
         let late = start_rec(2, "Guitare_001.wav", 2000);
-        let f = merge_late(main.finish(), vec![(late, 4800)]);
+        let f = merge_late(
+            main.finish(),
+            vec![LateEnd {
+                recorder: late,
+                offset: 4800,
+                track_id: 2,
+                file: "Guitare_001.wav".into(),
+                path: dir.join("Guitare_001.wav"),
+            }],
+        );
         let results = f.main.expect("prise terminée");
         let mut next = 100;
         let layout = layout_take(&results, 1000, 100, &mut || {
@@ -9116,7 +9414,7 @@ mod tests {
             let now = i as f64 / 60.0;
             let raw = ((now * sr) / block).floor() * block;
             let p = smooth_playhead(prev, raw, now, sr);
-            prev = Some((p, now));
+            prev = Some((p, now, raw));
             out.push(p);
         }
         let steps: Vec<f64> = out.windows(2).skip(60).map(|w| w[1] - w[0]).collect();
@@ -9127,6 +9425,10 @@ mod tests {
         // Un saut (clic sur la règle) est suivi aussitôt.
         let p = smooth_playhead(prev, 10.0 * sr, 4.0, sr);
         assert_eq!(p, 10.0 * sr);
+        // Un petit recul (tour d'une boucle courte, déplacement de 0,1 s) aussi.
+        let back = 10.0 * sr - 0.1 * sr;
+        let p = smooth_playhead(Some((10.0 * sr, 4.0, 10.0 * sr)), back, 4.016, sr);
+        assert_eq!(p, back);
     }
 
     /// Chien de garde : flux muet signalé après `STREAM_STALL` (l'entrée en prise après

@@ -20,12 +20,12 @@ extern "C" bool load_asio_driver(char * name){
 	return loadAsioDriver(name);
 }
 
-// TracksPlus : une fois le pilote relâché, sa DLL est déchargée (sinon elle reste dans le
-// processus, et l'application du pilote, Dante Virtual Soundcard par exemple, peut la
-// croire encore utilisée).
+// TracksPlus : la DLL du pilote n'est plus déchargée à chaque relâchement (une
+// énumération charge et relâche tous les pilotes : un pilote dont un thread finit encore
+// après Release perdrait son code). Le déchargement est demandé à part, seulement quand
+// un pilote est relâché pour libérer son application (voir l'application).
 extern "C" void remove_current_driver() {
 	asioDrivers->removeCurrentDriver();
-	CoFreeUnusedLibrariesEx(0, 0);
 }
 extern "C" long get_driver_names(char **names, long maxDrivers) {
 	AsioDrivers ad;
