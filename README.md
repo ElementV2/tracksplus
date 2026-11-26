@@ -383,7 +383,8 @@ Autres builds : `cargo build --release --features asio` sous Windows avec Visual
 ### Licence
 
 **GNU GPL v3** (voir [`LICENSE`](LICENSE)). Composants tiers : police
-[Inter](https://rsms.me/inter/) (OFL, `assets/fonts`) ; SDK ASIO de Steinberg, sous sa
+[Inter](https://rsms.me/inter/) (OFL, `assets/fonts`) ; icônes
+[Phosphor](https://phosphoricons.com/) (MIT, `assets/fonts`) ; SDK ASIO de Steinberg, sous sa
 licence GPLv3 ; `vendor/asio-sys`, copie d'asio-sys (Apache-2.0) avec deux modifications
 (compilation MinGW, pilote qui refuse de démarrer toujours relâché) ; export : LAME (LGPL), libvorbis et libogg (BSD), flacenc (Apache-2.0), ebur128
 (MIT).
