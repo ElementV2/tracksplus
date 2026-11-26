@@ -203,6 +203,19 @@ pub const MASTER_W: f32 = 100.0;
 
 /// Panneau de vumètre master stéréo (partagé avec le soundboard) : graduations à gauche,
 /// deux larges barres L / R séparées par un trait fin, crêtes max au-dessus.
+/// Vumètre d'une piste : niveau de lecture (après le fader) ou de son entrée. En lecture,
+/// toute piste qui a des prises montre ce qu'on entend, même armée ; en prise, une piste
+/// armée montre l'entrée enregistrée ; à l'arrêt, une piste d'enregistrement montre son
+/// entrée (réglage des niveaux). Une piste audio montre toujours sa lecture.
+fn shows_playback(tr: &crate::project::Track, transport: Transport) -> bool {
+    match transport {
+        _ if tr.is_audio() => true,
+        Transport::Playing { .. } => !tr.armed || !tr.clips.is_empty(),
+        Transport::Recording { .. } => !tr.armed,
+        Transport::Stopped => false,
+    }
+}
+
 pub fn master_panel(ui: &mut egui::Ui, title: &str, meters: &mut [MeterState; 2]) {
     let full = ui.max_rect();
     let p = ui.painter().clone();
@@ -1401,6 +1414,7 @@ impl App {
         let editable = !self.editing_locked();
         let in_ch = self.engine.status.in_channels;
         let in_base = self.in_base();
+        let transport = self.transport;
         let blink = (self.now * 1.6).fract() < 0.55;
         let (pointer, press_origin, shift, command) = ui.input(|i| {
             (
@@ -1741,8 +1755,8 @@ impl App {
                 let stereo = track.stereo;
                 let label = track.input_label();
                 let chans: Vec<u16> = track.inputs().collect();
-                let ms: Vec<MeterState> = if is_audio {
-                    // Piste audio : niveau de lecture, une barre par canal du fichier.
+                let ms: Vec<MeterState> = if shows_playback(track, transport) {
+                    // Niveau de lecture (après le fader), une barre par canal.
                     let m = self.track_meters.get(&tid).copied().unwrap_or_default();
                     m[..track.channels()].to_vec()
                 } else {
@@ -1859,7 +1873,10 @@ impl App {
                             m[1].reset();
                         }
                         for &i in &chans {
-                            if let Some(mm) = self.in_meters.get_mut(i as usize) {
+                            if let Some(mm) = i
+                                .checked_sub(in_base)
+                                .and_then(|c| self.in_meters.get_mut(c as usize))
+                            {
                                 mm.reset();
                             }
                         }
@@ -2469,7 +2486,7 @@ impl App {
         let full = ui.max_rect();
         let in_ch = self.engine.status.in_channels;
         let in_base = self.in_base();
-        let playing = matches!(self.transport, Transport::Playing { .. });
+        let transport = self.transport;
         let p = ui.painter().clone();
         w::hline(&p, full.left(), full.right(), full.top(), t::LINE);
         // Zones : crête, panoramique, puis vumètre et fader côte à côte, puis noms.
@@ -2528,9 +2545,7 @@ impl App {
                             }
                             _ => MeterState::default(),
                         };
-                        // Niveau de lecture (après le fader) pour une piste audio, ou pour
-                        // une piste non armée pendant la lecture ; sinon, son entrée.
-                        let audio_tr = tr.is_audio() || (playing && !armed);
+                        let audio_tr = shows_playback(tr, transport);
                         let (m0, m1, stereo) = if audio_tr {
                             let m = self.track_meters.get(&id).copied().unwrap_or_default();
                             (m[0], m[1], tr.stereo)
@@ -3265,6 +3280,36 @@ fn fmt_ruler(tt: f64, step: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::fmt_ruler;
+
+    /// En lecture, une piste armée qui a des prises montre ce qu'on entend, pas son entrée.
+    #[test]
+    fn meters_show_playback_while_playing() {
+        use super::shows_playback;
+        use crate::app::Transport;
+        let mut p = crate::project::Project::new("t".into(), std::env::temp_dir(), 48000);
+        let id = p.add_track(None, Some(0));
+        let tr = p.tracks.iter_mut().find(|t| t.id == id).unwrap();
+        tr.armed = true;
+        let play = Transport::Playing { start: 0 };
+        let rec = Transport::Recording { start: 0 };
+        assert!(!shows_playback(tr, play), "armée sans prise : son entrée");
+        tr.clips.push(crate::project::Clip {
+            id: 1,
+            file: "a.wav".into(),
+            start: 0,
+            offset: 0,
+            len: 48000,
+            src_len: 48000,
+            fade_in: 0,
+            fade_out: 0,
+        });
+        assert!(shows_playback(tr, play));
+        assert!(!shows_playback(tr, rec), "armée en prise : l'entrée enregistrée");
+        assert!(!shows_playback(tr, Transport::Stopped));
+        tr.armed = false;
+        assert!(shows_playback(tr, play));
+        assert!(shows_playback(tr, rec));
+    }
 
     /// Prise plus courte que `MIN_CLIP` (clic de 1 ms importé) : bornes du rognage
     /// toujours dans l'ordre, aucune panique ; elle peut seulement être rallongée.
