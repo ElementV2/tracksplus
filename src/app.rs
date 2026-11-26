@@ -830,6 +830,17 @@ fn backup_session_dir_for(root: &Path, dir: &Path, name: &str) -> Option<PathBuf
     Some(root.join(format!("{} ({:08x})", project::sanitize(name), code as u32)))
 }
 
+/// Fenêtre « Nettoyer les fichiers inutilisés » : recherche puis envoi à la Corbeille,
+/// chacun dans un thread (le second disque peut mettre du temps à se réveiller).
+pub struct CleanupDlg {
+    scan: Option<std::sync::mpsc::Receiver<Result<crate::cleanup::Scan, String>>>,
+    found: Option<crate::cleanup::Scan>,
+    trash: Option<std::sync::mpsc::Receiver<anyhow::Result<()>>>,
+    /// Copie de sécurité sur un second disque configurée (nettoyée elle aussi).
+    has_backup: bool,
+    error: Option<String>,
+}
+
 /// État d'une mesure d'espace libre en arrière-plan.
 enum DiskPoll {
     Idle,
@@ -1327,6 +1338,7 @@ pub struct App {
     pub settings_dlg: Option<SettingsDialog>,
     /// Fenêtre du journal des incidents ouverte (lignes, les plus récentes d'abord).
     pub incidents_dlg: Option<Vec<String>>,
+    pub cleanup_dlg: Option<CleanupDlg>,
     pub export_dlg: Option<ExportDialog>,
     pub export_job: Option<ExportJob>,
     pub new_dlg: Option<NewSessionDialog>,
@@ -1492,6 +1504,7 @@ impl App {
             scrub_at: 0.0,
             settings_dlg: None,
             incidents_dlg: None,
+            cleanup_dlg: None,
             export_dlg: None,
             export_job: None,
             new_dlg: None,
@@ -5552,6 +5565,12 @@ impl App {
         self.new_dlg = None;
         self.update_dlg = false;
         self.browser = None;
+        self.incidents_dlg = None;
+        // Nettoyage : jamais pendant l'envoi à la Corbeille (sa fin vide l'historique
+        // d'annulation, qui pourrait sinon remettre des fichiers partis).
+        if self.cleanup_dlg.as_ref().is_some_and(|d| d.trash.is_none()) {
+            self.cleanup_dlg = None;
+        }
         // Échap = « Annuler » des confirmations.
         self.confirm_close = false;
         self.sb.confirm_delete_page = None;
@@ -5645,8 +5664,279 @@ impl App {
         }
     }
 
+    /// Ouvre le nettoyage : cherche (dans un thread) les fichiers audio de la session et de
+    /// son double sur le second disque qu'aucune prise n'utilise plus.
+    pub fn open_cleanup(&mut self) {
+        if !self.is_stopped()
+            || self.editing_locked()
+            || self.import_job.is_some()
+            || self.audio_import.is_some()
+            || self.save_as_job.is_some()
+            || self.export_job.is_some()
+        {
+            self.notify("Arrêtez d'abord la lecture et les copies", true);
+            return;
+        }
+        if let Some(why) = &self.project.read_only {
+            let msg = format!("Session protégée : {why}");
+            self.notify(msg, true);
+            return;
+        }
+        // Gardés : fichiers des prises, et sons des pads (au cas où l'un d'eux pointerait
+        // dans le dossier Audio).
+        let keep: HashSet<String> = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .filter_map(|c| Path::new(&c.file).file_name().map(|n| n.to_os_string()))
+            .chain(
+                self.board
+                    .all_pads()
+                    .filter_map(|(_, p)| p.path.file_name().map(|n| n.to_os_string())),
+            )
+            .map(|n| crate::cleanup::key(&n.to_string_lossy()))
+            .collect();
+        let backup = self.backup_root.clone().zip(self.backup_session_dir());
+        let has_backup = backup.is_some();
+        let dir = self.project.dir.clone();
+        // Fichiers que seule la copie possède (trou sur le seul disque principal).
+        let backup_keep: HashSet<String> = self
+            .backup_alt
+            .iter()
+            .filter(|a| a.dir == dir)
+            .flat_map(|a| &a.backup)
+            .filter_map(|c| Path::new(&c.file).file_name())
+            .map(|n| crate::cleanup::key(&n.to_string_lossy()))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("tracksplus-cleanup-scan".into())
+            .spawn(move || {
+                let _ = tx.send(crate::cleanup::scan(&dir, backup, &keep, &backup_keep));
+            });
+        if spawned.is_err() {
+            self.notify("Nettoyage impossible", true);
+            return;
+        }
+        self.cleanup_dlg = Some(CleanupDlg {
+            scan: Some(rx),
+            found: None,
+            trash: None,
+            has_backup,
+            error: None,
+        });
+    }
+
+    fn cleanup_dialog(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(mut dlg) = self.cleanup_dlg.take() else {
+            return;
+        };
+        if let Some(rx) = &dlg.scan {
+            match rx.try_recv() {
+                Ok(Ok(s)) => (dlg.found, dlg.scan) = (Some(s), None),
+                Ok(Err(e)) => (dlg.error, dlg.scan) = (Some(e), None),
+                Err(TryRecvError::Disconnected) => {
+                    (dlg.error, dlg.scan) = (Some("Recherche interrompue".into()), None)
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        let mut trashed = None;
+        if let Some(rx) = &dlg.trash {
+            match rx.try_recv() {
+                Ok(r) => trashed = Some(r),
+                Err(TryRecvError::Disconnected) => trashed = Some(Err(anyhow::anyhow!("interrompu"))),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if dlg.scan.is_some() || dlg.trash.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(r) = trashed {
+            dlg.trash = None;
+            match r {
+                Ok(()) => {
+                    let (n, b) = dlg.found.as_ref().map_or((0, 0), |s| (s.count(), s.bytes()));
+                    // Les fichiers sont partis : l'historique d'annulation pourrait les
+                    // remettre dans la session.
+                    self.undo.clear();
+                    self.redo.clear();
+                    // Session du double remise à jour (elle citait peut-être des fichiers
+                    // qui viennent de partir).
+                    if dlg.has_backup {
+                        self.backup_session_job(None, false);
+                    }
+                    let what = format!(
+                        "{n} fichier{} à la Corbeille · {}",
+                        if n > 1 { "s" } else { "" },
+                        fmt_bytes(b as f64)
+                    );
+                    self.incident(format!("Nettoyage : {what}"));
+                    self.notify(what, false);
+                    return;
+                }
+                Err(e) if e.to_string() == "annulé" => {
+                    dlg.error = Some("Nettoyage annulé".into())
+                }
+                Err(e) => dlg.error = Some(format!("Nettoyage impossible : {e:#}")),
+            }
+        }
+        let busy = dlg.trash.is_some();
+        let mut close = false;
+        let mut go = false;
+        egui::Modal::new(egui::Id::unique("cleanup_dlg"))
+            .frame(t::window_frame())
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.label(
+                    egui::RichText::new("NETTOYER LA SESSION")
+                        .font(t::semibold(12.0))
+                        .color(t::TEXT_2),
+                );
+                ui.add_space(8.0);
+                let plural = |n: usize| if n > 1 { "s" } else { "" };
+                if dlg.scan.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Recherche…");
+                    });
+                } else if let Some(s) = &dlg.found {
+                    let n = s.count();
+                    if n == 0 {
+                        ui.label("Aucun fichier inutilisé.");
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{n} fichier{} inutilisé{} · {}",
+                                plural(n),
+                                plural(n),
+                                fmt_bytes(s.bytes() as f64)
+                            ))
+                            .font(t::semibold(13.0)),
+                        );
+                    }
+                    if dlg.has_backup {
+                        let line = |u: &crate::cleanup::Unused| {
+                            format!("{} · {}", u.files.len(), fmt_bytes(u.bytes as f64))
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("Session : {}", line(&s.main)))
+                                .color(t::TEXT_2),
+                        );
+                        let second = s
+                            .backup_skipped
+                            .clone()
+                            .unwrap_or_else(|| format!("2e disque : {}", line(&s.backup)));
+                        ui.label(egui::RichText::new(second).color(t::TEXT_2));
+                    }
+                    if n > 0 {
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let names = |u: &crate::cleanup::Unused, tag: &str| {
+                                    u.files
+                                        .iter()
+                                        .map(|f| {
+                                            let name = f
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_default();
+                                            format!("{name}{tag}")
+                                        })
+                                        .collect::<Vec<_>>()
+                                };
+                                for l in names(&s.main, "")
+                                    .into_iter()
+                                    .chain(names(&s.backup, "  · 2e disque"))
+                                {
+                                    ui.label(
+                                        egui::RichText::new(l)
+                                            .font(t::regular(11.5))
+                                            .color(t::TEXT_3),
+                                    );
+                                }
+                            });
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Envoyés à la Corbeille. Ctrl+Z ne pourra plus les rendre.",
+                            )
+                            .color(t::TEXT_2),
+                        );
+                    }
+                }
+                if let Some(e) = &dlg.error {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(e).color(t::REC));
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                        ui.label("Mise à la Corbeille…");
+                        return;
+                    }
+                    let n = dlg.found.as_ref().map_or(0, |s| s.count());
+                    if ui
+                        .button(if n > 0 { "Annuler" } else { "Fermer" })
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    if n > 0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if w::danger_button(ui, "Mettre à la Corbeille").clicked() {
+                                go = true;
+                            }
+                        });
+                    }
+                });
+            });
+        if !busy && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if close {
+            return;
+        }
+        if go && let Some(s) = &dlg.found {
+            // La session enregistrée doit correspondre à ce qui reste (sinon la rouvrir
+            // pointerait vers des fichiers partis).
+            if self.project.dirty
+                && let Err(e) = self.project.save()
+            {
+                self.project.dirty = true;
+                dlg.error = Some(format!("Sauvegarde impossible : {e:#}"));
+            } else {
+                let files: Vec<PathBuf> = s.files().cloned().collect();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let spawned = std::thread::Builder::new()
+                    .name("tracksplus-cleanup".into())
+                    .spawn(move || {
+                        let r = crate::cleanup::to_recycle_bin(&files);
+                        if r.is_ok() {
+                            crate::cleanup::drop_peak_caches(&files);
+                        }
+                        let _ = tx.send(r);
+                    });
+                match spawned {
+                    Ok(_) => {
+                        dlg.error = None;
+                        dlg.trash = Some(rx);
+                    }
+                    Err(_) => dlg.error = Some("Nettoyage impossible".into()),
+                }
+            }
+        }
+        self.cleanup_dlg = Some(dlg);
+    }
+
     pub fn dialog_open(&self) -> bool {
         self.incidents_dlg.is_some()
+            || self.cleanup_dlg.is_some()
             || self.settings_dlg.is_some()
             || self.tracks_dlg.is_some()
             || self.export_dlg.is_some()
@@ -6279,6 +6569,13 @@ impl App {
         if ui.button("Afficher le dossier").clicked() {
             let _ = self.project.ensure_dirs();
             open_in_file_manager(&self.project.dir);
+        }
+        if ui
+            .add_enabled(stopped, egui::Button::new("Nettoyer les fichiers inutilisés…"))
+            .clicked()
+        {
+            ui.close();
+            self.open_cleanup();
         }
         if ui.button("Journal des incidents").clicked() {
             ui.close();
@@ -8339,6 +8636,7 @@ impl App {
 
         self.settings_dialog(&ctx);
         self.incidents_dialog(&ctx);
+        self.cleanup_dialog(&ctx);
         self.export_dialog(&ctx);
         self.new_session_dialog(&ctx);
         self.new_tracks_dialog(&ctx);

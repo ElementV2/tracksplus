@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod cleanup;
 mod decode;
 #[cfg(test)]
 mod demo;
