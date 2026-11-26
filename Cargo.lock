@@ -4674,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "tracksplus"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "assert_no_alloc",
