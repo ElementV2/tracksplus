@@ -352,6 +352,9 @@ enum TakeOutcome {
     StillWriting,
 }
 
+/// Largeur du contenu des réglages, la même pour tous les onglets.
+pub(crate) const SETTINGS_W: f32 = 548.0;
+
 /// Copie de sécurité d'une prise dont le résultat n'est pas encore arrivé.
 struct PendingBackup {
     rx: crossbeam_channel::Receiver<Result<Vec<RecResult>, FinishError>>,
@@ -631,6 +634,71 @@ pub struct BackupJob {
     done: bool,
     /// Soundboard de la session (copié avec ses sons, chemins vers la copie).
     board: Board,
+    /// Fichiers audio de la session (dossier Audio) à tenir à jour sur le second disque :
+    /// vide pendant une prise (ses prises sont déjà écrites en double, en direct).
+    files: Vec<String>,
+}
+
+/// Avancement du miroir de la session sur le second disque (`mirror_audio`), partagé
+/// avec le fil de copie.
+#[derive(Default)]
+pub struct MirrorProgress {
+    /// Fichiers à copier lors du passage en cours, et déjà traités.
+    pub total: std::sync::atomic::AtomicU64,
+    pub done: std::sync::atomic::AtomicU64,
+    /// Fichiers non copiés depuis le dernier relevé (`swap` par l'interface).
+    pub failed: std::sync::atomic::AtomicU64,
+    /// Une prise est en cours : la copie s'arrête au fichier suivant (elle reprendra
+    /// après la prise), pour ne jamais ralentir les disques qui enregistrent.
+    pub pause: std::sync::atomic::AtomicBool,
+}
+
+/// Recopie dans `to` les fichiers `files` de `from` qui y manquent ou y sont plus courts
+/// (copie interrompue). Un fichier déjà présent, de même taille ou plus grand, n'est
+/// jamais remplacé : les prises ne changent plus une fois écrites, et la copie d'une
+/// prise peut être plus complète que l'original (trou sur le seul disque principal).
+/// Renvoie (copiés, échecs) ; s'arrête dès que `pause` est levé.
+fn mirror_audio(from: &Path, to: &Path, files: &[String], p: &MirrorProgress) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let need: Vec<&String> = files
+        .iter()
+        .filter(|f| match std::fs::metadata(from.join(f)) {
+            Ok(src) => std::fs::metadata(to.join(f)).map_or(true, |dst| dst.len() < src.len()),
+            Err(_) => false,
+        })
+        .collect();
+    p.done.store(0, Relaxed);
+    p.total.store(need.len() as u64, Relaxed);
+    if need.is_empty() {
+        return (0, 0);
+    }
+    if std::fs::create_dir_all(to).is_err() {
+        p.total.store(0, Relaxed);
+        p.failed.fetch_add(need.len() as u64, Relaxed);
+        return (0, need.len() as u64);
+    }
+    let (mut copied, mut failed) = (0, 0);
+    for f in need {
+        if p.pause.load(Relaxed) {
+            break;
+        }
+        let dst = to.join(f);
+        if let Some(dir) = dst.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match project::copy_synced(&from.join(f), &dst) {
+            Ok(()) => copied += 1,
+            Err(_) => {
+                failed += 1;
+                p.failed.fetch_add(1, Relaxed);
+            }
+        }
+        p.done.fetch_add(1, Relaxed);
+    }
+    // Fini ou interrompu : plus rien d'affiché (le reste suit au prochain passage).
+    p.total.store(0, Relaxed);
+    p.done.store(0, Relaxed);
+    (copied, failed)
 }
 
 /// Placement d'une prise terminée : une prise (clip) par fichier, avec son fichier, et les
@@ -872,8 +940,68 @@ pub struct Resume {
 /// sans dépasser une longueur lisible : partent d'abord les informations, puis les états
 /// de la carte, puis les avertissements, les plus anciens en premier. Le plus récent et
 /// les messages de prise interrompue ne partent jamais.
+/// Fins des messages de prise coupée dont la relance automatique est en attente.
+const RESUME_PENDING: &[&str] = &[" · relance à son retour", " · suite relancée"];
+
+/// Première lettre en minuscule (message repris à la suite d'un autre).
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// Demande de confirmation d'un arrêt de prise au clavier (`request_stop_recording`).
+const STOP_AGAIN: &str = "Appuyez encore pour arrêter";
+
+/// Début de l'alerte « buffer du pilote non appliqué » (`watch_buffer`).
+const BUFFER_STUCK: &str = "Buffer du pilote non appliqué";
+
+/// Messages qui règlent un problème peut-être encore affiché : (début du message, débuts
+/// des messages qu'il rend caducs). Le problème réglé est retiré au lieu de rester
+/// au-dessus (« MIDI débranché » puis « MIDI reconnecté » : seul le second reste) ; tout
+/// reste dans le journal des incidents.
+const RESOLVES: &[(&str, &[&str])] = &[
+    ("Contrôleur MIDI reconnecté", &["Contrôleur MIDI débranché"]),
+    (
+        "MIDI connecté",
+        &["MIDI :", "Contrôleur MIDI débranché", "Aucun contrôleur MIDI"],
+    ),
+    ("Prise précédente terminée", &["Disque lent", FINISHING]),
+    ("Prise précédente complétée", &["Disque lent", FINISHING]),
+    ("Prise enregistrée", &["Disque lent · fin de prise", FINISHING]),
+    ("Enregistré", &[SAVE_FAILED, SAVE_RETRY]),
+    ("Session enregistrée", &[SAVE_FAILED, SAVE_RETRY]),
+    ("Pad rétabli", &["Pad supprimé"]),
+    ("Copie dans la session impossible", &[COPYING_SOUND]),
+];
+/// « Prise refusée, la précédente finit de s'écrire » (`record`).
+const FINISHING: &str = "Finalisation de la prise précédente";
+/// Début du message « Copie de « son » dans la session… » (gros son glissé sur un pad).
+pub(crate) const COPYING_SOUND: &str = "Copie de « ";
+/// Débuts des messages d'échec de sauvegarde (retirés quand une sauvegarde réussit).
+const SAVE_FAILED: &str = "Sauvegarde de la session impossible";
+const SAVE_RETRY: &str = "Session non sauvegardée";
+/// Messages disant que la carte remarche : ils remplacent ses états de panne (`Level::Device`).
+const CARD_OK: &[&str] = &["Carte son reconnectée", "Carte son prête", "Carte son revenue"];
+
+/// Le message `text` rend-il caduc le message affiché `old` (de niveau `old_level`) ?
+fn toast_resolved_by(text: &str, old_level: Level, old: &str) -> bool {
+    (old_level == Level::Device && CARD_OK.iter().any(|p| text.starts_with(p)))
+        || RESOLVES
+            .iter()
+            .filter(|(p, _)| text.starts_with(p))
+            .any(|(_, stale)| stale.iter().any(|s| old.starts_with(s)))
+}
+
 fn push_toast(items: &mut Vec<(Level, String)>, level: Level, text: String) {
     const MAX: usize = 900;
+    // État de la carte : le nouveau remplace l'ancien (« perdue · reconnexion… » puis
+    // « refusée · nouvel essai… ») au lieu de s'empiler ; l'historique est dans le journal.
+    if level == Level::Device {
+        items.retain(|(l, _)| *l != Level::Device);
+    }
     if let Some(i) = items.iter().position(|(_, t)| *t == text) {
         let (l, t) = items.remove(i);
         items.push((l.max(level), t));
@@ -1227,6 +1355,15 @@ pub struct App {
     pub backup_prefs_error: Option<String>,
     /// Thread qui tient à jour le double de la session sur le second disque.
     pub backup_jobs: Option<std::sync::mpsc::Sender<BackupJob>>,
+    /// Avancement du miroir de la session sur le second disque.
+    pub mirror: Arc<MirrorProgress>,
+    /// Fichiers déjà confiés au miroir pour la session `mirror_dir`, et passage complet à
+    /// faire au prochain envoi (`backup_session_job`).
+    mirror_sent: HashSet<String>,
+    mirror_dir: PathBuf,
+    mirror_full: bool,
+    /// Sauvegardes de la session déjà suivies par le second disque (`Project::saves`).
+    mirror_saves: u64,
     pub backup_thread: Option<std::thread::JoinHandle<()>>,
     /// Carte son perdue : prochain essai de réouverture (secondes) et délai courant.
     pub reconnect: Option<(f64, f64)>,
@@ -1285,6 +1422,10 @@ pub struct App {
     /// où il a changé ; dernier passage (un saut = veille ou interface figée).
     hb: [(u64, f64); audio::SLOTS],
     hb_tick: f64,
+    /// Contrôle du rythme de la sortie principale : (instant, battements, alertes).
+    rate_check: (f64, u64, u8),
+    /// Décalage du pilote déjà signalé (`watch_buffer`).
+    rate_noted: bool,
     /// Prise arrêtée par une perte de la carte, à relancer dès son retour.
     pub resume: Option<Resume>,
     /// Réouverture ASIO en attente de la fin des pads / du transport : déjà signalée.
@@ -1298,6 +1439,8 @@ pub struct App {
     pub backup_disk_job: Option<(f64, PathBuf, std::sync::mpsc::Receiver<Option<u64>>)>,
     /// Latence aller-retour à compenser sur les prises en cours (trames, 0 = aucune).
     pub rec_latency: u64,
+    /// Charge audio affichée dans les réglages (relevée chaque seconde) et sa date.
+    audio_load: (std::time::Instant, audio::Load),
     /// La prise en cours est faite en écoutant les pistes existantes.
     pub rec_overdub: bool,
     /// Journal de la prise en cours, à compléter du décalage mesuré dès que la prise a
@@ -1378,6 +1521,10 @@ pub struct App {
     pub undo: Vec<Snapshot>,
     pub redo: Vec<Snapshot>,
     pub sel_clips: HashSet<u64>,
+    /// Raccourcis clavier (Réglages → Raccourcis).
+    pub keys: crate::shortcuts::Keymap,
+    /// Raccourci en cours d'attribution dans les réglages : (action, emplacement 0 ou 1).
+    pub keys_capture: Option<(&'static str, usize)>,
     pub snap: bool,
     pub clip_drag: Option<crate::ui::multitrack::ClipDrag>,
 }
@@ -1540,6 +1687,11 @@ impl App {
             backup_root,
             backup_prefs_error,
             backup_jobs: None,
+            mirror: Arc::new(MirrorProgress::default()),
+            mirror_sent: HashSet::new(),
+            mirror_dir: PathBuf::new(),
+            mirror_full: true,
+            mirror_saves: 0,
             backup_thread: None,
             reconnect: None,
             lost_during_take: false,
@@ -1564,12 +1716,15 @@ impl App {
             stall_logged: false,
             hb: [(0, 0.0); audio::SLOTS],
             hb_tick: 0.0,
+            rate_check: (0.0, 0, 0),
+            rate_noted: false,
             resume: None,
             reconnect_wait: false,
             device_note: String::new(),
             disk_job: None,
             backup_disk_job: None,
             rec_latency: 0,
+            audio_load: (std::time::Instant::now(), audio::Load::default()),
             rec_overdub: false,
             journal_pending: None,
             import_job: None,
@@ -1598,6 +1753,8 @@ impl App {
             undo: Vec::new(),
             redo: Vec::new(),
             sel_clips: HashSet::new(),
+            keys: crate::shortcuts::Keymap::load(),
+            keys_capture: None,
             snap: false,
             clip_drag: None,
         };
@@ -1768,6 +1925,7 @@ impl App {
         // messages partent seuls (plus longtemps affichés s'ils sont importants) ; tout ce
         // qui compte reste dans le journal des incidents.
         let until = self.now + toast_secs(level);
+        self.drop_toast(|l, old| toast_resolved_by(&text, l, old));
         if let Some(t) = &mut self.toast
             && t.error
             && self.now < t.until
@@ -1781,6 +1939,19 @@ impl App {
             error: level > Level::Info,
             until,
         });
+    }
+
+    /// Retire du message affiché ce qui n'a plus lieu d'être (problème réglé). S'il ne
+    /// reste plus d'alerte, le message disparaît (les simples informations partent avec).
+    pub(crate) fn drop_toast(&mut self, stale: impl Fn(Level, &str) -> bool) {
+        if let Some(t) = &mut self.toast {
+            let before = t.items.len();
+            t.items.retain(|(l, old)| !stale(*l, old));
+            // Seulement si quelque chose est parti : une information affichée reste.
+            if t.items.len() < before && !t.items.iter().any(|(l, _)| *l > Level::Info) {
+                self.toast = None;
+            }
+        }
     }
 
     /// Carte choisie mais qui ne joue pas encore (barre du haut) : « pas d'horloge » (Dante
@@ -1961,12 +2132,29 @@ impl App {
         }
     }
 
+    /// Pistes jouées par la lecture : les audibles (mute / solo), sauf celles qui
+    /// enregistrent en ce moment. Comme dans les logiciels pro, une piste en prise fait
+    /// entendre son entrée (monitoring), jamais l'ancienne prise qu'on remplace.
+    /// `recording` : une prise est en cours (ou démarre) ; ses pistes sont les armées qui
+    /// ont une entrée.
+    fn playback_audible(&self, recording: bool) -> Vec<bool> {
+        let mut audible = self.project.audible();
+        if recording {
+            for (a, t) in audible.iter_mut().zip(&self.project.tracks) {
+                if t.armed && t.input.is_some() {
+                    *a = false;
+                }
+            }
+        }
+        audible
+    }
+
     /// Mute / solo changés. Le lecteur lit jusqu'à 3 s en avance (sécurité disque) :
     /// pendant la lecture, un nouveau rendu démarre ~0,2 s devant ce qu'on entend et le
     /// moteur bascule dessus à cette trame précise, avec un fondu court. Le changement
     /// s'entend ainsi aussitôt, sans coupure ni saut.
     pub fn update_audible(&mut self) {
-        let audible = self.project.audible();
+        let audible = self.playback_audible(self.is_recording());
         let Some(p) = &self.player else {
             return;
         };
@@ -2120,7 +2308,7 @@ impl App {
             OverFinishing::Free => false,
             OverFinishing::Adopt => true,
             OverFinishing::Wait => {
-                self.notify("Finalisation de la prise précédente…", false);
+                self.notify(format!("{FINISHING}…"), false);
                 return;
             }
             OverFinishing::TooMany => {
@@ -2241,7 +2429,7 @@ impl App {
         }
         if self.engine.has_output() && self.project.has_audio() {
             let (player, cons) =
-                Player::start(&self.project, self.playhead, self.project.audible(), None);
+                Player::start(&self.project, self.playhead, self.playback_audible(true), None);
             if self.engine.start_playback(cons) {
                 self.player = Some(player);
                 self.play_base = self.playhead;
@@ -2526,6 +2714,9 @@ impl App {
         let same = *dir == self.project.dir;
         match rx.try_recv() {
             Ok(Ok(())) => {
+                if same {
+                    self.drop_save_failure();
+                }
                 // Session sauvegardée avec les prises : leurs fichiers inutiles peuvent partir.
                 if let Some((_, _, cleanup)) = self.rec_save.take() {
                     for f in cleanup {
@@ -2541,7 +2732,7 @@ impl App {
                     // Nouvel essai par la sauvegarde automatique (active aussi pendant une prise).
                     self.project.dirty = true;
                     self.notify(
-                        format!("Session non sauvegardée · nouvel essai : {e:#}"),
+                        format!("{SAVE_RETRY} · nouvel essai : {e:#}"),
                         true,
                     );
                 }
@@ -2642,6 +2833,12 @@ impl App {
     }
 
     pub fn stop(&mut self) {
+        // Prise arrêtée (clavier, bouton, perte de la carte…) : « Appuyez encore pour
+        // arrêter » n'a plus lieu d'être, le message de fin de prise prend sa place.
+        if self.is_recording() {
+            self.stop_armed_until = 0.0;
+            self.drop_toast(|_, t| t == STOP_AGAIN);
+        }
         match self.transport {
             // Stop à l'arrêt : l'opérateur reprend la main, plus de relance automatique.
             Transport::Stopped => self.cancel_resume(),
@@ -2891,6 +3088,8 @@ impl App {
         });
         self.journal_late_take(&file, track_id, Some(est));
         self.incident(format!("« {name} » ajoutée à la prise"));
+        // Sa lecture se tait : on entend son entrée.
+        self.update_audible();
         true
     }
 
@@ -2914,6 +3113,8 @@ impl App {
                 if let Some(t) = self.project.tracks.iter_mut().find(|t| t.id == l.track_id) {
                     t.armed = false;
                 }
+                // Pas ajoutée à la prise : sa lecture reprend.
+                self.update_audible();
                 let dir = l.path.parent().map(Path::to_path_buf).unwrap_or_default();
                 finish_discarded(l.recorder, dir);
                 self.notify("Piste non ajoutée à la prise", true);
@@ -3306,6 +3507,10 @@ impl App {
             return;
         }
         self.playhead = start + max_len;
+        // Prises qui viennent d'être enregistrées sélectionnées : Suppr pour la refaire.
+        if !main_clips.is_empty() {
+            self.sel_clips = main_clips.iter().map(|(_, c)| c.id).collect();
+        }
         self.project.dirty = true;
         // L'état d'avant la prise rejoint les versions précédentes (`.bak`).
         let save = self.project.save_checkpoint();
@@ -3492,7 +3697,7 @@ impl App {
             self.stop();
         } else {
             self.stop_armed_until = self.now + 2.0;
-            self.notify("Appuyez encore pour arrêter", true);
+            self.notify(STOP_AGAIN, true);
         }
     }
 
@@ -3504,6 +3709,7 @@ impl App {
     fn watch_device(&mut self) {
         self.poll_reconnect();
         self.watch_streams();
+        self.watch_buffer();
         self.watch_take();
         self.resume_take();
         self.schedule_reconnect();
@@ -3572,6 +3778,45 @@ impl App {
             self.hb = [(0, now); audio::SLOTS];
             self.open_seen = 0;
             self.started = 0;
+        }
+    }
+
+    /// ASIO : le pilote appelle bien moins souvent que son buffer ne le prévoit (buffer
+    /// changé dans son panneau pendant qu'un autre client, la sortie Windows sur la même
+    /// carte, garde l'ancienne période) : on n'en reçoit qu'une partie, voix de robot.
+    /// Constaté deux secondes de suite : dit une fois, jusqu'au retour à la normale.
+    fn watch_buffer(&mut self) {
+        let now = self.now;
+        let sh = &self.engine.shared;
+        let beat = sh.heartbeat[audio::SLOT_MAIN].load(Ordering::Relaxed);
+        let (t0, b0, strikes) = self.rate_check;
+        let dt = now - t0;
+        if dt < 1.0 {
+            return;
+        }
+        let blk = sh.out_block.load(Ordering::Relaxed);
+        let sr = self.engine.status.sample_rate;
+        let got = beat.saturating_sub(b0) as f64;
+        let checked = dt < 1.5
+            && self.prefs.host.as_deref() == Some("ASIO")
+            && self.engine.open_mask() & audio::slot_bit(audio::SLOT_MAIN) != 0
+            && blk > 0
+            && sr > 0
+            && got > 0.0;
+        let slow = checked && got < sr as f64 / blk as f64 * dt * 0.6;
+        let strikes = if slow { strikes.saturating_add(1) } else { 0 };
+        self.rate_check = (now, beat, strikes);
+        if checked && !slow {
+            // Revenu à la normale : l'alerte encore affichée n'a plus lieu d'être.
+            if std::mem::take(&mut self.rate_noted) {
+                self.drop_toast(|_, old| old.starts_with(BUFFER_STUCK));
+            }
+        } else if strikes >= 2 && !self.rate_noted {
+            self.rate_noted = true;
+            self.notify_level(
+                format!("{BUFFER_STUCK} · sortie Windows sur un autre périphérique, puis Actualiser"),
+                Level::Device,
+            );
         }
     }
 
@@ -3687,11 +3932,37 @@ impl App {
         self.stop();
     }
 
+    /// Issue d'une relance automatique annoncée plus haut (« … · relance à son retour ») :
+    /// le message d'origine est complété au lieu de rester affiché avec une suite caduque
+    /// (« Carte son perdue · prise sauvegardée (1:23) · prise relancée · trou de 12 s »).
+    fn resume_outcome(&mut self, outcome: String) {
+        let mut cause = None;
+        if let Some(t) = &mut self.toast {
+            if let Some(i) = t
+                .items
+                .iter()
+                .rposition(|(_, s)| RESUME_PENDING.iter().any(|p| s.ends_with(p)))
+            {
+                let (_, s) = t.items.remove(i);
+                if let Some(p) = RESUME_PENDING.iter().find(|p| s.ends_with(*p)) {
+                    cause = Some(s[..s.len() - p.len()].to_string());
+                }
+            }
+            // « Carte son reconnectée » : dit par le message complété.
+            t.items.retain(|(_, s)| !s.starts_with("Carte son reconnectée"));
+        }
+        let text = match cause {
+            Some(c) => format!("{c} · {}", lower_first(&outcome)),
+            None => outcome,
+        };
+        self.notify_level(text, Level::Critical);
+    }
+
     /// Relance automatique en attente : annulée (l'opérateur reprend la main : Stop,
     /// Échap, panique, indicateur du transport).
     pub fn cancel_resume(&mut self) {
         if self.resume.take().is_some() {
-            self.notify_level("Relance auto annulée", Level::Critical);
+            self.resume_outcome("Relance auto annulée".into());
         }
     }
 
@@ -3741,17 +4012,14 @@ impl App {
             ResumeStep::Cancel => self.resume = None,
             ResumeStep::Blocked => {
                 self.resume = None;
-                self.notify_level("Relance impossible : disque bloqué", Level::Critical);
+                self.resume_outcome("Relance impossible : disque bloqué".into());
             }
             ResumeStep::Expire => {
                 self.resume = None;
-                self.notify_level(
-                    format!(
-                        "Relance abandonnée : carte absente depuis {} min",
-                        (RESUME_MAX / 60.0).round()
-                    ),
-                    Level::Critical,
-                );
+                self.resume_outcome(format!(
+                    "Relance abandonnée : carte absente depuis {} min",
+                    (RESUME_MAX / 60.0).round()
+                ));
             }
             ResumeStep::Go => {
                 let gap = (self.now - at).max(0.0);
@@ -3763,12 +4031,9 @@ impl App {
                         self.playhead,
                         format!("Reprise auto (trou {})", fmt_gap(gap)),
                     );
-                    self.notify_level(
-                        format!("Prise relancée · trou de {}", fmt_gap(gap)),
-                        Level::Critical,
-                    );
+                    self.resume_outcome(format!("Prise relancée · trou de {}", fmt_gap(gap)));
                 } else {
-                    self.notify_level("Relance impossible · relancez la prise", Level::Critical);
+                    self.resume_outcome("Relance impossible · relancez la prise".into());
                 }
             }
         }
@@ -4117,7 +4382,7 @@ impl App {
                 stopped,
                 egui::Checkbox::new(
                     &mut on,
-                    "Enregistrer aussi chaque prise sur un second disque",
+                    "Copie de la session sur un second disque",
                 ),
             )
             .on_disabled_hover_text("Arrêtez d'abord la prise");
@@ -4131,10 +4396,10 @@ impl App {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "Comme les enregistreurs pro : chaque prise est écrite en même temps sur un \
-                 second disque (clé, SSD externe), avec un double de la session qui s'ouvre tel \
-                 quel. Un second disque lent, plein ou débranché ne gêne jamais \
-                 l'enregistrement principal.",
+                "Toute la session (prises, imports, sons du soundboard) est recopiée sur un \
+                 second disque et tenue à jour ; le double s'ouvre tel quel. Pendant une prise, \
+                 elle y est écrite en direct. Un second disque lent, plein ou débranché ne gêne \
+                 jamais l'enregistrement : il est remis à jour à son retour.",
             )
             .color(t::TEXT_3),
         );
@@ -4152,7 +4417,15 @@ impl App {
                 self.pick_backup_root();
             }
             ui.add_space(6.0);
+            let copying = self.mirror.total.load(Ordering::Relaxed);
             let (txt, col) = match self.backup_free {
+                Some(Ok(_)) if copying > 0 => (
+                    format!(
+                        "Copie en cours : {}/{copying} fichiers",
+                        self.mirror.done.load(Ordering::Relaxed).min(copying)
+                    ),
+                    t::TEXT_3,
+                ),
                 Some(Ok(free)) => (
                     format!(
                         "{:.0} Go libres · ≈ {} d'enregistrement avec les pistes armées",
@@ -4235,7 +4508,8 @@ impl App {
             Err(e) => self.notify(format!("Réglage de la copie non enregistré : {e:#}"), true),
         }
         self.backup_root = d;
-        // Nouvelle mesure du second disque au prochain passage (dans les 2 s).
+        // Nouvelle mesure du second disque au prochain passage (dans les 2 s) : dès qu'il
+        // répond, toute la session y est recopiée (`poll_disks`).
         self.backup_free = None;
         self.disk_checked = f64::NEG_INFINITY;
     }
@@ -4260,6 +4534,36 @@ impl App {
         let Some(dir) = self.backup_session_dir() else {
             return;
         };
+        // Miroir complet (prises, imports) hors prise, et seulement si le second disque
+        // répond : sinon chaque fichier échouerait.
+        // Passage complet (tous les fichiers revérifiés) à l'activation, au retour du disque,
+        // après une prise (une copie interrompue par la prise reprend) et à chaque nouvelle
+        // session ; sinon seulement les fichiers apparus depuis (imports) : pas de lecture
+        // de tout le second disque à chaque sauvegarde automatique.
+        if self.mirror_dir != self.project.dir {
+            self.mirror_dir = self.project.dir.clone();
+            self.mirror_full = true;
+        }
+        let files = if self.take_in_progress() || !matches!(self.backup_free, Some(Ok(_))) {
+            Vec::new()
+        } else {
+            let full = std::mem::take(&mut self.mirror_full) || done;
+            if full {
+                self.mirror_sent.clear();
+            }
+            let mut v: Vec<String> = self
+                .project
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter().map(|c| c.file.clone()))
+                .filter(|f| !self.mirror_sent.contains(f))
+                .collect();
+            v.sort();
+            v.dedup();
+            self.mirror_sent.extend(v.iter().cloned());
+            v
+        };
+        let progress = self.mirror.clone();
         let tx = self.backup_jobs.get_or_insert_with(|| {
             let (tx, rx) = std::sync::mpsc::channel::<BackupJob>();
             let h = std::thread::Builder::new()
@@ -4267,6 +4571,12 @@ impl App {
                 .spawn(move || {
                     for mut job in rx {
                         let from = std::mem::replace(&mut job.project.dir, job.dir.clone());
+                        // Fichiers audio d'abord : le double de la session ne référence
+                        // ensuite que des fichiers présents sur le second disque.
+                        if !job.files.is_empty() {
+                            let audio = project::AUDIO_DIR;
+                            mirror_audio(&from.join(audio), &job.dir.join(audio), &job.files, &progress);
+                        }
                         let saved = job.project.save().is_ok();
                         backup_board(job.board, &from, &job.dir);
                         if let Some(j) = &job.journal {
@@ -4298,6 +4608,7 @@ impl App {
             journal,
             done,
             board: self.board.clone(),
+            files,
         });
     }
 
@@ -4699,13 +5010,18 @@ impl App {
         self.save_board_now();
     }
 
+    /// Session sauvegardée : un message d'échec de sauvegarde encore affiché est retiré.
+    fn drop_save_failure(&mut self) {
+        self.drop_toast(|_, old| old.starts_with(SAVE_FAILED) || old.starts_with(SAVE_RETRY));
+    }
+
     /// Sauvegarde automatique impossible (disque plein, clé retirée…) : on le dit, sans
     /// répéter le message en boucle. La session reste marquée « modifiée ».
     fn save_failed(&mut self, e: anyhow::Error) {
         self.project.dirty = true;
         if self.now - self.save_error_at > 30.0 {
             self.save_error_at = self.now;
-            self.notify(format!("Sauvegarde de la session impossible : {e:#}"), true);
+            self.notify(format!("{SAVE_FAILED} : {e:#}"), true);
         }
     }
 
@@ -4762,6 +5078,8 @@ impl App {
         // remplacer celle-ci (refaite au prochain passage s'il y a encore à sauvegarder).
         crate::shutdown::set_pending_board_save(None);
         self.pending_saves_at = None;
+        // Sons ajoutés : copiés aussitôt sur le second disque.
+        self.backup_session_job(None, false);
         true
     }
 
@@ -4799,7 +5117,7 @@ impl App {
         {
             self.project.dirty = true;
             ok = false;
-            self.notify(format!("Sauvegarde de la session impossible : {e:#}"), true);
+            self.notify(format!("{SAVE_FAILED} : {e:#}"), true);
         } else if self.project.dirty
             && let Some(why) = &self.project.read_only
         {
@@ -5060,7 +5378,7 @@ impl App {
             if self.project.dirty
                 && let Err(e) = self.project.save()
             {
-                warnings.push(format!("Sauvegarde de la session impossible : {e:#}"));
+                warnings.push(format!("{SAVE_FAILED} : {e:#}"));
             }
             warnings.insert(0, m);
         }
@@ -5598,6 +5916,7 @@ impl App {
 
     pub fn close_dialogs(&mut self) {
         self.settings_dlg = None;
+        self.keys_capture = None;
         self.export_dlg = None;
         self.new_dlg = None;
         self.update_dlg = false;
@@ -5899,9 +6218,10 @@ impl App {
                             });
                         ui.add_space(6.0);
                         ui.label(
-                            egui::RichText::new(
-                                "Envoyés à la Corbeille. Ctrl+Z ne pourra plus les rendre.",
-                            )
+                            egui::RichText::new(format!(
+                                "Envoyés à la Corbeille. {} ne pourra plus les rendre.",
+                                self.keys.label(crate::shortcuts::UNDO)
+                            ))
                             .color(t::TEXT_2),
                         );
                     }
@@ -5998,6 +6318,11 @@ impl App {
     // ---------------------------------------------------------------- frame
 
     fn global_keys(&mut self, ctx: &egui::Context) {
+        // Raccourci en cours d'attribution (Réglages → Raccourcis) : la touche lui revient,
+        // Échap compris (il annule l'attribution sans fermer les réglages).
+        if self.keys_capture.is_some() {
+            return;
+        }
         if self.dialog_open() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
                 && self.export_job.is_none()
@@ -6006,15 +6331,10 @@ impl App {
             }
             return;
         }
+        use crate::shortcuts as k;
         if !ctx.egui_wants_keyboard_input() {
-            let shift_cmd = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
-            let (redo, undo) = ctx.input_mut(|i| {
-                (
-                    i.consume_key(shift_cmd, Key::Z)
-                        || i.consume_key(egui::Modifiers::COMMAND, Key::Y),
-                    i.consume_key(egui::Modifiers::COMMAND, Key::Z),
-                )
-            });
+            let keys = &self.keys;
+            let (redo, undo) = ctx.input_mut(|i| (keys.pressed(i, k::REDO), keys.pressed(i, k::UNDO)));
             if redo {
                 self.redo();
             } else if undo && self.tab == 1 && self.sb.deleted.is_some() {
@@ -6023,14 +6343,19 @@ impl App {
                 self.undo();
             }
         }
-        let (save, export, tab1, tab2) = ctx.input_mut(|i| {
+        let keys = &self.keys;
+        let (save, export, tab1, tab2, settings) = ctx.input_mut(|i| {
             (
-                i.consume_key(egui::Modifiers::COMMAND, Key::S),
-                i.consume_key(egui::Modifiers::COMMAND, Key::E),
-                i.consume_key(egui::Modifiers::COMMAND, Key::Num1),
-                i.consume_key(egui::Modifiers::COMMAND, Key::Num2),
+                keys.pressed(i, k::SAVE),
+                keys.pressed(i, k::EXPORT),
+                keys.pressed(i, k::TAB_MULTI),
+                keys.pressed(i, k::TAB_BOARD),
+                keys.pressed(i, k::SETTINGS),
             )
         });
+        if settings {
+            self.open_settings();
+        }
         if save {
             self.save();
         }
@@ -6221,10 +6546,17 @@ impl App {
             DiskPoll::Stuck => self.disk_free = None,
             _ => {}
         }
+        let backup_was_ok = matches!(self.backup_free, Some(Ok(_)));
         match poll(&mut self.backup_disk_job, &backup_dir) {
             DiskPoll::Done(free) => self.backup_free = Some(free.ok_or(())),
             DiskPoll::Stuck => self.backup_free = Some(Err(())),
             _ => {}
+        }
+        // Second disque qui répond (copie activée, lancement, disque rebranché) : la
+        // session y est mise à jour en entier, en arrière-plan.
+        if !backup_was_ok && matches!(self.backup_free, Some(Ok(_))) && self.worth_saving() {
+            self.mirror_full = true;
+            self.backup_session_job(None, false);
         }
         if backup_dir.is_none() {
             self.backup_free = None;
@@ -6318,7 +6650,7 @@ impl App {
                     .font(t::regular(9.0))
                     .color(t::TEXT_3),
             )
-            .on_hover_text("Modifications non enregistrées (Ctrl+S)");
+            .on_hover_text(self.keys.tip("Modifications non enregistrées", crate::shortcuts::SAVE));
         }
         let tabs = egui::Rect::from_min_max(
             egui::pos2(left.right() - tabs_w, full.top()),
@@ -6444,7 +6776,7 @@ impl App {
             30.0,
             BtnStyle::Ghost,
             !recording,
-            "Début (Origine)",
+            &self.keys.tip("Début", crate::shortcuts::GO_START),
         )
         .clicked()
         {
@@ -6458,7 +6790,10 @@ impl App {
             30.0,
             BtnStyle::Ghost,
             !stopped || self.resume.is_some(),
-            "Stop (Espace) — pendant une prise : deux clics pour arrêter",
+            &format!(
+                "{} — pendant une prise : deux clics pour arrêter",
+                self.keys.tip("Stop", crate::shortcuts::PLAY)
+            ),
         )
         .clicked()
         {
@@ -6479,7 +6814,7 @@ impl App {
             30.0,
             play_style,
             !recording,
-            "Lecture (Espace)",
+            &self.keys.tip("Lecture", crate::shortcuts::PLAY),
         )
         .clicked()
         {
@@ -6505,7 +6840,10 @@ impl App {
             30.0,
             rec_style,
             true,
-            "Enregistrer (R) — pendant une prise : deux clics pour arrêter",
+            &format!(
+                "{} — pendant une prise : deux clics pour arrêter",
+                self.keys.tip("Enregistrer", crate::shortcuts::RECORD)
+            ),
         )
         .clicked()
         {
@@ -6521,7 +6859,8 @@ impl App {
         } else {
             BtnStyle::Ghost
         };
-        if w::icon_button(ui, Icon::Loop, 30.0, loop_style, true, "Boucle (L)").clicked() {
+        let tip = self.keys.tip("Boucle", crate::shortcuts::LOOP);
+        if w::icon_button(ui, Icon::Loop, 30.0, loop_style, true, &tip).clicked() {
             self.toggle_loop();
         }
         ui.add_space(10.0);
@@ -6592,7 +6931,7 @@ impl App {
             self.open_session();
         }
         if ui
-            .add(egui::Button::new("Enregistrer").shortcut_text("Ctrl+S"))
+            .add(egui::Button::new("Enregistrer").shortcut_text(self.keys.label(crate::shortcuts::SAVE)))
             .clicked()
         {
             self.save();
@@ -6621,7 +6960,7 @@ impl App {
         if ui
             .add_enabled(
                 self.project.has_audio() && stopped,
-                egui::Button::new("Exporter…").shortcut_text("Ctrl+E"),
+                egui::Button::new("Exporter…").shortcut_text(self.keys.label(crate::shortcuts::EXPORT)),
             )
             .clicked()
         {
@@ -6752,6 +7091,18 @@ impl App {
                 let bps = self.rec_bytes_per_sec();
                 // Second disque de la copie de sécurité (à droite du disque principal).
                 match self.backup_free {
+                    // Session en cours de recopie sur le second disque.
+                    Some(Ok(_)) if self.mirror.total.load(Ordering::Relaxed) > 0 => {
+                        let total = self.mirror.total.load(Ordering::Relaxed);
+                        let done = self.mirror.done.load(Ordering::Relaxed).min(total);
+                        ui.label(
+                            egui::RichText::new(format!("Copie {done}/{total} fichiers"))
+                                .font(t::regular(11.5))
+                                .color(t::TEXT_3),
+                        )
+                        .on_hover_text("Copie de sécurité : la session est recopiée sur le second disque");
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                    }
                     Some(Ok(free)) => {
                         let secs = free / bps;
                         ui.label(
@@ -6777,22 +7128,26 @@ impl App {
                     None => {}
                 }
                 if let Some(free) = self.disk_free {
+                    // Seules les pistes armées remplissent le disque : la durée est calculée
+                    // pour elles (une piste mono si aucune n'est armée).
                     let armed = self
                         .project
                         .tracks
                         .iter()
                         .filter(|t| t.armed && t.input.is_some())
-                        .count()
-                        .max(1);
+                        .count();
                     let secs = free / bps;
                     let col = if secs < 1800 { t::REC } else { t::TEXT_3 };
+                    let who = match armed {
+                        0 => "par piste".to_string(),
+                        1 => "1 piste armée".to_string(),
+                        n => format!("{n} pistes armées"),
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "Disque {:.0} Go · ≈ {} d'enregistrement ({} piste{})",
+                            "Disque {:.0} Go · ≈ {} d'enregistrement ({who})",
                             free as f64 / 1e9,
                             fmt_duration(secs),
-                            armed,
-                            if armed > 1 { "s" } else { "" }
                         ))
                         .font(t::regular(11.5))
                         .color(col),
@@ -6851,9 +7206,10 @@ impl App {
         egui::Modal::new(egui::Id::unique("settings_dlg"))
             .frame(t::window_frame())
             .show(ctx, |ui| {
-                ui.set_width(520.0);
-                // Même hauteur pour tous les onglets : la fenêtre ne saute pas d'un onglet à
-                // l'autre (boutons en bas).
+                // Même largeur et même hauteur pour tous les onglets : la fenêtre ne bouge
+                // pas d'un onglet à l'autre (boutons en bas). La largeur est celle qu'il faut
+                // à « Carte son » (listes et bouton « Actualiser »).
+                ui.set_width(SETTINGS_W);
                 const SETTINGS_H: f32 = 530.0;
                 let top = ui.cursor().top();
                 ui.set_min_height(SETTINGS_H);
@@ -6863,7 +7219,11 @@ impl App {
                     vec2(ui.available_width(), 30.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        w::view_tabs(ui, &mut dlg.tab, &["CARTE SON", "ENREGISTREMENT", "SOUNDBOARD"]);
+                        w::view_tabs_even(
+                            ui,
+                            &mut dlg.tab,
+                            &["CARTE SON", "ENREGISTREMENT", "SOUNDBOARD", "RACCOURCIS"],
+                        );
                     },
                 );
                 {
@@ -6880,6 +7240,12 @@ impl App {
                 }
                 if dlg.tab == 2 {
                     self.sb_settings(ui);
+                    return;
+                }
+                if dlg.tab == 3 {
+                    // Liste qui défile dans la hauteur commune, bouton en bas comme
+                    // « Appliquer » : la fenêtre garde sa taille.
+                    self.keys_settings(ui, top + SETTINGS_H);
                     return;
                 }
                 // Notes affichées sous la grille (retour à la ligne dans la largeur du dialogue).
@@ -7150,6 +7516,26 @@ impl App {
                     if st.output.is_some() {
                         txt += &format!(" · sortie {}", blk(sh.out_block.load(Ordering::Relaxed)));
                     }
+                    // Charge : pire cycle de la dernière seconde (au-delà de ~70 %, ça craque).
+                    if self.audio_load.0.elapsed().as_secs_f32() >= 1.0 {
+                        self.audio_load = (
+                            std::time::Instant::now(),
+                            sh.take_load(st.sample_rate),
+                        );
+                    }
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                    let ld = self.audio_load.1;
+                    if st.output.is_some() && ld.block_ms > 0.0 {
+                        txt += &format!(" · charge {:.0} %", ld.busy * 100.0);
+                    }
+                    // Aller-retour annoncé par le pilote.
+                    let rt = self.engine.round_trip_latency();
+                    if st.input.is_some() && st.output.is_some() && rt > 0 {
+                        txt += &format!(
+                            " · aller-retour {:.1} ms",
+                            rt as f64 * 1000.0 / st.sample_rate.max(1) as f64
+                        );
+                    }
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(txt).font(t::regular(11.5)).color(t::TEXT_3));
                 }
@@ -7215,6 +7601,10 @@ impl App {
         if apply && dlg.asio() && dlg.card.is_none() {
             apply = false;
             dlg.error = Some("Choisissez une carte".into());
+        }
+        // Attribution de raccourci abandonnée en quittant l'onglet ou les réglages.
+        if close || dlg.tab != 3 {
+            self.keys_capture = None;
         }
         if apply {
             match self.apply_audio(dlg.prefs.clone()) {
@@ -8423,6 +8813,23 @@ impl App {
     /// du processus, messages des incidents survenus hors de l'interface.
     fn crash_safety_tick(&mut self, ctx: &egui::Context) {
         let busy = self.take_in_progress();
+        // Miroir sur le second disque : en pause pendant une prise (reprise après).
+        self.mirror.pause.store(busy, Ordering::Relaxed);
+        // Session sauvegardée (par n'importe quel chemin : sauvegarde automatique,
+        // Ctrl+S, import, fin de prise…) : le second disque suit.
+        if self.project.saves != self.mirror_saves {
+            self.mirror_saves = self.project.saves;
+            self.backup_session_job(None, false);
+        }
+        let failed = self.mirror.failed.swap(0, Ordering::Relaxed);
+        if failed > 0 {
+            // Tout revérifié au prochain envoi : les fichiers manqués seront recopiés.
+            self.mirror_full = true;
+            self.notify(
+                format!("Copie de sécurité : {failed} fichier(s) non copié(s) · nouvel essai à la prochaine sauvegarde"),
+                true,
+            );
+        }
         crate::shutdown::set_take_in_progress(busy);
         crate::shutdown::sync_block_reason(busy);
         // Fermeture acceptée (pas de confirmation à demander) : une erreur pendant la
@@ -8610,10 +9017,12 @@ impl App {
                 Ok(r) => {
                     self.autosave_job = None;
                     // (Une session quittée entre-temps a été réglée par `settle_autosave`.)
-                    if let Err(e) = r
-                        && same
-                    {
-                        self.save_failed(e);
+                    match r {
+                        Err(e) if same => self.save_failed(e),
+                        // Sauvegarde réussie : un échec encore affiché n'a plus lieu d'être,
+                        // et le second disque suit (fichiers audio compris hors prise).
+                        Ok(()) if same => self.drop_save_failure(),
+                        _ => {}
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -9569,7 +9978,7 @@ mod tests {
     /// Une erreur affichée n'est jamais effacée par le message suivant : il s'ajoute, en
     /// entier, et la liste reste d'une longueur lisible. Partent d'abord les informations,
     /// puis les états de la carte (même composés de « · »), jamais une prise interrompue ni
-    /// le message le plus récent.
+    /// le message le plus récent. L'état de la carte, lui, est remplacé par le suivant.
     #[test]
     fn toast_messages_pile_up_without_growing_forever() {
         use super::{Level, push_toast};
@@ -9582,24 +9991,25 @@ mod tests {
         push_toast(&mut v, Level::Info, "Carte son reconnectée".into());
         push_toast(&mut v, Level::Info, "Carte son reconnectée".into());
         assert_eq!(v.len(), 2);
-        // Notices de carte longues, faites de morceaux séparés par « · ».
+        // États de la carte : le dernier remplace les précédents (pas d'empilement
+        // « perdue · reconnexion… · refusée… »).
         let notice = |k: usize| format!("Carte son : Entrée « A{k} » perdue · {}", "x".repeat(250));
         for k in 0..6 {
             push_toast(&mut v, Level::Device, notice(k));
         }
-        push_toast(
-            &mut v,
-            Level::Warn,
-            "Prise enregistrée, mais 3 saturations disque".into(),
-        );
+        let devices: Vec<_> = v.iter().filter(|(l, _)| *l == Level::Device).collect();
+        assert_eq!(devices, vec![&(Level::Device, notice(5))]);
+        // Avertissements longs : la liste reste lisible. Partent d'abord les informations,
+        // puis l'état de la carte ; la prise interrompue et le plus récent restent entiers.
+        let warn = |k: usize| format!("Prise enregistrée, mais {k} saturations · {}", "w".repeat(250));
+        for k in 0..3 {
+            push_toast(&mut v, Level::Warn, warn(k));
+        }
         let len: usize = v.iter().map(|(_, t)| t.chars().count() + 1).sum();
         assert!(len <= 900, "{len}");
-        // La prise interrompue est toujours là, en entier ; l'information est partie avant
-        // les notices ; la plus récente notice restante est entière (jamais coupée).
         assert_eq!(v[0].0, Level::Critical);
         assert!(v.iter().all(|(l, _)| *l != Level::Info));
-        assert!(v.iter().any(|(_, t)| *t == notice(5)));
-        assert_eq!(v.last().unwrap().0, Level::Warn);
+        assert_eq!(v.last().unwrap(), &(Level::Warn, warn(2)));
         // Un seul message énorme : gardé entier.
         let mut w = vec![(Level::Info, "ancien".to_string())];
         let huge = "y".repeat(2000);
@@ -9611,6 +10021,26 @@ mod tests {
             push_toast(&mut c, Level::Critical, format!("{k}{}", "z".repeat(300)));
         }
         assert_eq!(c.len(), 5);
+    }
+
+    /// Un message qui règle un problème retire ce problème (et seulement lui) ; la carte
+    /// qui remarche retire ses états de panne.
+    #[test]
+    fn resolving_messages_drop_the_problem() {
+        use super::{Level, lower_first, toast_resolved_by};
+        let r = |new: &str, lvl: Level, old: &str| toast_resolved_by(new, lvl, old);
+        assert!(r("Contrôleur MIDI reconnecté : X", Level::Warn, "Contrôleur MIDI débranché : X"));
+        assert!(r("MIDI connecté : X", Level::Warn, "Aucun contrôleur MIDI · voir Réglages"));
+        assert!(r("Prise précédente complétée · 1:00", Level::Warn, "Disque lent · prise précédente en cours d'écriture"));
+        assert!(r("Enregistré · D:/S",Level::Warn, "Sauvegarde de la session impossible : disque plein"));
+        assert!(r("Carte son reconnectée", Level::Device, "Carte son perdue · reconnexion…"));
+        assert!(r("Carte son prête", Level::Device, "Dante : pas d'horloge réseau"));
+        // Sans rapport : rien n'est retiré. Une prise interrompue n'est jamais « réglée »
+        // par la carte qui revient (c'est la relance qui complète son message).
+        assert!(!r("Carte son reconnectée", Level::Critical, "Carte son perdue · prise sauvegardée · relancez la prise"));
+        assert!(!r("Contrôleur MIDI reconnecté : X", Level::Warn, "Disque lent · fin de prise en cours d'écriture"));
+        assert!(!r("Repère 2 · 0:12", Level::Device, "Carte son perdue · reconnexion…"));
+        assert_eq!(lower_first("Prise relancée · trou de 3 s"), "prise relancée · trou de 3 s");
     }
 
     /// Relance automatique : annulée si l'opérateur reprend la main, abandonnée au-delà
@@ -9926,6 +10356,43 @@ mod tests {
 
     /// Copie de sécurité : sons du soundboard copiés, pads pointant vers la copie (qui
     /// marche donc sans le disque principal) ; un son hors de la session garde son chemin.
+    #[test]
+    fn mirror_copies_missing_and_short_files_only() {
+        use super::{MirrorProgress, mirror_audio};
+        use std::sync::atomic::Ordering::Relaxed;
+        let base = std::env::temp_dir().join(format!("tp-mirror-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (from, to) = (base.join("main"), base.join("copie"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        for (f, n) in [("a.wav", 10), ("b.wav", 20), ("c.wav", 30), ("d.wav", 5)] {
+            std::fs::write(from.join(f), vec![1u8; n]).unwrap();
+        }
+        // b : copie interrompue (plus courte) ; c : copie plus complète que l'original.
+        std::fs::write(to.join("b.wav"), vec![2u8; 3]).unwrap();
+        std::fs::write(to.join("c.wav"), vec![3u8; 40]).unwrap();
+        let files: Vec<String> = ["a.wav", "b.wav", "c.wav", "absent.wav"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let p = MirrorProgress::default();
+        assert_eq!(mirror_audio(&from, &to, &files, &p), (2, 0));
+        assert_eq!(std::fs::read(to.join("a.wav")).unwrap(), vec![1u8; 10]);
+        assert_eq!(std::fs::read(to.join("b.wav")).unwrap(), vec![1u8; 20]);
+        assert_eq!(std::fs::read(to.join("c.wav")).unwrap(), vec![3u8; 40]);
+        // Hors liste : jamais copié.
+        assert!(!to.join("d.wav").exists());
+        // Deuxième passage : rien à faire.
+        assert_eq!(mirror_audio(&from, &to, &files, &p), (0, 0));
+        // En pause (prise en cours) : rien n'est copié.
+        std::fs::remove_file(to.join("a.wav")).unwrap();
+        p.pause.store(true, Relaxed);
+        assert_eq!(mirror_audio(&from, &to, &files, &p), (0, 0));
+        assert!(!to.join("a.wav").exists());
+        assert_eq!(p.total.load(Relaxed), 0);
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn backup_board_copies_sounds() {
         use crate::soundboard::{Board, Pad, SOUNDS_DIR};

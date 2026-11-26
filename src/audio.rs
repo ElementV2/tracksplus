@@ -643,6 +643,13 @@ pub struct Shared {
     pub in_latency: AtomicU32,
     /// Latence callback de sortie → restitution, d'après le pilote (trames, 0 = inconnue).
     pub out_latency: AtomicU32,
+    /// Entrée et sortie appelées dans le même cycle du pilote, sur la même horloge (ASIO :
+    /// un seul pilote, un seul cycle) : le monitoring n'a besoin d'aucune réserve.
+    pub mon_sync: AtomicBool,
+    /// Pire durée d'un callback d'entrée / de sortie principale (µs), depuis la dernière
+    /// lecture (`take_load`).
+    pub in_busy_us: AtomicU32,
+    pub out_busy_us: AtomicU32,
     /// Battement de cœur de chaque flux (`SLOT_*`) : nombre d'appels du callback. Un
     /// compteur qui n'avance plus = flux arrêté sans erreur du pilote (horloge Dante perdue,
     /// pilote bloqué) : l'interface le rouvre.
@@ -701,6 +708,9 @@ impl Shared {
             pad_pos: (0..MAX_PADS).map(|_| AtomicU64::new(0)).collect(),
             in_latency: AtomicU32::new(0),
             out_latency: AtomicU32::new(0),
+            mon_sync: AtomicBool::new(false),
+            in_busy_us: AtomicU32::new(0),
+            out_busy_us: AtomicU32::new(0),
             heartbeat: std::array::from_fn(|_| AtomicU64::new(0)),
             rec_gap_frames: AtomicU64::new(0),
             rec_gap_at: AtomicU64::new(0),
@@ -734,6 +744,27 @@ impl Shared {
         self.in_latency
             .load(Ordering::Relaxed)
             .saturating_add(self.out_latency.load(Ordering::Relaxed))
+    }
+
+    /// Charge audio depuis l'appel précédent (remise à zéro). ASIO : entrée et sortie se
+    /// suivent dans le même cycle, leurs durées s'ajoutent ; sinon, chacune son thread.
+    pub fn take_load(&self, sample_rate: u32) -> Load {
+        let inb = self.in_busy_us.swap(0, Ordering::Relaxed) as f32;
+        let outb = self.out_busy_us.swap(0, Ordering::Relaxed) as f32;
+        let blk = self
+            .out_block
+            .load(Ordering::Relaxed)
+            .max(self.in_block.load(Ordering::Relaxed));
+        let block_us = blk as f32 * 1e6 / sample_rate.max(1) as f32;
+        let busy_us = if self.mon_sync.load(Ordering::Relaxed) {
+            inb + outb
+        } else {
+            inb.max(outb)
+        };
+        Load {
+            busy: if block_us > 0.0 { busy_us / block_us } else { 0.0 },
+            block_ms: block_us / 1000.0,
+        }
     }
 
     pub fn take_peak(a: &AtomicU32) -> f32 {
@@ -1283,6 +1314,9 @@ impl ReopenJob {
         // Anciens flux fermés d'abord (ASIO : un seul pilote à la fois), puis leurs pertes
         // effacées : toute perte signalée ensuite vient des nouveaux flux.
         drop(old);
+        shared
+            .mon_sync
+            .store(plan.host_name == "ASIO", Ordering::Relaxed);
         shared.device_lost.fetch_and(!slots, Ordering::AcqRel);
         shared.stream_dead.fetch_and(!slots, Ordering::AcqRel);
 
@@ -2421,6 +2455,7 @@ impl InState {
             });
             return;
         }
+        let t0 = std::time::Instant::now();
         let ok = audio_cb(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Commandes d'abord : un trou constaté maintenant appartient à la prise d'avant
@@ -2440,6 +2475,9 @@ impl InState {
             }))
         })
         .is_ok();
+        self.shared
+            .in_busy_us
+            .fetch_max(micros(t0.elapsed()), Ordering::Relaxed);
         if !ok {
             self.faulted = true;
             self.shared.fault(LOST_INPUT);
@@ -2808,6 +2846,20 @@ struct OutState {
     faulted: bool,
 }
 
+/// Durée en µs, saturée (rangée dans un `AtomicU32`).
+fn micros(d: std::time::Duration) -> u32 {
+    d.as_micros().min(u32::MAX as u128) as u32
+}
+
+/// Charge audio relevée sur une période (`Shared::take_load`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Load {
+    /// Pire temps de calcul d'un cycle (entrée + sortie), en part du bloc (1.0 = tout le bloc).
+    pub busy: f32,
+    /// Durée d'un bloc (ms, 0 = aucun flux).
+    pub block_ms: f32,
+}
+
 /// Lit exactement `dst.len()` échantillons (disponibles) du tampon.
 fn read_into(c: &mut Consumer<f32>, dst: &mut [f32]) {
     if dst.is_empty() {
@@ -2881,7 +2933,12 @@ impl MonitorOut {
     /// par rafales : on garde une réserve d'environ deux paquets, et on ramène doucement
     /// la réserve vers cette cible en lisant un échantillon de plus ou de moins par bloc,
     /// ré-échantillonné (inaudible, 0,2 % au plus). Jamais de saut ni de coupure sèche.
-    fn render(&mut self, out: &mut [f32], frames: usize, in_block: usize) {
+    ///
+    /// `sync` (ASIO) : l'entrée et la sortie sont appelées l'une après l'autre dans le
+    /// même cycle du pilote, à la même horloge. La réserve tombe à un seul paquet : celui
+    /// que l'entrée vient de livrer (latence ajoutée nulle), ou celui du cycle d'avant si
+    /// la sortie passe en premier (un paquet). Pas de dérive à compenser.
+    fn render(&mut self, out: &mut [f32], frames: usize, in_block: usize, sync: bool) {
         out.fill(0.0);
         if frames == 0 {
             return;
@@ -2889,11 +2946,22 @@ impl MonitorOut {
         let cap = self.cons.buffer().capacity() / 2;
         let blk = frames.max(in_block).max(32);
         // Cible bornée au quart du tampon : toujours atteignable (sinon jamais amorcé).
-        let target = (2 * blk + 64).min(cap / 4);
+        let target = if sync {
+            frames.max(in_block)
+        } else {
+            2 * blk + 64
+        }
+        .min(cap / 4);
         let mut avail = self.cons.slots() / 2;
         // Énorme avance (après un blocage du système) : retour à la cible d'un coup,
         // avec un fondu d'entrée. Rare. Seuil toujours sous la capacité du tampon.
-        let snap = (target * 4 + frames).min((target + cap) / 2);
+        // Même horloge : toute avance au-delà d'un paquet ne se résorberait jamais.
+        let snap = if sync {
+            target + frames / 2
+        } else {
+            target * 4 + frames
+        }
+        .min((target + cap) / 2);
         if avail > snap {
             let skip = avail - target;
             if let Ok(c) = self.cons.read_chunk(skip * 2) {
@@ -2928,7 +2996,9 @@ impl MonitorOut {
         // en dessous → un de moins. Zone morte d'un quart de paquet (pas d'oscillation).
         self.avg += (avail as f32 - self.avg) * 0.05;
         let dead = (blk / 4) as f32;
-        let take = if self.avg > target as f32 + dead && avail > frames {
+        let take = if sync {
+            frames
+        } else if self.avg > target as f32 + dead && avail > frames {
             frames + 1
         } else if self.avg < target as f32 - dead && frames > 2 {
             frames - 1
@@ -3068,12 +3138,18 @@ impl OutState {
             data.fill(T::EQUILIBRIUM);
             return;
         }
+        let t0 = std::time::Instant::now();
         let ok = audio_cb(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.render_into(&mut *data, ts)
             }))
         })
         .is_ok();
+        if self.main {
+            self.shared
+                .out_busy_us
+                .fetch_max(micros(t0.elapsed()), Ordering::Relaxed);
+        }
         if !ok {
             self.faulted = true;
             data.fill(T::EQUILIBRIUM);
@@ -3356,7 +3432,8 @@ impl OutState {
         // Monitoring direct : latence courte, sans trous ni sauts (voir MonitorOut).
         if let Some(m) = self.monitor.as_mut() {
             let in_block = sh.in_block.load(Ordering::Relaxed) as usize;
-            m.render(&mut self.mon[..frames * 2], frames, in_block);
+            let sync = sh.mon_sync.load(Ordering::Relaxed);
+            m.render(&mut self.mon[..frames * 2], frames, in_block, sync);
             let left = m.left;
             let mon = &self.mon[..frames * 2];
             route(mix, mon, left, &sh.master_mon);
@@ -4343,7 +4420,7 @@ mod tests {
                         next += 1;
                     }
                 }
-                mon.render(&mut out, 480, 480);
+                mon.render(&mut out, 480, 480, false);
                 if call > 20 {
                     played.extend(out.iter().step_by(2).copied());
                     assert!(mon.cons.slots() / 2 < 4 * 1024, "latence qui grandit");
@@ -4356,6 +4433,77 @@ mod tests {
             // (Les retours au début de la rampe, vers le bas, ne comptent pas.)
             let jumps = played.windows(2).filter(|w| w[1] - w[0] > 3e-5).count();
             assert!(jumps == 0, "dérive {drift} : {jumps} sauts");
+        }
+    }
+
+    /// Charge : ASIO additionne entrée et sortie (même cycle), sinon la pire des deux ;
+    /// relevé remis à zéro à chaque lecture.
+    #[test]
+    fn load_is_measured_per_block() {
+        let sh = Shared::new();
+        sh.out_block.store(480, Ordering::Relaxed);
+        sh.in_busy_us.store(2000, Ordering::Relaxed);
+        sh.out_busy_us.store(3000, Ordering::Relaxed);
+        sh.mon_sync.store(true, Ordering::Relaxed);
+        let l = sh.take_load(48000);
+        assert!((l.block_ms - 10.0).abs() < 1e-3);
+        assert!((l.busy - 0.5).abs() < 1e-3);
+        assert_eq!(sh.take_load(48000).busy, 0.0);
+        sh.in_busy_us.store(2000, Ordering::Relaxed);
+        sh.out_busy_us.store(3000, Ordering::Relaxed);
+        sh.mon_sync.store(false, Ordering::Relaxed);
+        assert!((sh.take_load(48000).busy - 0.3).abs() < 1e-3);
+    }
+
+    /// ASIO (même cycle, même horloge) : aucune réserve. Entrée appelée avant la sortie →
+    /// la sortie joue le paquet du cycle même (0 trame ajoutée) ; sortie d'abord → celui du
+    /// cycle d'avant (un paquet). Jamais de trou ni de saut, et une avance accidentelle
+    /// retombe aussitôt à un paquet.
+    #[test]
+    fn monitor_sync_adds_no_reserve() {
+        for block in [32usize, 64, 128, 256, 1024] {
+            for input_first in [true, false] {
+                let (mut prod, cons) = rtrb::RingBuffer::new(MON_RING * 2);
+                let mut mon = MonitorOut::new(cons, 0);
+                let mut out = vec![0.0f32; block * 2];
+                let mut next = 0u64;
+                let push = |prod: &mut Producer<f32>, next: &mut u64| {
+                    for _ in 0..block {
+                        let v = 0.1 + (*next % 100_000) as f32 * 1e-5;
+                        prod.push(v).unwrap();
+                        prod.push(v).unwrap();
+                        *next += 1;
+                    }
+                };
+                let mut played = Vec::new();
+                for cycle in 0..200 {
+                    if input_first {
+                        push(&mut prod, &mut next);
+                    }
+                    let before = next;
+                    mon.render(&mut out, block, block, true);
+                    if cycle > 2 {
+                        played.extend(out.iter().step_by(2).copied());
+                        // Dernier échantillon joué = dernier livré : rien n'attend en
+                        // réserve (sortie d'abord : livré au cycle d'avant).
+                        let last = out[(block - 1) * 2];
+                        let want = 0.1 + ((before - 1) % 100_000) as f32 * 1e-5;
+                        assert!((last - want).abs() < 1e-6, "bloc {block} : retard en trop");
+                        assert_eq!(mon.cons.slots(), 0, "bloc {block} : réserve");
+                    }
+                    if !input_first {
+                        push(&mut prod, &mut next);
+                    }
+                }
+                assert!(played.iter().all(|&v| v != 0.0), "bloc {block} : trou");
+                let jumps = played.windows(2).filter(|w| w[1] - w[0] > 3e-5).count();
+                assert_eq!(jumps, 0, "bloc {block} : saut");
+                // Avance accidentelle (deux paquets d'un coup) : ramenée à un paquet.
+                push(&mut prod, &mut next);
+                push(&mut prod, &mut next);
+                mon.render(&mut out, block, block, true);
+                assert!(mon.cons.slots() / 2 <= block, "bloc {block} : avance gardée");
+            }
         }
     }
 
@@ -4382,7 +4530,7 @@ mod tests {
             for _ in 0..20 {
                 push(&mut prod);
                 for _ in 0..calls {
-                    mon.render(&mut out, out_frames, block);
+                    mon.render(&mut out, out_frames, block, false);
                     heard |= out.iter().any(|&x| x != 0.0);
                 }
             }
@@ -4393,7 +4541,7 @@ mod tests {
             for _ in 0..2 {
                 push(&mut prod);
                 for _ in 0..calls {
-                    mon.render(&mut out, out_frames, block);
+                    mon.render(&mut out, out_frames, block, false);
                 }
             }
             let lat = mon.cons.slots() / 2;

@@ -359,7 +359,10 @@ impl App {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    self.notify(format!("Copie de « {name} » dans la session…"), false);
+                    self.notify(
+                        format!("{}{name} » dans la session…", crate::app::COPYING_SOUND),
+                        false,
+                    );
                 }
                 f
             } else {
@@ -487,6 +490,8 @@ impl App {
                             }
                         }
                     }
+                    // Copie finie : « Copie de « son » dans la session… » n'a plus lieu d'être.
+                    self.drop_toast(|_, t| t.starts_with(crate::app::COPYING_SOUND));
                     if !used {
                         continue;
                     }
@@ -655,7 +660,7 @@ impl App {
         if self.dialog_open() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let events: Vec<(Key, bool, bool)> = ctx.input(|i| {
+        let events: Vec<(Key, bool, bool, egui::Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
@@ -665,19 +670,26 @@ impl App {
                         repeat,
                         modifiers,
                         ..
-                    } if !modifiers.command && !modifiers.alt => Some((*key, *pressed, *repeat)),
+                    } if !modifiers.command && !modifiers.alt => {
+                        Some((*key, *pressed, *repeat, *modifiers))
+                    }
                     _ => None,
                 })
                 .collect()
         });
-        for (key, pressed, repeat) in events {
+        use crate::shortcuts as k;
+        for (key, pressed, repeat, mods) in events {
+            let stop_all = self.keys.is(k::PADS_STOP, key, mods);
+            let delete = self.keys.is(k::PAD_DELETE, key, mods);
             if repeat {
                 continue;
             }
             if let Some(slot) = self.sb.learn_key {
-                if pressed && key == Key::Delete {
-                    // Suppr est réservé à la suppression du pad sélectionné.
-                    self.notify("Suppr réservé · choisissez une autre touche", true);
+                // Touches des raccourcis du soundboard (supprimer le pad, tout arrêter) :
+                // réservées. Échap annule toujours l'attribution.
+                if pressed && key != Key::Escape && (delete || stop_all) {
+                    let l = mods_label(key, mods);
+                    self.notify(format!("{l} réservé · choisissez une autre touche"), true);
                     continue;
                 }
                 if pressed {
@@ -699,11 +711,11 @@ impl App {
                 }
                 continue;
             }
-            if key == Key::Escape && pressed {
+            if stop_all && pressed {
                 self.stop_all_pads();
                 continue;
             }
-            if key == Key::Delete && pressed {
+            if delete && pressed {
                 if let Some(slot) = self.sb.selected
                     && self.board.pad(slot).is_some()
                     && !self.board.locked
@@ -1514,7 +1526,7 @@ impl App {
                     ui.close();
                 }
                 if ui
-                    .add(egui::Button::new("Supprimer le pad").shortcut_text("Suppr"))
+                    .add(egui::Button::new("Supprimer le pad").shortcut_text(self.keys.label(crate::shortcuts::PAD_DELETE)))
                     .clicked()
                 {
                     self.delete_pad(slot);
@@ -2045,7 +2057,8 @@ impl App {
         self.engine.pad(PadCmd::Stop { slot });
         if let Some(p) = self.board.pad(slot).cloned() {
             self.sb.deleted = Some((slot, p));
-            self.notify("Pad supprimé · Ctrl+Z pour le rétablir", false);
+            let undo = self.keys.label(crate::shortcuts::UNDO);
+            self.notify(format!("Pad supprimé · {undo} pour le rétablir"), false);
         }
         self.board.set(slot, None);
         if self.sb.selected == Some(slot) {
@@ -2455,4 +2468,9 @@ mod tests {
         let len = p.end.unwrap() - p.start;
         assert!(p.fade_in + p.fade_out <= len + 1e-9);
     }
+}
+
+/// Nom affiché d'un appui (« Maj+X »).
+fn mods_label(key: Key, mods: egui::Modifiers) -> String {
+    crate::shortcuts::Combo::new(key, mods).label()
 }

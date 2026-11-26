@@ -660,8 +660,32 @@ pub fn view_tabs(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
     view_tabs_resps(ui, value, labels).0
 }
 
+/// Onglets de même largeur (celle du plus long), pour une fenêtre qui ne bouge pas.
+pub fn view_tabs_even(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> bool {
+    let w = labels
+        .iter()
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap(l.to_string(), t::semibold(11.0), t::TEXT)
+                .size()
+                .x
+        })
+        .fold(0.0f32, f32::max);
+    tabs(ui, value, labels, Some(w + 24.0)).0
+}
+
 /// Comme `view_tabs`, et retourne aussi la zone de chaque onglet (cibles de dépôt).
 pub fn view_tabs_resps(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool, Vec<Response>) {
+    tabs(ui, value, labels, None)
+}
+
+/// Onglets : chacun à la largeur de son libellé, ou tous à `width`.
+fn tabs(
+    ui: &mut Ui,
+    value: &mut usize,
+    labels: &[&str],
+    width: Option<f32>,
+) -> (bool, Vec<Response>) {
     let mut resps = Vec::new();
     let mut changed = false;
     ui.spacing_mut().item_spacing.x = 2.0;
@@ -670,7 +694,8 @@ pub fn view_tabs_resps(ui: &mut Ui, value: &mut usize, labels: &[&str]) -> (bool
         let g = ui
             .painter()
             .layout_no_wrap(l.to_string(), t::semibold(11.0), t::TEXT);
-        let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 24.0, h), Sense::click());
+        let tab_w = width.unwrap_or(g.size().x + 24.0);
+        let (rect, resp) = ui.allocate_exact_size(vec2(tab_w, h), Sense::click());
         let sel = *value == i;
         let p = ui.painter();
         if resp.hovered() && !sel {

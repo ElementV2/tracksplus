@@ -28,6 +28,7 @@ mod render;
 mod sampler;
 mod sessions;
 mod shutdown;
+mod shortcuts;
 mod soundboard;
 mod ui;
 mod update;
@@ -267,7 +268,14 @@ fn main() -> eframe::Result {
     recorder::emergency_finish(writers.0, writers.1);
     recorder::wait_backups(backups, backups);
     match res {
-        Ok(r) => r,
+        Ok(r) => {
+            // Verrou d'instance unique gardé jusqu'à la disparition réelle du processus :
+            // Windows ne le rend qu'en fermant ses fichiers, après le déchargement des
+            // pilotes (un pilote ASIO peut y passer plusieurs secondes, fenêtre encore à
+            // l'écran). Rendu ici, une nouvelle instance pourrait s'ouvrir à côté.
+            std::mem::forget(instance);
+            r
+        }
         Err(_) => {
             // En plein spectacle, l'application revient d'elle-même dans sa session (les
             // prises interrompues sont réintégrées au démarrage).

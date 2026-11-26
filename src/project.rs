@@ -258,6 +258,10 @@ pub struct Project {
     /// neuve n'écrase jamais un fichier du même nom déjà présent sur le disque.
     #[serde(skip)]
     owns_file: bool,
+    /// Sauvegardes lancées depuis l'ouverture (par n'importe quel chemin) : le second disque
+    /// de la copie de sécurité suit chacune.
+    #[serde(skip)]
+    pub saves: u64,
     /// Moment de l'état enregistré (millisecondes depuis 1970, horloge de l'ordinateur) :
     /// départage les versions de secours à l'ouverture d'un fichier abîmé (voir `open`).
     #[serde(default)]
@@ -312,6 +316,7 @@ impl Project {
             extra: Extra::new(),
             read_only: None,
             owns_file: false,
+            saves: 0,
             saved_at: 0,
             state_at: None,
             master_db: 0.0,
@@ -578,6 +583,7 @@ impl Project {
             bail!("{why}");
         }
         self.owns_file = true;
+        self.saves += 1;
         let seq = next_save_seq();
         let mut snapshot = self.clone();
         snapshot.saved_at = self.state_at.take().unwrap_or_else(now_ms);

@@ -7,7 +7,7 @@ use crate::audio;
 use crate::project::{Clip, MIN_CLIP};
 use crate::render::{PEAK_BLOCK, PEAK_L1, Peaks};
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Key, Mesh, Rect, Sense, Stroke, StrokeKind, UiBuilder,
+    self, Align2, Color32, CornerRadius, Mesh, Rect, Sense, Stroke, StrokeKind, UiBuilder,
     pos2, vec2,
 };
 use std::collections::HashSet;
@@ -198,11 +198,27 @@ pub struct ClipDrag {
     pub changed: bool,
 }
 
-/// Décalage qui aimante l'une des positions `edges` : priorité à l'objet le plus proche à
-/// moins de `tol` (repères, bords d'autres prises, tête, sélection), pour n'importe quel
-/// bord ; sinon la PREMIÈRE position (début de la prise) se cale sur la grille `grid`.
-/// Toujours le même bord sur la grille : des pas réguliers (sinon début et fin se
-/// relaient selon le plus proche, et les pas alternent entre petits et grands).
+/// Arrêt suivant (`forward`) ou précédent parmi `stops`, à plus de 50 ms de la tête
+/// (sinon on resterait sur place). En arrière, faute d'arrêt : le début.
+fn nav_stop(stops: &[u64], playhead: u64, forward: bool) -> Option<u64> {
+    const NEAR: u64 = 2400;
+    if forward {
+        stops.iter().copied().filter(|&p| p > playhead + NEAR).min()
+    } else {
+        stops
+            .iter()
+            .copied()
+            .filter(|&p| p + NEAR < playhead)
+            .max()
+            .or(Some(0))
+    }
+}
+
+/// Décalage qui aimante l'une des positions `edges` : priorité au point le plus proche à
+/// moins de `tol` (repères, tête de lecture), pour n'importe quel bord ; sinon la PREMIÈRE
+/// position (début de la prise) se cale sur la grille `grid`. Toujours le même bord sur la
+/// grille : des pas réguliers (sinon début et fin se relaient selon le plus proche, et les
+/// pas alternent entre petits et grands).
 fn snap_offset(edges: &[i64], points: &[u64], tol: i64, grid: i64) -> i64 {
     let mut best: Option<i64> = None;
     for &e in edges {
@@ -362,33 +378,59 @@ impl App {
         if self.dialog_open() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let none = egui::Modifiers::NONE;
-        let (mark_in, mark_out) =
-            ctx.input_mut(|i| (i.consume_key(none, Key::I), i.consume_key(none, Key::O)));
+        use crate::shortcuts as k;
+        let keys = &self.keys;
+        let (mark_in, mark_out, looped) = ctx.input_mut(|i| {
+            (
+                keys.pressed(i, k::MARK_IN),
+                keys.pressed(i, k::MARK_OUT),
+                keys.pressed(i, k::LOOP),
+            )
+        });
         if mark_in {
             self.set_range_point(self.playhead, true);
         }
         if mark_out {
             self.set_range_point(self.playhead, false);
         }
-        if ctx.input_mut(|i| i.consume_key(none, Key::L)) {
+        if looped {
             self.toggle_loop();
         }
+        // Affichage : suivre la lecture, mixage et vumètres, magnétisme.
+        let keys = &self.keys;
+        let (follow, meters, snap) = ctx.input_mut(|i| {
+            (
+                keys.pressed(i, k::FOLLOW),
+                keys.pressed(i, k::METERS),
+                keys.pressed(i, k::SNAP),
+            )
+        });
+        if follow {
+            self.view.follow = !self.view.follow;
+            self.view.nav_until = 0.0;
+        }
+        if meters {
+            self.show_bridge = !self.show_bridge;
+        }
+        if snap {
+            self.snap = !self.snap;
+        }
+        let keys = &self.keys;
         let (space, rec, home, end, marker, fit, esc, all, left, right, split, del) = ctx
             .input_mut(|i| {
                 (
-                    i.consume_key(none, Key::Space),
-                    i.consume_key(none, Key::R),
-                    i.consume_key(none, Key::Home) || i.consume_key(none, Key::Enter),
-                    i.consume_key(none, Key::End),
-                    i.consume_key(none, Key::M),
-                    i.consume_key(none, Key::F),
-                    i.consume_key(none, Key::Escape),
-                    i.consume_key(egui::Modifiers::COMMAND, Key::A),
-                    i.consume_key(none, Key::ArrowLeft),
-                    i.consume_key(none, Key::ArrowRight),
-                    i.consume_key(none, Key::S),
-                    i.consume_key(none, Key::Delete) || i.consume_key(none, Key::Backspace),
+                    keys.pressed(i, k::PLAY),
+                    keys.pressed(i, k::RECORD),
+                    keys.pressed(i, k::GO_START),
+                    keys.pressed(i, k::GO_END),
+                    keys.pressed(i, k::ADD_MARKER),
+                    keys.pressed(i, k::ZOOM_FIT),
+                    keys.pressed(i, k::DESELECT),
+                    keys.pressed(i, k::SELECT_ALL),
+                    keys.pressed(i, k::PREV),
+                    keys.pressed(i, k::NEXT),
+                    keys.pressed(i, k::SPLIT),
+                    keys.pressed(i, k::DELETE),
                 )
             });
         // Pendant un enregistrement, le clavier ne peut pas l'arrêter d'un seul appui :
@@ -441,22 +483,9 @@ impl App {
         if del {
             self.delete_selection();
         }
-        // Touches 1 à 9 : aller au repère 1 à 9 (dans l'ordre de la timeline).
-        let digit = ctx.input_mut(|i| {
-            [
-                Key::Num1,
-                Key::Num2,
-                Key::Num3,
-                Key::Num4,
-                Key::Num5,
-                Key::Num6,
-                Key::Num7,
-                Key::Num8,
-                Key::Num9,
-            ]
-            .iter()
-            .position(|&k| i.consume_key(none, k))
-        });
+        // Aller au repère 1 à 9 (dans l'ordre de la timeline).
+        let keys = &self.keys;
+        let digit = ctx.input_mut(|i| k::MARKERS.iter().position(|id| keys.pressed(i, id)));
         if let Some(n) = digit
             && !self.is_recording()
         {
@@ -466,23 +495,12 @@ impl App {
             }
         }
         if (left || right) && !self.is_recording() {
-            let ph = self.playhead;
-            let target = if left {
-                self.project
-                    .markers
-                    .iter()
-                    .rev()
-                    .map(|m| m.pos)
-                    .find(|&p| p + 2400 < ph)
-                    .or(Some(0))
-            } else {
-                self.project
-                    .markers
-                    .iter()
-                    .map(|m| m.pos)
-                    .find(|&p| p > ph + 2400)
-            };
-            if let Some(p) = target {
+            // Arrêts : les repères, et les deux bords de la plage sélectionnée.
+            let mut stops: Vec<u64> = self.project.markers.iter().map(|m| m.pos).collect();
+            if let Some((a, b)) = self.selection {
+                stops.extend([a, b]);
+            }
+            if let Some(p) = nav_stop(&stops, self.playhead, right) {
                 self.seek(p);
             }
         }
@@ -506,40 +524,43 @@ impl App {
             ui.spacing_mut().item_spacing.x = 3.0;
             // Pictogrammes : la bulle d'aide nomme l'action et son raccourci.
             if w::tool_icon(ui, Icon::Follow, self.view.follow, true)
-                .on_hover_text("Suivre la lecture")
+                .on_hover_text(self.keys.tip("Suivre la lecture", crate::shortcuts::FOLLOW))
                 .clicked()
             {
                 self.view.follow = !self.view.follow;
                 self.view.nav_until = 0.0;
             }
             if w::tool_icon(ui, Icon::Snap, self.snap, true)
-                .on_hover_text("Magnétisme · Maj : désactiver")
+                .on_hover_text(format!(
+                    "{} · Maj en glissant : inverser",
+                    self.keys.tip("Magnétisme", crate::shortcuts::SNAP)
+                ))
                 .clicked()
             {
                 self.snap = !self.snap;
             }
             w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Marker, false, true)
-                .on_hover_text("Repère (M)")
+                .on_hover_text(self.keys.tip("Repère", crate::shortcuts::ADD_MARKER))
                 .clicked()
             {
                 self.add_marker();
             }
             if w::tool_icon(ui, Icon::MarkIn, false, true)
-                .on_hover_text("Début de plage (I)")
+                .on_hover_text(self.keys.tip("Début de plage", crate::shortcuts::MARK_IN))
                 .clicked()
             {
                 self.set_range_point(self.playhead, true);
             }
             if w::tool_icon(ui, Icon::MarkOut, false, true)
-                .on_hover_text("Fin de plage (O)")
+                .on_hover_text(self.keys.tip("Fin de plage", crate::shortcuts::MARK_OUT))
                 .clicked()
             {
                 self.set_range_point(self.playhead, false);
             }
             let has_range = self.selection.is_some() || self.ruler_anchor.is_some();
             if w::tool_icon(ui, Icon::ClearRange, false, has_range)
-                .on_hover_text("Effacer la plage (Échap)")
+                .on_hover_text(self.keys.tip("Effacer la plage", crate::shortcuts::DESELECT))
                 .clicked()
             {
                 self.selection = None;
@@ -547,34 +568,34 @@ impl App {
             }
             w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Scissors, false, !recording)
-                .on_hover_text("Couper (S)")
+                .on_hover_text(self.keys.tip("Couper", crate::shortcuts::SPLIT))
                 .clicked()
             {
                 self.split_at_playhead();
             }
             let can_del = !recording && (!self.sel_clips.is_empty() || self.selection.is_some());
             if w::tool_icon(ui, Icon::Trash, false, can_del)
-                .on_hover_text("Supprimer (Suppr)")
+                .on_hover_text(self.keys.tip("Supprimer", crate::shortcuts::DELETE))
                 .clicked()
             {
                 self.delete_selection();
             }
             w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Undo, false, !self.undo.is_empty() && !recording)
-                .on_hover_text("Annuler (Ctrl+Z)")
+                .on_hover_text(self.keys.tip("Annuler", crate::shortcuts::UNDO))
                 .clicked()
             {
                 self.undo();
             }
             if w::tool_icon(ui, Icon::Redo, false, !self.redo.is_empty() && !recording)
-                .on_hover_text("Rétablir (Ctrl+Maj+Z)")
+                .on_hover_text(self.keys.tip("Rétablir", crate::shortcuts::REDO))
                 .clicked()
             {
                 self.redo();
             }
             w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Meters, self.show_bridge, true)
-                .on_hover_text("Mixage et vumètres")
+                .on_hover_text(self.keys.tip("Mixage et vumètres", crate::shortcuts::METERS))
                 .clicked()
             {
                 self.show_bridge = !self.show_bridge;
@@ -594,7 +615,7 @@ impl App {
             false,
             self.project.has_audio() && stopped,
         )
-        .on_hover_text("Exporter (Ctrl+E)")
+        .on_hover_text(self.keys.tip("Exporter", crate::shortcuts::EXPORT))
         .clicked()
         {
             self.open_export();
@@ -891,7 +912,7 @@ impl App {
 
     /// Règle : clic = aller à cet endroit ; glisser = faire défiler la timeline (attraper la
     /// tête de lecture elle-même la déplace). Plage de temps : **Ctrl + clic = point
-    /// d'entrée, Alt + clic = point de sortie**. Tout est aimanté à la grille (Maj : libre).
+    /// d'entrée, Alt + clic = point de sortie**. Aimanté selon le magnétisme (Maj : inversé).
     fn time_select(&mut self, resp: &egui::Response, left: f32) {
         let (free, ctrl, alt) = resp
             .ctx
@@ -1037,10 +1058,11 @@ impl App {
         snap_offset(edges, points, tol, self.grid_step() as i64)
     }
 
-    /// Position aimantée (magnétisme actif et Maj relâchée). `moving_playhead` : la tête
-    /// elle-même ne sert pas d'aimant (elle resterait collée à sa position).
-    fn snap_pos(&self, s: u64, no_snap: bool, moving_playhead: bool) -> u64 {
-        if !self.snap || no_snap {
+    /// Position aimantée : magnétisme actif, ou inactif mais Maj enfoncée (`invert` : Maj
+    /// inverse le magnétisme le temps du geste). `moving_playhead` : la tête elle-même ne
+    /// sert pas d'aimant (elle resterait collée à sa position).
+    fn snap_pos(&self, s: u64, invert: bool, moving_playhead: bool) -> u64 {
+        if self.snap == invert {
             return s;
         }
         let mut pts = self.snap_points();
@@ -1130,7 +1152,7 @@ impl App {
         self.sel_clips = sel;
     }
 
-    fn update_clip_drag(&mut self, sample: u64, target_row: Option<usize>, no_snap: bool) {
+    fn update_clip_drag(&mut self, sample: u64, target_row: Option<usize>, invert: bool) {
         let Some(drag) = self.clip_drag.take() else {
             return;
         };
@@ -1142,8 +1164,8 @@ impl App {
         let mut d = sample as i64 - drag.anchor as i64;
         // Aimant : temps de la grille (début de la prise), repères et tête de lecture (l'un
         // ou l'autre bord). Les bords des autres prises n'attirent pas : ils semaient des
-        // crans irréguliers. Maj enfoncée : déplacement libre.
-        let snapping = self.snap && !no_snap;
+        // crans irréguliers. Maj enfoncée : magnétisme inversé le temps du geste.
+        let snapping = self.snap != invert;
         let points_v = if snapping { self.snap_points() } else { Vec::new() };
         let points: &[u64] = &points_v;
         let main = drag
@@ -3340,6 +3362,22 @@ fn fmt_ruler(tt: f64, step: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::fmt_ruler;
+
+    /// Flèches : de repère en repère, en s'arrêtant aussi sur les bords de la plage ; rien
+    /// à moins de 50 ms de la tête ; en arrière, faute d'arrêt, le début.
+    #[test]
+    fn arrows_stop_on_markers_and_range_edges() {
+        use super::nav_stop;
+        // Repères à 10 000 et 90 000, plage 40 000 → 60 000.
+        let stops = [10_000, 90_000, 40_000, 60_000];
+        assert_eq!(nav_stop(&stops, 20_000, true), Some(40_000));
+        assert_eq!(nav_stop(&stops, 40_000, true), Some(60_000));
+        assert_eq!(nav_stop(&stops, 60_000, true), Some(90_000));
+        assert_eq!(nav_stop(&stops, 90_000, true), None);
+        assert_eq!(nav_stop(&stops, 60_000, false), Some(40_000));
+        assert_eq!(nav_stop(&stops, 41_000, false), Some(10_000));
+        assert_eq!(nav_stop(&stops, 5_000, false), Some(0));
+    }
 
     /// Prise de 1 300 glissée sur une grille de 1 000 : son début se cale toujours sur la
     /// grille (pas réguliers), jamais sa fin ; un objet proche reste prioritaire.

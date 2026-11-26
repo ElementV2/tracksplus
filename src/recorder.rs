@@ -1611,7 +1611,11 @@ mod tests {
             p_ok.push(0.1).unwrap();
             p_bad.push(0.1).unwrap();
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // Attente bornée (pas un délai fixe : machine chargée pendant toute la suite).
+        let t = Instant::now();
+        while rec.errors().is_empty() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(rec.errors().len(), 1, "erreur visible pendant la prise");
         drop(p_ok);
         drop(p_bad);
