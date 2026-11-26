@@ -95,6 +95,38 @@ impl AudioPrefs {
         }
     }
 
+    /// ASIO : un seul pilote par application, donc une seule carte pour l'entrée et toutes
+    /// les sorties. Celle de la sortie principale (celle que montrent les réglages) fait
+    /// foi ; une entrée ou une sortie restée sur une autre carte (ancien réglage) y est
+    /// ramenée. Sinon cette autre carte serait chargée et bloquerait la vraie. Rend `true`
+    /// si quelque chose a changé.
+    pub fn align_asio_card(&mut self) -> bool {
+        if self.host.as_deref() != Some("ASIO") {
+            return false;
+        }
+        let Some(card) = self.output.clone().or_else(|| self.input.clone()) else {
+            return false;
+        };
+        let mut changed = false;
+        for d in [&mut self.input, &mut self.output] {
+            if d.as_ref() != Some(&card) {
+                *d = Some(card.clone());
+                changed = true;
+            }
+        }
+        for (d, left) in [
+            (&mut self.pad_output, &mut self.pad_left),
+            (&mut self.monitor_output, &mut self.monitor_left),
+        ] {
+            if d.as_ref().is_some_and(|n| *n != card) {
+                *d = None;
+                *left = 0;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn path() -> Option<std::path::PathBuf> {
         dirs::config_dir().map(|d| d.join("TracksPlus").join("audio.json"))
     }
@@ -3205,6 +3237,41 @@ where
 mod tests {
     /// Monitoring : entrée mono au centre à -3 dB ; beaucoup d'entrées écoutées ensemble
     /// ne dépassent jamais -1 dBFS (limiteur), sans toucher aux prises.
+    #[test]
+    fn asio_keeps_input_and_outputs_on_one_card() {
+        let rme = "ASIO Fireface USB".to_string();
+        let dante = "Dante Virtual Soundcard (x64)".to_string();
+        let mut p = AudioPrefs {
+            host: Some("ASIO".into()),
+            input: Some(dante.clone()),
+            output: Some(rme.clone()),
+            out_left: 6,
+            pad_output: Some(dante.clone()),
+            pad_left: 2,
+            monitor_output: Some(rme.clone()),
+            monitor_left: 4,
+            ..Default::default()
+        };
+        assert!(p.align_asio_card());
+        assert_eq!(p.input.as_deref(), Some(rme.as_str()));
+        assert_eq!(p.output.as_deref(), Some(rme.as_str()));
+        assert_eq!((p.pad_output.as_deref(), p.pad_left), (None, 0));
+        assert_eq!(
+            (p.monitor_output.as_deref(), p.monitor_left),
+            (Some(rme.as_str()), 4)
+        );
+        assert_eq!(p.out_left, 6);
+        assert!(!p.align_asio_card());
+        // Hors ASIO, plusieurs cartes à la fois restent possibles.
+        let mut w = AudioPrefs {
+            host: Some("WASAPI".into()),
+            input: Some(dante),
+            output: Some(rme),
+            ..Default::default()
+        };
+        assert!(!w.align_asio_card());
+    }
+
     #[test]
     fn monitor_mix_pan_law_and_limiter() {
         let run = |listened: usize, level: f32| -> Vec<f32> {

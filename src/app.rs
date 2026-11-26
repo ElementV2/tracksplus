@@ -109,6 +109,7 @@ impl SettingsDialog {
         if d.prefs.host.is_none() {
             d.prefs.host = Some(audio::default_host_name());
         }
+        d.prefs.align_asio_card();
         d.refresh();
         let asio = d.asio();
         d.card = d
@@ -1328,6 +1329,9 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         t::apply(&cc.egui_ctx);
         let mut prefs = AudioPrefs::load();
+        if prefs.align_asio_card() {
+            prefs.save();
+        }
         // Réglages du contrôleur (communs) ; les pads viennent de la session ouverte.
         let board = Board::load_devices();
         // Reprise : la sortie du soundboard était enregistrée avec le soundboard ; elle est
@@ -4912,6 +4916,7 @@ impl App {
     }
 
     pub fn apply_audio(&mut self, mut prefs: AudioPrefs) -> Result<(), String> {
+        prefs.align_asio_card();
         // Réglé à part (onglet Enregistrement), appliqué tout de suite : jamais écrasé ici.
         prefs.auto_restart = self.prefs.auto_restart;
         if self.editing_locked() {
