@@ -244,7 +244,7 @@ pub fn master_panel(ui: &mut egui::Ui, title: &str, meters: &mut [MeterState; 2]
         w::peak_readout(&p, r, m);
         if ui
             .interact(r, ui.make_persistent_id((title, "pk", k)), Sense::click())
-            .on_hover_text("Crête max — clic : remise à zéro")
+            .on_hover_text("Crête — clic : remise à zéro")
             .clicked()
         {
             reset = true;
@@ -1865,7 +1865,7 @@ impl App {
                     let (pr, presp) = ui.allocate_exact_size(vec2(36.0, 16.0), Sense::click());
                     w::peak_readout(ui.painter(), pr, &merged);
                     if presp
-                        .on_hover_text("Crête max — clic : remise à zéro")
+                        .on_hover_text("Crête — clic : remise à zéro")
                         .clicked()
                     {
                         if let Some(m) = self.track_meters.get_mut(&tid) {

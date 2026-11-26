@@ -52,6 +52,10 @@ pub fn fmt_db(db: f32) -> String {
 
 /// Vitesse de retour des vumètres (dB par seconde).
 pub const METER_FALL_DB_S: f32 = 24.0;
+/// Valeur crête affichée : un nouveau maximum reste lu pendant `PEAK_READ_HOLD` s, puis la
+/// valeur suit la crête de chaque seconde écoulée (niveau actuel, pas un pic ancien).
+const PEAK_READ_HOLD: f64 = 3.0;
+const PEAK_READ_EVERY: f64 = 1.0;
 
 /// État d'affichage d'un vumètre : chute progressive, crête maintenue, saturation.
 #[derive(Clone, Copy, Default)]
@@ -61,8 +65,11 @@ pub struct MeterState {
     /// Crête maintenue (linéaire) et instant de fin du maintien.
     pub hold: f32,
     hold_until: f64,
-    /// Crête maximale depuis la dernière remise à zéro (affichage numérique).
+    /// Crête affichée en chiffres : maintenue un moment, puis mise à jour chaque seconde.
     pub max: f32,
+    /// Fin du maintien de `max`, et plus forte crête vue depuis la dernière mise à jour.
+    max_until: f64,
+    recent: f32,
     /// Saturation mémorisée (jusqu'au clic).
     pub clip: bool,
 }
@@ -82,7 +89,16 @@ impl MeterState {
         } else if now > self.hold_until {
             self.hold *= 10f32.powf(-48.0 * dt / 20.0);
         }
-        self.max = self.max.max(peak);
+        self.recent = self.recent.max(peak);
+        if peak > self.max {
+            self.max = peak;
+            self.max_until = now + PEAK_READ_HOLD;
+            self.recent = 0.0;
+        } else if now > self.max_until {
+            self.max = self.recent;
+            self.max_until = now + PEAK_READ_EVERY;
+            self.recent = 0.0;
+        }
         if peak >= 0.999 {
             self.clip = true;
         }
@@ -90,6 +106,7 @@ impl MeterState {
 
     pub fn reset(&mut self) {
         self.max = 0.0;
+        self.recent = 0.0;
         self.clip = false;
         self.hold = 0.0;
     }
@@ -101,6 +118,8 @@ impl MeterState {
             hold: self.hold.max(o.hold),
             hold_until: self.hold_until.max(o.hold_until),
             max: self.max.max(o.max),
+            max_until: self.max_until.max(o.max_until),
+            recent: self.recent.max(o.recent),
             clip: self.clip || o.clip,
         }
     }
@@ -210,7 +229,7 @@ pub fn scale_v(p: &Painter, rect: Rect, align_right: bool) {
     }
 }
 
-/// Valeur crête max (dB) ; fond rouge si saturation.
+/// Valeur crête (dB, voir `MeterState::max`) ; fond rouge si saturation (jusqu'au clic).
 pub fn peak_readout(p: &Painter, rect: Rect, m: &MeterState) {
     let db = to_db(m.max);
     let (bg, fg) = if m.clip {
@@ -1001,6 +1020,29 @@ mod tests {
             // Maintien de crête encore à 0 dB juste avant 1,5 s.
             assert!((to_db(m.hold)).abs() < 0.01);
         }
+    }
+
+    /// La valeur crête lue garde un pic 3 s, puis suit le niveau actuel (plus bas).
+    #[test]
+    fn peak_readout_follows_the_current_level() {
+        let mut m = MeterState::default();
+        let dt = 1.0 / 60.0;
+        let mut now = 0.0;
+        let mut run = |m: &mut MeterState, peak: f32, secs: f64| {
+            let end = now + secs;
+            while now < end {
+                now += dt as f64;
+                m.update(peak, now, dt);
+            }
+        };
+        run(&mut m, 1.0, 0.1);
+        run(&mut m, 0.1, 2.5);
+        assert!((to_db(m.max)).abs() < 0.01, "pic encore lu");
+        run(&mut m, 0.1, 2.0);
+        assert!((to_db(m.max) + 20.0).abs() < 0.01, "niveau actuel : {}", to_db(m.max));
+        run(&mut m, 0.0, 2.5);
+        assert_eq!(m.max, 0.0, "silence : −∞");
+        assert!(m.clip, "saturation gardée jusqu'au clic");
     }
 
     #[test]
