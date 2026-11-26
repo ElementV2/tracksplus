@@ -1406,6 +1406,7 @@ impl App {
         let track_h = self.view.track_h;
         let mut to_delete: Option<Vec<u64>> = None;
         let mut clip_to_delete = None;
+        let mut export_clips = false;
         let mut audible_changed = false;
         let stopped = self.is_stopped();
         // Pendant une prise, une piste non armée peut être armée : elle rejoint la prise.
@@ -2257,11 +2258,27 @@ impl App {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Sélectionner la plage de la prise").clicked() {
-                            if let Some((_, cl)) = self.project.find_clip(c) {
-                                self.selection = Some((cl.start, cl.end()));
-                            }
+                        // Plusieurs prises sélectionnées : leur plage commune.
+                        let n = self.sel_clips.len().max(1);
+                        let label = if n > 1 {
+                            format!("Sélectionner la plage des {n} prises")
+                        } else {
+                            "Sélectionner la plage de la prise".to_string()
+                        };
+                        if ui.button(label).clicked() {
+                            self.selection = self.sel_clips_span().or_else(|| {
+                                self.project.find_clip(c).map(|(_, cl)| (cl.start, cl.end()))
+                            });
                             ui.close();
+                        }
+                        let label = if n > 1 {
+                            format!("Exporter les {n} prises…")
+                        } else {
+                            "Exporter la prise…".to_string()
+                        };
+                        if ui.add_enabled(editable, egui::Button::new(label)).clicked() {
+                            ui.close();
+                            export_clips = true;
                         }
                         if ui
                             .add_enabled(editable, egui::Button::new("Supprimer   Suppr"))
@@ -2495,6 +2512,9 @@ impl App {
         }
         if clip_to_delete.is_some() {
             self.delete_selection();
+        }
+        if export_clips {
+            self.open_export_clips();
         }
     }
 

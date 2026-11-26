@@ -525,12 +525,16 @@ enum TrackChoice {
 pub enum RangeChoice {
     All,
     Selection,
+    /// Du début de la première prise sélectionnée à la fin de la dernière.
+    Clips,
 }
 
 pub struct ExportDialog {
     pub s: ExportSettings,
     pub range: RangeChoice,
     pub tracks: HashSet<u64>,
+    /// Étendue des prises sélectionnées (export lancé depuis leur clic droit).
+    pub clips_span: Option<(u64, u64)>,
 }
 
 struct Toast {
@@ -5535,7 +5539,40 @@ impl App {
                 RangeChoice::All
             },
             tracks: default_tracks,
+            clips_span: None,
         });
+    }
+
+    /// Étendue des prises sélectionnées : début de la première, fin de la dernière.
+    pub fn sel_clips_span(&self) -> Option<(u64, u64)> {
+        self.project
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .filter(|c| self.sel_clips.contains(&c.id))
+            .map(|c| (c.start, c.end()))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    }
+
+    /// Export des prises sélectionnées (clic droit) : leurs pistes cochées, et leur étendue
+    /// comme plage.
+    pub fn open_export_clips(&mut self) {
+        let span = self.sel_clips_span();
+        let tracks: HashSet<u64> = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.clips.iter().any(|c| self.sel_clips.contains(&c.id)))
+            .map(|t| t.id)
+            .collect();
+        self.open_export();
+        if let (Some(d), Some(span)) = (self.export_dlg.as_mut(), span)
+            && !tracks.is_empty()
+        {
+            d.tracks = tracks;
+            d.range = RangeChoice::Clips;
+            d.clips_span = Some(span);
+        }
     }
 
     pub fn open_settings(&mut self) {
@@ -7607,7 +7644,9 @@ impl App {
         let mut close = false;
         let mut go = false;
         let sr = self.project.sample_rate.max(1);
-        if self.selection.is_none() {
+        if (d.range == RangeChoice::Selection && self.selection.is_none())
+            || (d.range == RangeChoice::Clips && d.clips_span.is_none())
+        {
             d.range = RangeChoice::All;
         }
         d.s.fit_format();
@@ -7641,6 +7680,13 @@ impl App {
         let sel_label = self.selection.map(|(a, b)| {
             format!(
                 "Plage In/Out · {} → {}",
+                fmt_time_short(a, sr),
+                fmt_time_short(b, sr)
+            )
+        });
+        let clips_label = d.clips_span.map(|(a, b)| {
+            format!(
+                "Prises sélectionnées · {} → {}",
                 fmt_time_short(a, sr),
                 fmt_time_short(b, sr)
             )
@@ -7802,8 +7848,15 @@ impl App {
                                     "Seulement entre les repères In et Out posés sur la règle : un extrait, un seul morceau du concert.",
                                 ));
                             }
+                            if let Some(l) = &clips_label {
+                                opts.push((
+                                    RangeChoice::Clips,
+                                    l.as_str(),
+                                    "Du début de la première prise sélectionnée à la fin de la dernière.",
+                                ));
+                            }
                             w::segmented_tips(ui, "exp_range", &mut d.range, &opts);
-                            if sel_label.is_none() {
+                            if sel_label.is_none() && clips_label.is_none() {
                                 ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new(
@@ -7945,8 +7998,9 @@ impl App {
                     chans.push(if d.s.mix_mono { 1 } else { 2 });
                 }
                 let n_files = chans.len();
-                let len = match (d.range, self.selection) {
-                    (RangeChoice::Selection, Some((a, b))) => b.saturating_sub(a),
+                let len = match (d.range, self.selection, d.clips_span) {
+                    (RangeChoice::Selection, Some((a, b)), _)
+                    | (RangeChoice::Clips, _, Some((a, b))) => b.saturating_sub(a),
                     _ => session_len,
                 };
                 let secs = len as f64 / sr as f64;
@@ -7998,6 +8052,7 @@ impl App {
             s.tracks = d.tracks.iter().copied().collect();
             s.range = match d.range {
                 RangeChoice::Selection => self.selection,
+                RangeChoice::Clips => d.clips_span,
                 RangeChoice::All => None,
             };
             let dir = match s.dir.strip_prefix(&self.project.dir) {
