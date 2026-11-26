@@ -136,6 +136,22 @@ fn install_fonts(ctx: &egui::Context) {
         list.extend(fallback.iter().cloned());
         fonts.families.insert(FontFamily::Name(fam.into()), list);
     }
+    // Icônes : Phosphor (licence MIT), en « Bold » et en pleine.
+    add(
+        &mut fonts,
+        "Phosphor-Bold",
+        include_bytes!("../../assets/fonts/Phosphor-Bold.ttf"),
+    );
+    add(
+        &mut fonts,
+        "Phosphor-Fill",
+        include_bytes!("../../assets/fonts/Phosphor-Fill.ttf"),
+    );
+    for (fam, font) in [("ph-bold", "Phosphor-Bold"), ("ph-fill", "Phosphor-Fill")] {
+        fonts
+            .families
+            .insert(FontFamily::Name(fam.into()), vec![font.to_owned()]);
+    }
     ctx.set_fonts(fonts);
 }
 

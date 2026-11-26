@@ -469,60 +469,60 @@ impl App {
             ui.spacing_mut().item_spacing.x = 3.0;
             // Pictogrammes : la bulle d'aide nomme l'action et son raccourci.
             if w::tool_icon(ui, Icon::Follow, self.view.follow, true)
-                .on_hover_text("Suivre la lecture : la timeline suit la tête de lecture")
+                .on_hover_text("Suivre la lecture")
                 .clicked()
             {
                 self.view.follow = !self.view.follow;
                 self.view.nav_until = 0.0;
             }
             if w::tool_icon(ui, Icon::Snap, self.snap, true)
-                .on_hover_text("Magnétisme : les prises s'aimantent à la tête, aux repères et aux autres prises (Maj pour désactiver)")
+                .on_hover_text("Magnétisme · Maj : désactiver")
                 .clicked()
             {
                 self.snap = !self.snap;
             }
-            ui.add_space(10.0);
+            w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Marker, false, true)
-                .on_hover_text("Repère : en poser un à la tête de lecture (M), même en enregistrement")
+                .on_hover_text("Repère (M)")
                 .clicked()
             {
                 self.add_marker();
             }
             if w::tool_icon(ui, Icon::MarkIn, false, true)
-                .on_hover_text("Point d'entrée de la plage à la tête de lecture (I) — aussi : Ctrl + clic sur la règle")
+                .on_hover_text("Début de plage (I)")
                 .clicked()
             {
                 self.set_range_point(self.playhead, true);
             }
             if w::tool_icon(ui, Icon::MarkOut, false, true)
-                .on_hover_text("Point de sortie de la plage à la tête de lecture (O) — aussi : Alt + clic sur la règle")
+                .on_hover_text("Fin de plage (O)")
                 .clicked()
             {
                 self.set_range_point(self.playhead, false);
             }
             let has_range = self.selection.is_some() || self.ruler_anchor.is_some();
             if w::tool_icon(ui, Icon::ClearRange, false, has_range)
-                .on_hover_text("Effacer la plage de temps (Échap)")
+                .on_hover_text("Effacer la plage (Échap)")
                 .clicked()
             {
                 self.selection = None;
                 self.ruler_anchor = None;
             }
-            ui.add_space(10.0);
+            w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Scissors, false, !recording)
-                .on_hover_text("Couper à la tête de lecture (S) : prises sélectionnées, ou toutes celles sous la tête")
+                .on_hover_text("Couper (S)")
                 .clicked()
             {
                 self.split_at_playhead();
             }
             let can_del = !recording && (!self.sel_clips.is_empty() || self.selection.is_some());
             if w::tool_icon(ui, Icon::Trash, false, can_del)
-                .on_hover_text("Supprimer les prises sélectionnées, ou le contenu de la plage (Suppr)")
+                .on_hover_text("Supprimer (Suppr)")
                 .clicked()
             {
                 self.delete_selection();
             }
-            ui.add_space(10.0);
+            w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Undo, false, !self.undo.is_empty() && !recording)
                 .on_hover_text("Annuler (Ctrl+Z)")
                 .clicked()
@@ -535,9 +535,9 @@ impl App {
             {
                 self.redo();
             }
-            ui.add_space(10.0);
+            w::tool_sep(ui);
             if w::tool_icon(ui, Icon::Meters, self.show_bridge, true)
-                .on_hover_text("Vumètres : afficher tous les vumètres d'entrée")
+                .on_hover_text("Mixage et vumètres")
                 .clicked()
             {
                 self.show_bridge = !self.show_bridge;
@@ -557,7 +557,7 @@ impl App {
             false,
             self.project.has_audio() && stopped,
         )
-        .on_hover_text("Exporter les pistes ou un mix (Ctrl+E)")
+        .on_hover_text("Exporter (Ctrl+E)")
         .clicked()
         {
             self.open_export();

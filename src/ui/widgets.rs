@@ -3,7 +3,7 @@
 
 use super::theme as t;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Mesh, Painter, Pos2, Rect, Response, Sense, Shape,
+    self, Align2, Color32, CornerRadius, FontId, Mesh, Painter, Pos2, Rect, Response, Sense,
     Stroke, Ui, pos2, vec2,
 };
 
@@ -275,289 +275,62 @@ pub enum Icon {
     Lock,
 }
 
-pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
-    let st = Stroke::new((1.4 * s / 10.0).max(1.0), col);
+/// Glyphe Phosphor (police d'icônes pro, licence MIT) de chaque icône, et sa graisse :
+/// pleine (`true`) pour le transport et les symboles, « Bold » pour les outils.
+fn icon_glyph(icon: Icon) -> (&'static str, bool) {
     match icon {
-        Icon::Play => {
-            let pts = vec![
-                c + vec2(-0.55, -0.75) * s,
-                c + vec2(0.8, 0.0) * s,
-                c + vec2(-0.55, 0.75) * s,
-            ];
-            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
-        }
-        Icon::Stop => {
-            p.rect_filled(
-                Rect::from_center_size(c, vec2(1.25, 1.25) * s),
-                CornerRadius::same(1),
-                col,
-            );
-        }
-        Icon::Record => {
-            p.circle_filled(c, 0.7 * s, col);
-        }
-        Icon::ToStart => {
-            p.rect_filled(
-                Rect::from_center_size(c + vec2(-0.7, 0.0) * s, vec2(0.2, 1.4) * s),
-                0.0,
-                col,
-            );
-            let pts = vec![
-                c + vec2(0.75, -0.7) * s,
-                c + vec2(0.75, 0.7) * s,
-                c + vec2(-0.45, 0.0) * s,
-            ];
-            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
-        }
-        Icon::Plus => {
-            p.line_segment([c + vec2(-0.65, 0.0) * s, c + vec2(0.65, 0.0) * s], st);
-            p.line_segment([c + vec2(0.0, -0.65) * s, c + vec2(0.0, 0.65) * s], st);
-        }
+        Icon::ToStart => ("\u{E5A4}", true),         // skip-back
+        Icon::Stop => ("\u{E46C}", true),            // stop
+        Icon::Play => ("\u{E3D0}", true),            // play
+        Icon::Record => ("\u{E18A}", true),          // circle
+        Icon::Plus => ("\u{E3D4}", false),           // plus
+        Icon::Marker => ("\u{E244}", true),          // flag
+        Icon::Follow => ("\u{E064}", false),         // arrow-line-right
+        Icon::Meters => ("\u{E228}", false),         // faders
+        Icon::Export => ("\u{EAF0}", false),         // export
+        Icon::More => ("\u{E1FE}", false),           // dots-three
+        Icon::Close => ("\u{E4F6}", false),          // x
+        Icon::Speaker => ("\u{E44A}", true),         // speaker-high
+        Icon::Snap => ("\u{E680}", false),           // magnet
+        Icon::Undo => ("\u{E08A}", false),           // arrow-u-up-left
+        Icon::Redo => ("\u{E08C}", false),           // arrow-u-up-right
+        Icon::Headphones => ("\u{E2A6}", true),      // headphones
+        Icon::Download => ("\u{E20C}", false),       // download-simple
+        Icon::Folder => ("\u{E256}", false),         // folder-open
+        Icon::MarkIn | Icon::MarkOut => ("", false), // crochets dessinés en texte
+        Icon::Scissors => ("\u{EAE0}", false),       // scissors
+        Icon::Trash => ("\u{E4A6}", false),          // trash
+        Icon::ClearRange => ("\u{E21E}", false),     // eraser
+        Icon::Lock => ("\u{E308}", true),            // lock-simple
+    }
+}
+
+/// Dessine une icône centrée sur `c`. `s` : demi-taille historique des icônes (le glyphe
+/// fait environ 2,6 × `s` pixels).
+pub fn paint_icon(p: &Painter, icon: Icon, c: Pos2, s: f32, col: Color32) {
+    let size = (s * 2.6).max(8.0);
+    match icon {
+        // Points d'entrée / de sortie de la plage : de vrais crochets, bien gras.
         Icon::MarkIn | Icon::MarkOut => {
-            // Crochet, et un petit trait vers l'intérieur de la plage.
-            let d = if icon == Icon::MarkIn { 1.0 } else { -1.0 };
-            let x = c.x - d * 0.35 * s;
-            let pts = vec![
-                pos2(x + d * 0.4 * s, c.y - 0.8 * s),
-                pos2(x, c.y - 0.8 * s),
-                pos2(x, c.y + 0.8 * s),
-                pos2(x + d * 0.4 * s, c.y + 0.8 * s),
-            ];
-            p.add(Shape::line(pts, st));
-            p.line_segment(
-                [pos2(x + d * 0.4 * s, c.y), pos2(x + d * 0.85 * s, c.y)],
-                st,
-            );
-        }
-        Icon::Folder => {
-            let pts = vec![
-                c + vec2(-0.8, -0.55) * s,
-                c + vec2(-0.25, -0.55) * s,
-                c + vec2(-0.05, -0.35) * s,
-                c + vec2(0.8, -0.35) * s,
-                c + vec2(0.8, 0.6) * s,
-                c + vec2(-0.8, 0.6) * s,
-            ];
-            p.add(Shape::closed_line(pts, st));
-        }
-        Icon::Download => {
-            p.line_segment([c + vec2(0.0, -0.75) * s, c + vec2(0.0, 0.35) * s], st);
-            p.line_segment([c + vec2(-0.45, -0.05) * s, c + vec2(0.0, 0.4) * s], st);
-            p.line_segment([c + vec2(0.45, -0.05) * s, c + vec2(0.0, 0.4) * s], st);
-            p.line_segment([c + vec2(-0.65, 0.8) * s, c + vec2(0.65, 0.8) * s], st);
-        }
-        Icon::Close => {
-            p.line_segment([c + vec2(-0.5, -0.5) * s, c + vec2(0.5, 0.5) * s], st);
-            p.line_segment([c + vec2(-0.5, 0.5) * s, c + vec2(0.5, -0.5) * s], st);
-        }
-        Icon::Marker => {
-            let pts = vec![
-                c + vec2(-0.6, -0.7) * s,
-                c + vec2(0.6, -0.7) * s,
-                c + vec2(0.6, 0.2) * s,
-                c + vec2(0.0, 0.8) * s,
-                c + vec2(-0.6, 0.2) * s,
-            ];
-            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
-        }
-        Icon::Follow => {
-            p.line_segment([c + vec2(-0.3, -0.8) * s, c + vec2(-0.3, 0.8) * s], st);
-            let pts = vec![
-                c + vec2(0.1, -0.45) * s,
-                c + vec2(0.85, 0.0) * s,
-                c + vec2(0.1, 0.45) * s,
-            ];
-            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
-        }
-        Icon::Meters => {
-            for (i, h) in [0.9f32, 1.45, 0.6, 1.15].iter().enumerate() {
-                let x = c.x + (i as f32 - 1.5) * 0.42 * s;
-                p.rect_filled(
-                    Rect::from_min_max(
-                        pos2(x - 0.12 * s, c.y + 0.75 * s - h * s),
-                        pos2(x + 0.12 * s, c.y + 0.75 * s),
-                    ),
-                    0.0,
-                    col,
-                );
-            }
-        }
-        Icon::Export => {
-            p.line_segment([c + vec2(0.0, 0.3) * s, c + vec2(0.0, -0.8) * s], st);
-            p.line_segment([c + vec2(-0.4, -0.4) * s, c + vec2(0.0, -0.8) * s], st);
-            p.line_segment([c + vec2(0.4, -0.4) * s, c + vec2(0.0, -0.8) * s], st);
-            p.add(Shape::line(
-                vec![
-                    c + vec2(-0.75, 0.15) * s,
-                    c + vec2(-0.75, 0.8) * s,
-                    c + vec2(0.75, 0.8) * s,
-                    c + vec2(0.75, 0.15) * s,
-                ],
-                st,
-            ));
-        }
-        Icon::More => {
-            for k in -1..=1 {
-                p.rect_filled(
-                    Rect::from_center_size(
-                        c + vec2(0.0, k as f32 * 0.5 * s),
-                        vec2(1.3 * s, st.width),
-                    ),
-                    0.0,
-                    col,
-                );
-            }
-        }
-        Icon::Speaker => {
-            let pts = vec![
-                c + vec2(-0.8, -0.3) * s,
-                c + vec2(-0.4, -0.3) * s,
-                c + vec2(0.1, -0.75) * s,
-                c + vec2(0.1, 0.75) * s,
-                c + vec2(-0.4, 0.3) * s,
-                c + vec2(-0.8, 0.3) * s,
-            ];
-            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
-            p.line_segment([c + vec2(0.4, -0.35) * s, c + vec2(0.4, 0.35) * s], st);
-            p.line_segment([c + vec2(0.7, -0.6) * s, c + vec2(0.7, 0.6) * s], st);
-        }
-        Icon::Snap => {
-            let r = 0.55 * s;
-            let w = Stroke::new(st.width * 1.8, col);
-            let pts: Vec<Pos2> = (0..=12)
-                .map(|k| {
-                    let a = std::f32::consts::PI * k as f32 / 12.0;
-                    c + vec2(-r * a.cos(), r * a.sin() + 0.05 * s)
-                })
-                .collect();
-            p.add(Shape::line(pts, w));
-            p.line_segment([c + vec2(-r, 0.05 * s), c + vec2(-r, -0.75 * s)], w);
-            p.line_segment([c + vec2(r, 0.05 * s), c + vec2(r, -0.75 * s)], w);
-        }
-        Icon::Headphones => {
-            // Arceau en demi-cercle et deux écouteurs.
-            let r = 0.62 * s;
-            let cy = c.y + 0.1 * s;
-            let pts: Vec<Pos2> = (0..=12)
-                .map(|k| {
-                    let a = std::f32::consts::PI * (1.0 + k as f32 / 12.0);
-                    pos2(c.x + r * a.cos(), cy + r * a.sin())
-                })
-                .collect();
-            p.add(Shape::line(pts, st));
-            for x in [c.x - r, c.x + r] {
-                p.rect_filled(
-                    Rect::from_center_size(pos2(x, cy + 0.32 * s), vec2(0.42 * s, 0.7 * s)),
-                    CornerRadius::same(1),
-                    col,
-                );
-            }
-        }
-        Icon::Scissors => {
-            // Deux lames croisées et deux anneaux.
-            let ring = 0.24 * s;
-            let (l, r) = (c + vec2(-0.42, 0.52) * s, c + vec2(0.42, 0.52) * s);
-            p.circle_stroke(l, ring, st);
-            p.circle_stroke(r, ring, st);
-            p.line_segment([l + vec2(0.15, -0.18) * s, c + vec2(0.45, -0.85) * s], st);
-            p.line_segment([r + vec2(-0.15, -0.18) * s, c + vec2(-0.45, -0.85) * s], st);
-        }
-        Icon::Lock => {
-            // Anse en arc au-dessus d'un corps plein.
-            let r = 0.36 * s;
-            let top = c + vec2(0.0, -0.18 * s);
-            let pts: Vec<Pos2> = (0..=10)
-                .map(|k| {
-                    let a = std::f32::consts::PI * k as f32 / 10.0;
-                    top + vec2(-r * a.cos(), -r * a.sin())
-                })
-                .collect();
-            p.line_segment([pts[0], pts[0] + vec2(0.0, 0.2 * s)], st);
-            p.line_segment([pts[10], pts[10] + vec2(0.0, 0.2 * s)], st);
-            p.add(Shape::line(pts, st));
-            p.rect_filled(
-                Rect::from_min_max(c + vec2(-0.6, 0.0) * s, c + vec2(0.6, 0.85) * s),
-                1.0,
+            let txt = if icon == Icon::MarkIn { "[" } else { "]" };
+            p.text(
+                c,
+                Align2::CENTER_CENTER,
+                txt,
+                FontId::new(size * 1.05, egui::FontFamily::Name("semibold".into())),
                 col,
             );
         }
-        Icon::Trash => {
-            // Couvercle, poignée, bac et deux rainures.
-            p.line_segment([c + vec2(-0.75, -0.5) * s, c + vec2(0.75, -0.5) * s], st);
-            p.add(Shape::line(
-                vec![
-                    c + vec2(-0.25, -0.5) * s,
-                    c + vec2(-0.25, -0.78) * s,
-                    c + vec2(0.25, -0.78) * s,
-                    c + vec2(0.25, -0.5) * s,
-                ],
-                st,
-            ));
-            p.add(Shape::line(
-                vec![
-                    c + vec2(-0.55, -0.5) * s,
-                    c + vec2(-0.45, 0.85) * s,
-                    c + vec2(0.45, 0.85) * s,
-                    c + vec2(0.55, -0.5) * s,
-                ],
-                st,
-            ));
-            p.line_segment([c + vec2(-0.17, -0.2) * s, c + vec2(-0.15, 0.55) * s], st);
-            p.line_segment([c + vec2(0.17, -0.2) * s, c + vec2(0.15, 0.55) * s], st);
-        }
-        Icon::Redo => {
-            let r = 0.55 * s;
-            let pts: Vec<Pos2> = (0..=10)
-                .map(|k| {
-                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * k as f32 / 10.0;
-                    c + vec2(-r * a.cos() - 0.1 * s, r * a.sin() + 0.1 * s)
-                })
-                .collect();
-            p.add(Shape::line(pts, st));
-            let tip = c + vec2(-0.1 * s, -r + 0.1 * s);
-            p.add(Shape::convex_polygon(
-                vec![
-                    tip + vec2(0.45, 0.0) * s,
-                    tip + vec2(0.0, 0.3) * s,
-                    tip + vec2(0.0, -0.3) * s,
-                ],
+        _ => {
+            let (glyph, fill) = icon_glyph(icon);
+            let fam = if fill { "ph-fill" } else { "ph-bold" };
+            p.text(
+                c,
+                Align2::CENTER_CENTER,
+                glyph,
+                FontId::new(size, egui::FontFamily::Name(fam.into())),
                 col,
-                Stroke::NONE,
-            ));
-        }
-        Icon::ClearRange => {
-            // Plage entre crochets, barrée.
-            let br = |x: f32, d: f32| {
-                vec![
-                    c + vec2(x + d * 0.3, -0.7) * s,
-                    c + vec2(x, -0.7) * s,
-                    c + vec2(x, 0.7) * s,
-                    c + vec2(x + d * 0.3, 0.7) * s,
-                ]
-            };
-            p.add(Shape::line(br(-0.8, 1.0), st));
-            p.add(Shape::line(br(0.8, -1.0), st));
-            p.line_segment([c + vec2(-0.4, 0.45) * s, c + vec2(0.4, -0.45) * s], st);
-        }
-        Icon::Undo => {
-            let r = 0.55 * s;
-            let pts: Vec<Pos2> = (0..=10)
-                .map(|k| {
-                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * k as f32 / 10.0;
-                    c + vec2(r * a.cos() + 0.1 * s, r * a.sin() + 0.1 * s)
-                })
-                .collect();
-            p.add(Shape::line(pts, st));
-            let tip = c + vec2(0.1 * s, -r + 0.1 * s);
-            p.add(Shape::convex_polygon(
-                vec![
-                    tip + vec2(-0.45, 0.0) * s,
-                    tip + vec2(0.0, -0.3) * s,
-                    tip + vec2(0.0, 0.3) * s,
-                ],
-                col,
-                Stroke::NONE,
-            ));
+            );
         }
     }
 }
@@ -661,9 +434,19 @@ pub fn tool_button(
 
 /// Bouton pictogramme de barre d'outils : même look que `tool_button`, sans texte (la
 /// bulle d'aide explique l'action). `active` = interrupteur allumé (fond orange).
+/// Séparation fine entre deux groupes de boutons d'outils.
+pub fn tool_sep(ui: &mut Ui) {
+    let (r, _) = ui.allocate_exact_size(vec2(13.0, 22.0), Sense::hover());
+    let x = r.center().x.round() + 0.5;
+    ui.painter().line_segment(
+        [pos2(x, r.top()), pos2(x, r.bottom())],
+        Stroke::new(1.0, t::SURFACE_4),
+    );
+}
+
 pub fn tool_icon(ui: &mut Ui, icon: Icon, active: bool, enabled: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(
-        vec2(30.0, 24.0),
+        vec2(32.0, 28.0),
         if enabled {
             Sense::click()
         } else {
@@ -691,7 +474,7 @@ pub fn tool_icon(ui: &mut Ui, icon: Icon, active: bool, enabled: bool) -> Respon
     };
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(t::R), bg);
-    paint_icon(p, icon, rect.center(), 6.0, fg);
+    paint_icon(p, icon, rect.center(), 6.5, fg);
     resp
 }
 
