@@ -1890,8 +1890,15 @@ impl App {
                 self.engine.pad(PadCmd::Stop { slot });
             }
         });
+        // Son rangé dans la session : chemin court (« Sons\… »), le chemin complet en bulle.
+        let shown = pad
+            .path
+            .strip_prefix(&self.project.dir)
+            .unwrap_or(&pad.path)
+            .display()
+            .to_string();
         ua.label(
-            egui::RichText::new(short(&pad.path.display().to_string(), 46))
+            egui::RichText::new(short(&shown, 46))
                 .font(t::regular(10.5))
                 .color(t::TEXT_3),
         )

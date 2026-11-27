@@ -15,7 +15,8 @@ Fonctionne avec Dante Virtual Soundcard (64 entrées et plus), ASIO, WASAPI et C
 - Au premier lancement, Windows SmartScreen peut afficher « Windows a protégé votre
   ordinateur » → « Informations complémentaires » → « Exécuter quand même ».
 - Quand une nouvelle version est publiée, une pastille **« Version x.y.z »** apparaît en haut
-  à droite (et un point orange sur le menu ···). Elle affiche les nouveautés et le bouton
+  à droite et sur l'écran d'accueil (et un point orange sur le menu ···). Elle affiche les
+  nouveautés et le bouton
   **« Installer et redémarrer »** : TracksPlus se met à jour et se relance, réglages et
   sessions conservés. Indisponible pendant une prise.
 - « Ignorer cette version » ne la propose plus. Menu ··· → « Rechercher des mises à jour »
@@ -51,7 +52,13 @@ ou archiver d'un bloc :
   session y apparaissent comme des sessions), Enregistrer (Ctrl+S), Enregistrer sous… (copie
   aussi le soundboard et ses sons, sans écraser une session existante), Afficher le dossier,
   Exporter… (Ctrl+E), format d'enregistrement, **Importer un soundboard…** (reprend les pads
-  et les sons d'un autre soundboard), Réglages…, mises à jour.
+  et les sons d'un autre soundboard), **Nettoyer les fichiers inutilisés…**, Réglages…
+  (Ctrl+,), mises à jour.
+- **Nettoyer les fichiers inutilisés** : les prises qui ne servent plus (pistes ou prises
+  supprimées) sont listées avec leur taille, puis envoyées à la **Corbeille** de Windows,
+  aussi sur le second disque de la copie de sécurité. Les fichiers encore utilisés, même par
+  un morceau de prise, ne sont jamais touchés. Après le nettoyage, Ctrl+Z ne peut plus
+  ramener ce qui a été supprimé avant.
 
 ## Multipiste
 
@@ -62,11 +69,20 @@ ou archiver d'un bloc :
 - La flèche à gauche du nom déplie la piste : type, entrée (grille, entrées déjà utilisées
   signalées), couleur. Armement, **monitoring direct** (sortie « Monitoring multipiste »),
   **M**ute / **S**olo, renommage par double-clic.
-- Enregistrement en WAV 24 bits ou 32 bits flottant (menu ···), sauvegarde à chaque stop,
-  temps restant sur le disque, écoute des pistes existantes pendant la prise.
-- **Vumètres** crête IEC 60268-18 : vert / jaune (−12 dB) / rouge (−3 dB), maintien, crête max
-  en dB, voyant de saturation (clic pour remettre à zéro). Un par piste, un master stéréo, et
-  un bandeau de toutes les pistes (entrée pour les pistes armées, lecture pour les autres).
+- Plusieurs pistes sélectionnées à gauche : clic droit → **« Supprimer les N pistes »**
+  (Ctrl+Z les ramène).
+- Enregistrement en WAV (BWF) 24 bits ou 32 bits flottant (menu ···), signal brut de la carte,
+  sauvegarde à chaque stop. Temps restant sur le disque en bas à droite, calculé pour les
+  pistes armées.
+- **Enregistrer par-dessus** : les autres pistes jouent pendant la prise ; une piste qui
+  enregistre fait entendre son entrée, jamais l'ancienne prise qu'elle recouvre (gardée
+  dessous, retrouvée à la lecture).
+- À l'arrêt, les **prises qui viennent d'être enregistrées sont sélectionnées** : Suppr pour
+  la refaire, Ctrl+Z pour la ramener.
+- **Vumètres** crête IEC 60268-18 : vert / jaune (−12 dB) / rouge (−3 dB), maintien, valeur
+  crête en dB (−∞ sans signal), voyant de saturation rouge jusqu'au clic. Un par piste, un
+  master stéréo, et un bandeau de toutes les pistes : niveau de lecture pendant la lecture,
+  niveau d'entrée des pistes armées à l'arrêt et pendant la prise.
 - **Mixage** (bandeau des vumètres) : un fader et un panoramique par piste, et un fader
   master. Double-clic : 0 dB ou centre ; Maj : réglage fin. Piste mono au centre à −3 dB
   de chaque côté, comme sur une console. Les prises ne sont jamais modifiées : les faders
@@ -99,22 +115,31 @@ ou archiver d'un bloc :
   au retour au début ; la plage s'affiche avec une barre orange sur la règle.
 - Glisser sur les pistes : rectangle de sélection (Ctrl / Maj pour ajouter). Double-clic sur
   une prise : sélectionner sa durée.
-- **Barre d'outils** (bulle d'aide avec le raccourci) : suivre la lecture, magnétisme ·
-  repère, entrée `[`, sortie `]`, effacer la plage · couper, supprimer · annuler,
-  rétablir · mixage et vumètres ; à droite, exporter.
+- **← / →** : de repère en repère, en s'arrêtant aussi au début et à la fin de la plage
+  sélectionnée. **1 à 9** : aller au repère 1 à 9 (aussi sur un clavier AZERTY, sans Maj).
+- **Barre d'outils** (bulle d'aide avec le raccourci) : suivre la lecture (Ctrl+F),
+  magnétisme (G) · repère, entrée `[`, sortie `]`, effacer la plage · couper, supprimer ·
+  annuler, rétablir · mixage et vumètres (V) ; à droite, exporter.
 
 ### Montage et repères
 
 - Clic sur une prise : la sélectionner (Ctrl pour ajouter). Glisser : la déplacer, aussi vers
-  une autre piste. Tirer ses bords : la rogner.
-- **S** coupe à la tête de lecture ; **Suppr** supprime la sélection ou le contenu de la plage.
-- **Magnétisme** (bouton aimant, désactivé au lancement) : tête de lecture, repères,
-  sélection, bords des prises ; Maj pour l'ignorer.
+  une autre piste (affichée en direct sur la piste visée). Tirer ses bords : la rogner.
+- Clic droit sur des prises sélectionnées : **« Sélectionner la plage des N prises »** (de la
+  première à la dernière), **« Exporter les N prises… »** (export avec leurs pistes et leur
+  plage), fondus, supprimer.
+- **S** coupe à la tête de lecture (les prises sélectionnées, sinon toutes celles sous la
+  tête) ; **Suppr** supprime la sélection ou le contenu de la plage.
+- **Magnétisme** (bouton aimant ou **G**, désactivé au lancement) : les prises, la tête de
+  lecture et la plage se calent sur les temps de la grille (par pas réguliers), les repères
+  et la tête de lecture. **Maj** enfoncée pendant un glissement l'inverse (aimante quand il
+  est coupé, libère quand il est actif).
 - **Fondus** : poignées aux coins supérieurs des prises, ou clic droit → 10 ms / 100 ms / 1 s.
   Deux prises qui se chevauchent avec un fondu font un fondu enchaîné.
 - Ctrl+Z / Ctrl+Maj+Z. Le montage ne modifie jamais les fichiers enregistrés.
 - **Repères** : **M** (même pendant une prise). Clic : y aller ; clic droit ou double-clic :
   renommer, supprimer, sélectionner jusqu'au suivant. ← / → et **1 à 9** pour y sauter.
+- Tous les raccourcis se changent dans Réglages → Raccourcis.
 
 ## Export
 
@@ -123,8 +148,10 @@ ou archiver d'un bloc :
 Chaque option a une bulle d'aide avec un exemple.
 
 - **Contenu** : pistes choisies une à une (ou celles sélectionnées à gauche), toute la
-  session ou seulement la **plage In/Out** ; **stems** (stéréo pour les pistes stéréo) et/ou
-  **mix stéréo ou mono**.
+  session, la **plage In/Out** ou les **prises sélectionnées** (clic droit → « Exporter les N
+  prises… ») ; **stems** (stéréo pour les pistes stéréo) et/ou **mix stéréo ou mono**.
+  « Toute la session » donne des fichiers de la durée de la session, silence compris : posés
+  au même départ dans un autre logiciel, ils restent synchronisés.
 - **Formats** : **WAV** (RF64 au-delà de 4 Go), **BWF** (horodaté, se recale seul en
   post-production), **AIFF** (4 Go maximum), **FLAC**, **MP3** (128 à 320 kbit/s ou VBR V0,
   tags ID3), **Ogg Vorbis** (qualité 5, 7 ou 9).
@@ -212,7 +239,8 @@ Chaque option a une bulle d'aide avec un exemple.
 
 ## Réglages
 
-Menu ··· → « Réglages… », ou la pastille de la carte son en haut à droite.
+Menu ··· → « Réglages… » (Ctrl+,), ou la pastille de la carte son en haut à droite. Quatre
+onglets de même taille : Carte son, Enregistrement, Soundboard, Raccourcis.
 
 ![Réglages de la carte son](docs/reglages.png)
 
@@ -222,33 +250,66 @@ Menu ··· → « Réglages… », ou la pastille de la carte son en haut à dr
   multipiste »). La configuration est retrouvée au lancement.
   **« Actualiser »** reprend les réglages changés dans le panneau du pilote (buffer,
   fréquence). Indisponible pendant une prise.
+  La ligne **« En cours »** montre ce qui tourne vraiment : blocs d'entrée et de sortie,
+  **charge** (temps de calcul de TracksPlus par bloc ; au-delà de ~70 %, ça craque) et
+  **latence aller-retour** annoncée par le pilote (micro → casque en monitoring).
+- **Enregistrement** : copie de sécurité sur un second disque, relance automatique d'une
+  prise après la perte de la carte.
 - **Soundboard** : contrôleur MIDI, LED, disposition (automatique / manuelle), taille de la
-  grille.
+  grille, anti-rebond.
+- **Raccourcis** : voir ci-dessous.
 
 ## Raccourcis
 
-| Touche | Multipiste | Soundboard |
-| --- | --- | --- |
-| Espace | Lecture / Stop (pendant une prise : deux appuis) | |
-| R | Enregistrer (pendant une prise : deux appuis pour arrêter) | |
-| M | Ajouter un repère | |
-| I / O | Point d'entrée / de sortie de la plage à la tête de lecture | |
-| ← / → | Repère précédent / suivant | |
-| 1 … 9 | Aller au repère 1 … 9 | |
-| Origine / Entrée | Début (ou début de la sélection) | |
-| F | Tout afficher | |
-| S | Couper à la tête de lecture | |
-| Suppr | Supprimer la sélection | Supprimer le pad sélectionné |
-| Ctrl + Z / Ctrl + Maj + Z | Annuler / Rétablir | |
-| Échap | Effacer les sélections | Tout arrêter (pendant un renommage : l'annuler) |
-| Ctrl + clic | Ajouter une prise à la sélection ; sur la règle : point d'entrée de la plage | Jouer le pad |
-| Alt + clic (règle) | Point de sortie de la plage | |
-| Glisser sur la règle | Faire défiler la timeline (sur la tête de lecture : la déplacer) | |
-| Double-clic | Renommer une piste / un repère | Renommer le pad |
-| Ctrl + molette | Zoom | Zoom de l'éditeur |
-| Alt + molette | Défiler dans le temps | |
-| Ctrl + 1 / Ctrl + 2 | Changer d'onglet | Changer d'onglet |
-| Ctrl + S / Ctrl + E | Enregistrer / Exporter | |
+Réglages → **Raccourcis** : chaque action peut avoir deux touches. Clic sur une touche puis
+appui sur la nouvelle combinaison (avec Ctrl, Maj, Alt) ; clic droit : la retirer ; Échap :
+annuler ; ↺ : revenir à la touche par défaut, ou « Tout remettre par défaut ». Une touche
+déjà prise est retirée à l'autre action (un message le dit). Appliqué et enregistré aussitôt
+(`shortcuts.json`, dossier `%APPDATA%\TracksPlus`) ; les bulles d'aide suivent.
+
+![Réglages des raccourcis](docs/raccourcis.png)
+
+Touches par défaut :
+
+| Action | Touche |
+| --- | --- |
+| Lecture / arrêt | Espace (pendant une prise : deux appuis) |
+| Enregistrer | R (pendant une prise : deux appuis pour arrêter) |
+| Début (ou début de la plage) | Origine, Entrée |
+| Fin de la session | Fin |
+| Boucle | L |
+| Repère ou bord de plage précédent / suivant | ← / → |
+| Aller au repère 1 … 9 | 1 … 9 |
+| Tout afficher | F |
+| Suivre la lecture | Ctrl + F |
+| Mixage et vumètres | V |
+| Magnétisme | G |
+| Poser un repère | M |
+| Début / fin de plage | I / O |
+| Couper à la tête de lecture | S |
+| Supprimer | Suppr, Retour arrière |
+| Tout sélectionner | Ctrl + A |
+| Tout désélectionner | Échap |
+| Annuler / Rétablir | Ctrl + Z / Ctrl + Maj + Z, Ctrl + Y |
+| Enregistrer la session / Exporter | Ctrl + S / Ctrl + E |
+| Onglet Multipiste / Soundboard | Ctrl + 1 / Ctrl + 2 |
+| Réglages | Ctrl + , |
+| Soundboard : arrêter tous les pads | Échap |
+| Soundboard : supprimer le pad sélectionné | Suppr |
+
+Gestes de la souris (fixes) :
+
+| Geste | Effet |
+| --- | --- |
+| Maj + glisser | Inverser le magnétisme (prises, tête, plage) |
+| Ctrl + clic / Alt + clic sur la règle | Début / fin de plage |
+| Glisser sur la règle | Faire défiler la timeline (sur la tête de lecture : la déplacer) |
+| Ctrl / Maj + clic sur une prise | Ajouter à la sélection |
+| Maj + glisser un fader | Réglage fin |
+| Double-clic | Fader : 0 dB ; panoramique : centre ; piste, repère, pad : renommer |
+| Ctrl + clic sur un pad | Jouer le pad |
+| Ctrl + molette | Zoom (timeline, éditeur de pad) |
+| Maj + molette (ou molette horizontale) | Défiler dans le temps |
 
 ## Utilisation avec Dante
 
@@ -262,11 +323,21 @@ Menu ··· → « Réglages… », ou la pastille de la carte son en haut à dr
 
 ## Fiabilité en live
 
-- **Copie de sécurité** (option, désactivée par défaut : Réglages → Enregistrement) : chaque
-  prise est écrite en même temps sur un second disque, avec un double de la session ouvrable
-  tel quel. La place libre du second disque est affichée en bas de l'écran et surveillée
-  (alerte dès 30 min restantes, ou si le disque est introuvable). Un second disque lent, plein ou
-  débranché ne gêne jamais l'enregistrement principal.
+- **Copie de sécurité** (option, désactivée par défaut : Réglages → Enregistrement) : un
+  **miroir complet de la session** sur un second disque, ouvrable tel quel.
+  - À l'activation (et au lancement, ou quand le disque est rebranché), toute la session est
+    recopiée en arrière-plan : prises, fichiers importés, sons du soundboard. La progression
+    s'affiche en bas à droite (« Copie 12/340 fichiers »).
+  - Ensuite, chaque sauvegarde (automatique, Ctrl+S, import, fin de prise) met le second
+    disque à jour aussitôt ; un son ajouté au soundboard y part tout de suite.
+  - Pendant une prise, chaque prise est écrite **en même temps** sur les deux disques ; le
+    reste de la copie attend la fin de la prise pour ne jamais ralentir les disques.
+  - Un fichier déjà présent n'est jamais écrasé (sauf copie incomplète) ; une copie
+    interrompue ne laisse jamais de fichier abîmé.
+  - La place libre du second disque est affichée en bas de l'écran et surveillée (alerte dès
+    30 min restantes, ou si le disque est introuvable). Un second disque lent, plein ou
+    débranché ne gêne jamais l'enregistrement principal.
+  - Décocher la copie arrête seulement le miroir : le dossier sur le second disque est gardé.
 - **Fichiers BWF** : chaque prise porte son heure d'enregistrement (TimeReference) et le nom
   de sa piste ; Pro Tools, Nuendo ou Reaper peuvent la poser à son heure réelle.
 - **Signal interrompu pendant une prise** (horloge Dante perdue quelques secondes, sans
@@ -310,7 +381,16 @@ Menu ··· → « Réglages… », ou la pastille de la carte son en haut à dr
   impossible.
 - **Décrochages** du pilote comptés pendant la prise ou la lecture et rappelés à l'arrêt.
 - **Retour d'écoute** : entrée mono au centre à -3 dB (comme une console), limiteur de
-  sécurité à -1 dBFS sur le mix d'écoute uniquement (les prises ne sont jamais touchées).
+  sécurité à -1 dBFS sur le mix d'écoute uniquement (les prises ne sont jamais touchées). En
+  ASIO, le monitoring n'ajoute aucune latence à celle du pilote (entrée et sortie dans le
+  même cycle) : à 128 échantillons et 48 kHz, environ 6 ms du micro au casque.
+- **Buffer du pilote non appliqué** : si le pilote tourne avec un buffer plus grand que celui
+  qu'il annonce (buffer changé dans son panneau pendant que le son de Windows utilise la
+  même carte), une alerte le dit : son haché, « voix de robot ». Mettre la sortie Windows sur
+  un autre périphérique, puis « Actualiser ».
+- **Messages** en bas de l'écran : un problème réglé est remplacé par sa résolution (« carte
+  perdue » puis « reconnectée », « disque lent » puis « prise enregistrée »…) au lieu de
+  s'empiler ; l'historique complet reste dans le journal des incidents.
 - **Prises recalées** : la latence de la carte est compensée en enregistrant sur des pistes
   existantes.
 - **Stop immédiat**, sauvegarde aussitôt ; sauvegarde automatique du montage toutes les 30 s.
@@ -338,7 +418,12 @@ multipiste ; TracksPlus ne peut pas les faire à votre place.
   jour Windows pendant le spectacle (une mise à jour peut réactiver les économies d'énergie :
   revérifier après chaque mise à jour).
 - Pilote **ASIO** de préférence (sinon WASAPI : TracksPlus passe alors son thread audio en
-  priorité « Pro Audio »).
+  priorité « Pro Audio »). Buffer ASIO : 128 à 256 échantillons ; 48 à 64 seulement si la
+  « charge » reste basse dans Réglages → Carte son. Pour une écoute au casque sans aucune
+  latence, le monitoring matériel de la carte (TotalMix chez RME…) reste imbattable.
+- **Sortie son de Windows sur un autre périphérique** que la carte d'enregistrement
+  (navigateur, visio, sons système) : sinon certains pilotes gardent leur ancien buffer après
+  un changement dans leur panneau.
 
 **Dante Virtual Soundcard**
 - Carte réseau **intégrée** en Gigabit (éviter les adaptateurs USB), réseau Gigabit de bout
@@ -353,7 +438,8 @@ multipiste ; TracksPlus ne peut pas les faire à votre place.
 
 **Avant les portes**
 - Une prise test de 2 minutes sur toutes les pistes, réécoutée ; vérifier qu'aucun
-  « décrochage » n'est compté en bas de l'écran.
+  « décrochage » n'est compté en bas de l'écran et que la « charge » reste basse
+  (Réglages → Carte son).
 - Copie de sécurité activée sur un second disque, place libre vérifiée sur les deux disques.
 - Soundboard en **mode spectacle** (cadenas).
 
@@ -385,6 +471,8 @@ Autres builds : `cargo build --release --features asio` sous Windows avec Visual
 | `src/project.rs` | Session, pistes, prises, repères |
 | `src/update.rs` | Mises à jour depuis les releases GitHub |
 | `src/sessions.rs` | Sessions connues, pour l'écran d'accueil |
+| `src/shortcuts.rs` / `src/ui/keys.rs` | Raccourcis paramétrables et leur onglet des réglages |
+| `src/cleanup.rs` | Nettoyage des fichiers inutilisés (session et second disque) |
 | `src/ui/browser.rs` | Explorateur intégré (sons, sessions) |
 | `src/app.rs`, `src/ui/*` | Interface (egui) : thème, widgets, onglets |
 
